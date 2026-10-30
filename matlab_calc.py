@@ -19,7 +19,7 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
-APP_VERSION = '0.1.2'           # Shown in the welcome banner; see the version history in README.md
+APP_VERSION = '0.1.3'           # Shown in the welcome banner; see the version history in README.md
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
 WINDOW_HEIGHT = 520             # Initial window height in pixels
@@ -663,6 +663,7 @@ def evaluate(node, variables):
 #  Engine: runs command lines and formats results (independent of the GUI)
 # =============================================================================
 CLEAR_SCREEN = object()  # returned by MatlabEngine.execute() for 'clc'
+EXIT_APP = object()      # returned by MatlabEngine.execute() for 'exit' / 'quit'
 
 
 class MatlabEngine:
@@ -672,14 +673,16 @@ class MatlabEngine:
 
     # ---- execution ---------------------------------------------------------
     def execute(self, line):
-        """Run one command line. Returns output chunks (str) and/or CLEAR_SCREEN.
+        """Run one command line. Returns output chunks (str), CLEAR_SCREEN and/or EXIT_APP.
 
-        Like MATLAB, the remaining statements on the line are skipped after an error.
+        Like MATLAB, the remaining statements on the line are skipped after an error or 'exit'.
         """
         output = []
         try:
             for text, suppressed in split_statements(line):
                 output.extend(self._run_statement(text, suppressed))
+                if output and output[-1] is EXIT_APP:
+                    break
         except MatlabError as err:
             output.append(f"{err}\n")
         except np.linalg.LinAlgError as err:
@@ -712,6 +715,8 @@ class MatlabEngine:
         name, args = words[0], words[1:]
         if name == 'clc' and not args:
             return [CLEAR_SCREEN]
+        if name in ('exit', 'quit') and not args:
+            return [EXIT_APP]
         if name == 'whos' and not args:
             return [self._whos()]
         if name == 'format' and len(args) <= 1 and all(w.isalpha() for w in args):
@@ -996,7 +1001,7 @@ class MatlabConsoleApp:
 
         self.write_output(
             f"{APP_NAME} {APP_VERSION} - MATLAB Syntax Calculator\n"
-            "Commands: 'format short', 'format long', 'clear <var>', 'clear all', 'whos', 'clc'\n"
+            "Commands: 'format short', 'format long', 'clear <var>', 'clear all', 'whos', 'clc', 'exit'\n"
             + "-" * 80 + "\n"
         )
         self.show_prompt()
@@ -1080,16 +1085,22 @@ class MatlabConsoleApp:
         if raw_cmd:
             self.history.append(raw_cmd)
             self.history_idx = len(self.history)
-            self._execute_command(raw_cmd)
+            if not self._execute_command(raw_cmd):
+                return "break"  # the window has been closed by 'exit'
         self.show_prompt()
         return "break"
 
     def _execute_command(self, raw_cmd):
+        """Show the command's output. Returns False if it closed the application."""
         for chunk in self.engine.execute(raw_cmd):
+            if chunk is EXIT_APP:
+                self.root.destroy()  # ends mainloop(), so the program exits
+                return False
             if chunk is CLEAR_SCREEN:
                 self.output_area.clear()
             else:
                 self.write_output(chunk)
+        return True
 
 
 def main():

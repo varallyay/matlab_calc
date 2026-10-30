@@ -263,6 +263,14 @@ class TestCommands(EngineCase):
     def test_clc(self):
         self.assertIs(self.eng.execute('clc')[0], mc.CLEAR_SCREEN)
 
+    def test_exit(self):
+        self.assertIs(self.eng.execute('exit')[-1], mc.EXIT_APP)
+        self.assertIs(self.eng.execute('quit;')[-1], mc.EXIT_APP)
+        out = self.eng.execute('a = 1, exit, b = 2')        # nothing runs after exit
+        self.assertEqual(out[-1:], [mc.EXIT_APP])
+        self.assertNotIn('b', self.eng.variables)
+        self.assertValue('exit = 3', 3, var='exit')          # still usable as a variable name
+
     def test_showing_a_variable_keeps_ans(self):
         self.out('7; x = 4;')
         self.assertEqual(self.out('x'), 'x =\n    4\n')
@@ -369,6 +377,24 @@ class TestEventLoop(unittest.TestCase):
             self.assertIn('>> 1+1\nans =\n    2\n', content)
         finally:
             root.destroy()
+
+    def test_exit_closes_the_window(self):
+        root = make_root(visible=True)
+        app = mc.MatlabConsoleApp(root)
+
+        def type_exit():
+            app.output_area.insert('input_start', 'exit')
+            app.process_command()
+
+        root.after(50, type_exit)
+        timer = root.after(10000, root.quit)  # safety net: only fires if 'exit' did nothing
+        root.mainloop()
+        try:
+            root.after_cancel(timer)
+            root.destroy()
+            self.fail("'exit' did not close the window")
+        except tk.TclError:
+            pass  # the application was destroyed, as expected
 
 
 class TestIcon(unittest.TestCase):
