@@ -1,5 +1,7 @@
 # Matlab_Calc — MATLAB Command Window Emulator (`matlab_calc.py`)
 
+**Version 0.1.2** — see [Version History](#version-history).
+
 A lightweight, interactive desktop calculator built with Python, Tkinter, and NumPy that emulates the look, feel, and matrix-first syntax of the **MATLAB Command Window**.
 
 ---
@@ -48,6 +50,7 @@ All settings are constants at the top of `matlab_calc.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `'Matlab_Calc'` | Window title, Tk class name and macOS menu-bar name |
+| `APP_VERSION` | `'0.1.2'` | Version number, shown in the welcome banner (also available as `matlab_calc.__version__`) |
 | `WINDOW_WIDTH`, `WINDOW_HEIGHT` | `750`, `520` | Initial window size in pixels |
 | `APP_ICON_FILE` | `'icon.png'` | Icon image, looked up next to the script |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size (keeps the Dock icon the same size as native macOS icons) |
@@ -154,4 +157,25 @@ Array indexing (`A(2,3)`) and indexed assignment, character strings, user functi
 python3 test_matlab_calc.py
 ```
 
-Runs 35 tests covering operators, precedence, parsing, number display, workspace commands, the read-only console and the rounded icon. The GUI and icon tests are skipped when no display is available.
+Runs 36 tests covering operators, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available.
+
+---
+
+## Version History
+
+### 0.1.2 — 2026-10-30
+- **Fixed crash on the first key press:** the read-only protection of the console was implemented as a Python callback; Tk errors raised inside it (for example when checking for a text selection while nothing is selected) were re-raised by Tkinter's event loop and closed the app. The protection now runs entirely in Tcl.
+- **Tests:** added a test that types inside the running Tk event loop.
+
+### 0.1.1 — 2026-10-30
+- **Correct results:** replaced the Python-operator translation with a MATLAB expression parser. Element-wise operators now work on scalars (`2 ./ 4` returned `0`, `2 .^ 3` returned `2`), and precedence and associativity match MATLAB (`2*A.^2`, `-A.^2`, `2^3^2 = 64`).
+- **Input fixes:** `==` comparisons, several statements per line, `%` comments, `[]`, sizes computed from expressions (`zeros(n, n)`), and variable names starting with `clear` now work.
+- **New syntax:** ranges (`1:5`), left division (`A\b`, `.\`), comparison and logical operators, and the constants `Inf`, `NaN`, `i` and `j`.
+- **Display:** very small and very large numbers use scientific notation instead of showing `0`; `Inf`, `NaN` and complex results look as they do in MATLAB; very large results are summarised.
+- **Console:** earlier output is fully read-only (Ctrl+H could delete the prompt), keypad Enter works, and a monospace font is picked automatically so matrix columns line up on macOS.
+- **Configuration:** settings are parameters at the top of the file (`APP_NAME`, `APP_VERSION`, `WINDOW_WIDTH`, `WINDOW_HEIGHT`, fonts, colours, …).
+- **App icon:** shrunk with a transparent margin (`APP_ICON_MARGIN`) and rounded corners (`APP_ICON_ROUNDING`) to match native macOS Dock icons.
+- **Tests:** added `test_matlab_calc.py`.
+
+### 0.1.0
+- Initial version: Tkinter command window with a `>>` prompt and command history, MATLAB matrix and vector syntax, matrix and element-wise operators, adaptive number formatting, and the workspace commands `whos`, `clear`, `clc` and `format`.

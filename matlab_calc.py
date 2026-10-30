@@ -19,6 +19,7 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
+APP_VERSION = '0.1.2'           # Shown in the welcome banner; see the version history in README.md
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
 WINDOW_HEIGHT = 520             # Initial window height in pixels
@@ -40,6 +41,8 @@ SHORT_DECIMALS = 4              # Maximum decimals shown by 'format short' (the 
 LONG_DECIMALS = 15              # Maximum decimals shown by 'format long'
 MAX_DISPLAY_ELEMENTS = 10000    # Bigger results are summarised instead of printed in full
 # =============================================================================
+
+__version__ = APP_VERSION
 
 
 MAX_ELEMENTS = 10_000_000       # Guard against accidental huge allocations, e.g. 1:1e12
@@ -913,34 +916,45 @@ def pick_font_family(root, candidates=FONT_FAMILIES):
 # =============================================================================
 #  GUI
 # =============================================================================
+# Runs in place of the text widget's own command. It is written in Tcl on purpose: an
+# error raised inside a Python command called from Tcl (e.g. asking for "sel.first" when
+# nothing is selected) is stored by tkinter and re-raised by mainloop(), even when the
+# caller catches it. That crashed version 0.1.1 on the first key press.
+_TEXT_GUARD_TCL = r'''
+proc ::matlab_calc_text_guard {raw cmd args} {
+    if {$cmd in {insert delete replace} && [llength $args] > 0
+            && [$raw compare [lindex $args 0] < input_start]} {
+        return
+    }
+    return [$raw $cmd {*}$args]
+}
+'''
+
+
 class ConsoleText(scrolledtext.ScrolledText):
     """ScrolledText whose text before the 'input_start' mark is read-only for the user.
 
     Every insert/delete made by Tk's own bindings (typing, Backspace, Ctrl+H, Ctrl+T, cut,
-    paste, middle-click, ...) passes through _guard(), which drops edits that would touch
-    the read-only part. The app writes at the end of the buffer and uses clear() for 'clc'.
+    paste, middle-click, ...) passes through the Tcl guard above, which drops edits that
+    would touch the read-only part. The app writes at the end of the buffer and uses
+    clear() for 'clc'.
     """
 
     def __init__(self, master, **kw):
         super().__init__(master, **kw)
         self._raw = self._w + '_raw'
+        self.tk.eval(_TEXT_GUARD_TCL)
         self.tk.call('rename', self._w, self._raw)
-        self.tk.createcommand(self._w, self._guard)
+        self.tk.call('interp', 'alias', '', self._w, '', '::matlab_calc_text_guard', self._raw)
         self.mark_set('input_start', '1.0')
         self.mark_gravity('input_start', tk.LEFT)
-
-    def _guard(self, command, *args):
-        if command in ('insert', 'delete', 'replace') and args:
-            if self.tk.call(self._raw, 'compare', args[0], '<', 'input_start'):
-                return ''
-        return self.tk.call((self._raw, command) + args)
 
     def clear(self):
         self.tk.call(self._raw, 'delete', '1.0', 'end')
 
     def destroy(self):
-        self.tk.deletecommand(self._w)
-        self.tk.call('rename', self._raw, self._w)
+        self.tk.call('rename', self._w, '')          # remove the guard
+        self.tk.call('rename', self._raw, self._w)   # give the widget its own command back
         super().destroy()
 
 
@@ -981,7 +995,7 @@ class MatlabConsoleApp:
         self.output_area.bind("<<Paste>>", self.on_paste)
 
         self.write_output(
-            f"{APP_NAME} - MATLAB Syntax Calculator\n"
+            f"{APP_NAME} {APP_VERSION} - MATLAB Syntax Calculator\n"
             "Commands: 'format short', 'format long', 'clear <var>', 'clear all', 'whos', 'clc'\n"
             + "-" * 80 + "\n"
         )
