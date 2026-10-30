@@ -117,6 +117,25 @@ class TestMatrixOperations(EngineCase):
         self.assertValue('log10(1000)', 3)
         self.assertValue('exp(1)', np.e)
 
+    def test_rounding(self):
+        # MATLAB rounds halves away from zero (NumPy's np.round would give -2 -2 0 0 2 2)
+        self.assertValue('round([-2.5 -1.5 -0.5 0.5 1.5 2.5])', [-3, -2, -1, 1, 2, 3])
+        self.assertValue('round(0.49999999999999994)', 0)
+        self.assertValue('round(pi, 2)', 3.14)
+        self.assertValue('round(0.125, 2)', 0.13)
+        self.assertValue('round(1234.5678, -2)', 1200)
+        self.assertValue('round(2.5 + 1.5i)', 3 + 2j)          # real and imaginary parts separately
+        self.assertValue('floor([-2.5 2.5])', [-3, 2])
+        self.assertValue('ceil([-2.5 2.5])', [-2, 3])
+        self.assertValue('floor(-0.5 + 2.7i)', -1 + 2j)
+        self.assertValue('round([Inf -Inf])', [np.inf, -np.inf])
+        self.assertValue('round(5, -400)', 0)
+        self.assertValue('round(123, 400)', 123)
+        self.assertEqual(self.out('round(-0.4)'), 'ans =\n    0\n')  # no '-0'
+        self.assertError('round(1, 1.5)', 'must be an integer scalar')
+        self.assertError('round(1, 2, 3)', 'Too many input arguments')
+        self.assertError('ceil()', 'Not enough input arguments')
+
     def test_complex_results(self):
         self.assertValue('sqrt(-4)', 2j)
         self.assertValue('(-8)^(1/3)', complex(-8) ** (1 / 3))
@@ -262,6 +281,11 @@ class TestCommands(EngineCase):
 
     def test_clc(self):
         self.assertIs(self.eng.execute('clc')[0], mc.CLEAR_SCREEN)
+
+    def test_version(self):
+        self.assertEqual(self.out('version'), f'{mc.APP_NAME} {mc.APP_VERSION}\n')
+        self.assertEqual(self.out('version;'), '')
+        self.assertValue('version = 2', 2, var='version')     # still usable as a variable name
 
     def test_exit(self):
         self.assertIs(self.eng.execute('exit')[-1], mc.EXIT_APP)

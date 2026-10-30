@@ -19,7 +19,7 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
-APP_VERSION = '0.1.3'           # Shown in the welcome banner; see the version history in README.md
+APP_VERSION = '0.1.4'           # Shown in the welcome banner; see the version history in README.md
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
 WINDOW_HEIGHT = 520             # Initial window height in pixels
@@ -287,6 +287,45 @@ def _unary_fn(np_func):
     return lambda x: to_matrix(np_func(x))
 
 
+def _componentwise(func):
+    """Apply func to real and imaginary parts separately, as MATLAB's rounding functions do."""
+    def apply(x):
+        if np.iscomplexobj(x):
+            return to_matrix(func(x.real) + 1j * func(x.imag))
+        return to_matrix(func(x))
+    return apply
+
+
+def _round_half_away(v):
+    """Nearest integer with halves rounded away from zero (MATLAB), e.g. 2.5 -> 3 and -2.5 -> -3.
+
+    NumPy's np.round rounds halves to the nearest even number instead (2.5 -> 2).
+    """
+    a = np.abs(v)
+    whole = np.floor(a)
+    return np.copysign(whole + (a - whole >= 0.5), v)
+
+
+def fn_round(x, digits=None):
+    """round(X) to integers, or round(X, N) to N decimals (N < 0 rounds to tens, hundreds, ...)."""
+    if digits is None:
+        return _componentwise(_round_half_away)(x)
+    if digits.size != 1 or np.iscomplexobj(digits) or not float(digits.flat[0]).is_integer():
+        raise MatlabError("Error using round\nThe number of digits N must be an integer scalar.")
+    n = int(digits.flat[0])
+
+    def round_to(v):
+        if n > 308:   # finer than double precision: nothing to round
+            return v
+        if n < -308:  # coarser than the largest double: every finite value rounds to 0
+            return np.where(np.isfinite(v), 0.0 * v, v)
+        if n >= 0:
+            scaled = v * 10.0 ** n
+            return np.where(np.isfinite(scaled), _round_half_away(scaled) / 10.0 ** n, v)
+        return _round_half_away(v / 10.0 ** -n) * 10.0 ** -n
+    return _componentwise(round_to)(x)
+
+
 CONSTANTS = {
     'pi': np.pi, 'e': np.e,
     'Inf': np.inf, 'inf': np.inf, 'NaN': np.nan, 'nan': np.nan,
@@ -305,6 +344,9 @@ FUNCTIONS = {  # name: (callable, minimum number of arguments, maximum number of
     'log': (_unary_fn(np.emath.log), 1, 1),       # log(-1) = pi*i
     'log10': (_unary_fn(np.emath.log10), 1, 1),
     'abs': (_unary_fn(np.abs), 1, 1),
+    'round': (fn_round, 1, 2),
+    'floor': (_componentwise(np.floor), 1, 1),
+    'ceil': (_componentwise(np.ceil), 1, 1),
     'eye': (lambda *a: to_matrix(np.eye(*_size_args('eye', a))), 0, 2),
     'zeros': (lambda *a: to_matrix(np.zeros(_size_args('zeros', a))), 0, 2),
     'ones': (lambda *a: to_matrix(np.ones(_size_args('ones', a))), 0, 2),
@@ -696,7 +738,7 @@ class MatlabEngine:
         return output
 
     def _run_statement(self, text, suppressed):
-        result = self._run_command(text)
+        result = self._run_command(text, suppressed)
         if result is not None:
             return result
         target, node = Parser(tokenize(text)).parse_statement()
@@ -709,7 +751,7 @@ class MatlabEngine:
             self.variables[target] = value
         return [] if suppressed else [f"{target} =\n{self.format_value(value)}\n"]
 
-    def _run_command(self, text):
+    def _run_command(self, text, suppressed=False):
         """Console commands (command syntax). Returns None if text is not a command."""
         words = text.split()
         name, args = words[0], words[1:]
@@ -717,6 +759,8 @@ class MatlabEngine:
             return [CLEAR_SCREEN]
         if name in ('exit', 'quit') and not args:
             return [EXIT_APP]
+        if name == 'version' and not args:
+            return [] if suppressed else [f"{APP_NAME} {APP_VERSION}\n"]
         if name == 'whos' and not args:
             return [self._whos()]
         if name == 'format' and len(args) <= 1 and all(w.isalpha() for w in args):
@@ -1001,7 +1045,7 @@ class MatlabConsoleApp:
 
         self.write_output(
             f"{APP_NAME} {APP_VERSION} - MATLAB Syntax Calculator\n"
-            "Commands: 'format short', 'format long', 'clear <var>', 'clear all', 'whos', 'clc', 'exit'\n"
+            "Commands: format short/long, clear <var>/all, whos, clc, version, exit\n"
             + "-" * 80 + "\n"
         )
         self.show_prompt()

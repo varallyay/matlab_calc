@@ -1,6 +1,6 @@
 # Matlab_Calc — MATLAB Command Window Emulator (`matlab_calc.py`)
 
-**Version 0.1.3** — see [Version History](#version-history).
+**Version 0.1.4** — see [Version History](#version-history).
 
 A lightweight, interactive desktop calculator built with Python, Tkinter, and NumPy that emulates the look, feel, and matrix-first syntax of the **MATLAB Command Window**.
 
@@ -50,7 +50,7 @@ All settings are constants at the top of `matlab_calc.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `'Matlab_Calc'` | Window title, Tk class name and macOS menu-bar name |
-| `APP_VERSION` | `'0.1.3'` | Version number, shown in the welcome banner (also available as `matlab_calc.__version__`) |
+| `APP_VERSION` | `'0.1.4'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
 | `WINDOW_WIDTH`, `WINDOW_HEIGHT` | `750`, `520` | Initial window size in pixels |
 | `APP_ICON_FILE` | `'icon.png'` | Icon image, looked up next to the script |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size (keeps the Dock icon the same size as native macOS icons) |
@@ -123,6 +123,11 @@ Listed from highest to lowest precedence group:
   - `inv(M)` — matrix inverse
   - `det(M)` — matrix determinant
   - `abs(x)` — absolute value / magnitude
+- **Rounding** (element-wise; complex numbers are rounded in their real and imaginary parts separately):
+  - `round(x)` — nearest integer, halves rounded away from zero as in MATLAB (`round(2.5) = 3`, `round(-2.5) = -3`)
+  - `round(x, n)` — round to `n` decimals (`round(pi, 2) = 3.14`); a negative `n` rounds to tens, hundreds, … (`round(1234, -2) = 1200`)
+  - `floor(x)` — round toward minus infinity (`floor(-2.5) = -3`)
+  - `ceil(x)` — round toward plus infinity (`ceil(-2.5) = -2`)
 
 ### 4. Console & Workspace Commands
 | Command | Description |
@@ -133,6 +138,7 @@ Listed from highest to lowest precedence group:
 | `clear <var> ...` | Remove specific variable(s) from the workspace |
 | `clear` / `clear all` | Clear all variables from the workspace |
 | `clc` | Clear the command window screen |
+| `version` | Show the application name and version number |
 | `exit` / `quit` | Close the application |
 
 Typing a variable's name shows its value without changing `ans`.
@@ -158,11 +164,15 @@ Array indexing (`A(2,3)`) and indexed assignment, character strings, user functi
 python3 test_matlab_calc.py
 ```
 
-Runs 38 tests covering operators, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available.
+Runs 40 tests covering operators, rounding, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available.
 
 ---
 
 ## Version History
+
+### 0.1.4 — 2026-10-30
+- **New command:** `version` shows the application name and version number.
+- **New functions:** `round(x)`, `round(x, n)`, `floor(x)` and `ceil(x)`. `round` follows MATLAB and rounds halves away from zero.
 
 ### 0.1.3 — 2026-10-30
 - **New command:** `exit` (or `quit`) closes the application. Statements after it on the same line are not run.
