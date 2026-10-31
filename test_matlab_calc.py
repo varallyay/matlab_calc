@@ -5,6 +5,7 @@ skipped otherwise); the anti-aliased icon test also needs Pillow.
 """
 import importlib.util
 import os
+import re
 import sys
 import tempfile
 import tkinter as tk
@@ -30,8 +31,7 @@ class EngineCase(unittest.TestCase):
 
     def ans(self, line, var='ans'):
         text = self.out(line)
-        self.assertNotIn('Error', text, f"{line!r} -> {text}")
-        self.assertNotIn('Unrecognized', text, f"{line!r} -> {text}")
+        self.assertIsNone(self.eng.last_error, f"{line!r} -> {text}")
         return self.eng.variables[var]
 
     def assertValue(self, line, expected, var='ans'):
@@ -42,6 +42,7 @@ class EngineCase(unittest.TestCase):
 
     def assertError(self, line, fragment):
         text = self.out(line)
+        self.assertIsNotNone(self.eng.last_error, f"{line!r} should fail -> {text}")
         self.assertIn(fragment, text, f"{line!r} -> {text}")
 
 
@@ -116,6 +117,31 @@ class TestMatrixOperations(EngineCase):
         self.assertValue('abs([-3 4])', [3, 4])
         self.assertValue('log10(1000)', 3)
         self.assertValue('exp(1)', np.e)
+
+    def test_power_and_times_functions(self):
+        self.assertValue('power(A, 2)', self.A ** 2)
+        self.assertValue('power(A, b)', self.A ** np.array([[1], [2]]))     # implicit expansion
+        self.assertValue('power(2, [1 2 3])', [2, 4, 8])
+        self.assertValue('power(-8, 1/3)', complex(-8) ** (1 / 3))
+        self.assertValue('times(A, A)', self.A * self.A)
+        self.assertValue('times([1 2 3], [4; 5])', [[4, 8, 12], [5, 10, 15]])
+        self.assertValue('times(2, 3)', 6)
+        for a, b in (('A', 'b'), ('[1 2 3]', '[1; 2]'), ('2', 'A'), ('A', "A'")):
+            self.assertValue(f'power({a}, {b}) - {a}.^({b})', np.zeros_like(self.ans(f'{a}.^({b})')))
+            self.assertValue(f'times({a}, {b}) - {a}.*({b})', np.zeros_like(self.ans(f'{a}.*({b})')))
+        self.assertError('power([1 2 3], [1 2])', 'Arrays have incompatible sizes')
+        self.assertError('times(1)', 'Not enough input arguments')
+        self.assertError('power(1, 2, 3)', 'Too many input arguments')
+
+    def test_constants(self):
+        self.assertValue('pi', np.pi)
+        self.assertValue('e', np.e)
+        self.assertValue('[Inf inf]', [np.inf, np.inf])
+        self.assertValue('i + j', 2j)
+        self.assertTrue(np.isnan(self.ans('NaN')).all())
+        self.assertValue('pi()', np.pi)
+        self.assertError('pi(2)', 'Too many input arguments')
+        self.assertValue('i = 5; i', 5, var='i')                  # a variable hides the constant
 
     def test_rounding(self):
         # MATLAB rounds halves away from zero (NumPy's np.round would give -2 -2 0 0 2 2)
@@ -213,7 +239,6 @@ class TestParsing(EngineCase):
         self.assertError('y = 1 +', 'incomplete')
         self.assertError('1 2', "Invalid expression near '2'")
         self.assertError("'abc'", 'strings are not supported')
-        self.assertError('x = 1; x(1)', 'Indexing into variables')
         self.assertError('x(1) = 2', 'Only assignments')
         self.assertError('sin(1, 2)', 'Too many input arguments')
         self.assertError('sin()', 'Not enough input arguments')
@@ -224,6 +249,86 @@ class TestParsing(EngineCase):
         self.assertIn('a =', text)
         self.assertNotIn('b =', text)
         self.assertNotIn('b', self.eng.variables)
+
+
+class TestIndexing(EngineCase):
+    A = np.arange(1, 13, dtype=float).reshape(3, 4)   # [1 2 3 4; 5 6 7 8; 9 10 11 12]
+    COLUMN_MAJOR = A.ravel(order='F')                  # MATLAB numbers elements down the columns
+
+    def setUp(self):
+        super().setUp()
+        self.out('A = [1 2 3 4; 5 6 7 8; 9 10 11 12]; v = [10 20 30 40]; c = [10; 20; 30];')
+
+    def test_elements(self):
+        self.assertValue('A(2,3) + A(1,4)', 7 + 4)
+        self.assertValue('A(2,3)', 7)
+        self.assertValue('A(3, 1)', 9)
+        self.assertValue('A(5)', self.COLUMN_MAJOR[4])         # 6
+        self.assertValue('v(3)', 30)
+        self.assertValue('c(2)', 20)
+        self.assertValue('A(2,3) * v(4) - c(1) ./ A(1)', 7 * 40 - 10)
+        self.assertValue('A(A(1,2), A(1,3))', 7)              # subscripts can be expressions
+        self.assertValue('sqrt(A(3,4) + A(1,4))', 4)
+        self.assertValue('[A(1,1) A(3,4); v(1:2)]', [[1, 12], [10, 20]])
+        self.assertValue('x = 5; x(1)', 5)
+        self.assertValue('ans(1)', 5)
+
+    def test_rows_columns_and_ranges(self):
+        self.assertValue('A(2, :)', self.A[1:2, :])
+        self.assertValue('A(:, 3)', self.A[:, 2:3])
+        self.assertValue('A(1:2, [1 3])', self.A[np.ix_([0, 1], [0, 2])])
+        self.assertValue('A([3 1], 2)', self.A[np.ix_([2, 0], [1])])
+        self.assertValue('A(:, :)', self.A)
+        self.assertValue('A()', self.A)
+        self.assertValue('A(:)', self.COLUMN_MAJOR.reshape(-1, 1))
+        self.assertValue('v(2:3)', [20, 30])
+        self.assertValue('v([1 1 2])', [10, 10, 20])
+
+    def test_end(self):
+        self.assertValue('A(end)', 12)
+        self.assertValue('A(end, 1)', 9)
+        self.assertValue('A(1, end)', 4)
+        self.assertValue('A(end-1, end-2:end)', [6, 7, 8])
+        self.assertValue('v(2:end)', [20, 30, 40])
+        self.assertValue('v(end:-1:1)', [40, 30, 20, 10])
+        self.assertValue('A(round(end/2))', self.COLUMN_MAJOR[5])  # end inside a function call
+        self.assertValue('A(v(end) / 20, end)', 8)             # inner end belongs to v: A(40/20, 4)
+        self.assertError('A(v(end) / 10, end)', 'Index in position 1 exceeds array bounds')  # A(4, 4)
+
+    def test_result_shapes(self):
+        self.assertValue('v([1; 3])', [10, 30])                # a vector keeps its orientation
+        self.assertValue('c([1 3])', [[10], [30]])
+        self.assertValue('A([1 2; 3 4])', self.COLUMN_MAJOR[np.array([[1, 2], [3, 4]]) - 1])  # [A(1) A(2); A(3) A(4)]
+        self.assertValue('A([2 3])', [5, 9])                   # matrix(row vector) is a row
+        self.assertValue('x = 7; x([1 1 1])', [7, 7, 7])
+        self.assertEqual(self.ans('A([])').shape, (0, 0))
+        self.assertEqual(self.ans('v([])').size, 0)
+
+    def test_variables_shadow_functions(self):
+        self.assertValue('sin = [5 6 7]; sin(2)', 6)
+        self.assertValue('clear sin; sin(0)', 0)
+
+    def test_errors(self):
+        self.assertError('A(3, 5)', 'Index in position 2 exceeds array bounds. Index must not exceed 4.')
+        self.assertError('A(4, 1)', 'Index in position 1 exceeds array bounds. Index must not exceed 3.')
+        self.assertError('A(13)', 'Index exceeds the number of array elements. Index must not exceed 12.')
+        self.assertError('A(end + 1)', 'Index must not exceed 12')
+        self.assertError('A(0)', 'Array indices must be positive integers')
+        self.assertError('A(1.5, 1)', 'Index in position 1 is invalid.')
+        self.assertError('A(-1)', 'Array indices must be positive integers')
+        self.assertError('A(NaN)', 'Array indices must be positive integers')
+        self.assertError('A(1, 2, 3)', 'Only one or two subscripts')
+        self.assertError('A(2,3) = 5', 'Only assignments')
+        self.assertError('end + 1', "'end' can only be used inside the subscript")
+        self.assertError('sin(end)', "'end' can only be used inside the subscript")
+        self.assertError('sin(:)', 'A colon on its own can only be used as a subscript')
+        self.assertError('end = 3', "'end' is a keyword")
+        self.assertError('foo(1)', "Unrecognized function or variable 'foo'")
+
+    def test_display(self):
+        self.assertEqual(self.out('A(2,3) + A(1,4)'), 'ans =\n    11\n')
+        self.assertEqual(self.out('A(:, end)'), 'ans =\n     4\n     8\n    12\n')
+        self.assertIn('A(i, j)', self.out('help end'))
 
 
 class TestDisplay(EngineCase):
@@ -304,6 +409,70 @@ class TestCommands(EngineCase):
         self.assertValue('clc = 4', 4, var='clc')
         self.assertValue('format = 2', 2, var='format')
         self.assertError('format compact', "Unsupported format 'compact'")
+
+
+class TestHelp(EngineCase):
+    def all_documented(self):
+        """Every command and function object, with the names it is registered under."""
+        entries = list(mc.COMMANDS.items()) + list(mc.FUNCTIONS.items())
+        return [(name, entry[0]) for name, entry in entries]
+
+    def test_every_command_and_function_has_help(self):
+        for name, func in self.all_documented():
+            with self.subTest(name=name):
+                text = mc.help_text(func)
+                h1 = text.splitlines()[0]
+                self.assertRegex(h1, r'^\S+ - [A-Z].*\.$', 'first line must be "name - Summary."')
+                self.assertIn(h1.split(' - ')[0], func.matlab_names)
+                self.assertGreater(len(text.splitlines()), 2, 'help needs more than the summary line')
+                self.assertNotRegex(text, r'\{[A-Z_]+\}', 'unfilled {PARAMETER} field')
+                self.assertIn(func.help_category, mc.HELP_CATEGORIES)
+
+    def test_overview_lists_everything(self):
+        text = self.out('help')
+        self.assertTrue(text.startswith(f'  {mc.APP_NAME} {mc.APP_VERSION} - '), text)
+        for name, func in self.all_documented():
+            self.assertRegex(text, rf'\n    [^\n]*\b{re.escape(name)}\b[^\n]* - {re.escape(mc.help_summary(func))}\n')
+        for ops, meaning in mc.OPERATOR_SUMMARY:
+            self.assertRegex(text, re.escape(ops) + ' +' + re.escape(meaning))
+        for category in mc.HELP_CATEGORIES:
+            self.assertIn(f'\n  {category}\n', text)
+
+    def test_help_fits_the_window(self):
+        topics = ['', 'ops'] + [name for name, _ in self.all_documented()]
+        for topic in topics:
+            for line in self.out(f'help {topic}').splitlines():
+                self.assertLessEqual(len(line), 76, f'help {topic}: {line!r}')
+
+    def test_help_for_a_name(self):
+        expected = '\n'.join(('  ' + line).rstrip() for line in mc.help_text(mc.fn_round).splitlines()) + '\n'
+        self.assertEqual(self.out('help round'), expected)
+        self.assertEqual(self.out('help ROUND'), expected)          # not case-sensitive
+        self.assertIn('away from zero', expected)
+        self.assertIn('the same as A.^B', self.out('help power'))
+        self.assertIn('the same as A.*B', self.out('help times'))
+        self.assertEqual(self.out('help quit'), self.out('help exit'))
+        self.assertEqual(self.out('help inf'), self.out('help Inf'))
+        self.assertIn(f'shows up to {mc.SHORT_DECIMALS} decimals', self.out('help format'))
+        self.assertIn(f'{mc.APP_NAME} {mc.APP_VERSION}', self.out('help version'))
+        self.assertIn('help NAME', self.out('help help'))
+        two = self.out('help sin cos')
+        self.assertIn('sin - Sine', two)
+        self.assertIn('cos - Cosine', two)
+
+    def test_help_for_operators(self):
+        ops = self.out('help ops')
+        self.assertIn('ops - Operators and special characters.', ops)
+        for topic in ('.*', '+', '\\', "'", '==', ':', 'mtimes', 'operators'):
+            self.assertEqual(self.out(f'help {topic}'), ops, topic)
+
+    def test_help_for_unknown_names_and_variables(self):
+        self.assertIn('foo not found', self.out('help foo'))
+        self.out('x = 1;')
+        self.assertIn('x is a variable', self.out('help x'))
+        self.assertValue('help = 3', 3, var='help')                  # still usable as a variable name
+        self.assertValue('format =2', 2, var='format')
+        self.assertIn('ops - Operators', self.out('help ='))        # ...while 'help =' explains '='
 
 
 def make_root(visible=False):

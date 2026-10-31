@@ -4,6 +4,7 @@ Matlab_Calc - a MATLAB Command Window emulator built with Tkinter and NumPy.
 Run with:  python3 matlab_calc.py
 """
 
+import inspect
 import math
 import os
 import re
@@ -19,7 +20,7 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
-APP_VERSION = '0.1.4'           # Shown in the welcome banner; see the version history in README.md
+APP_VERSION = '0.3.0'           # Shown in the welcome banner; see the version history in README.md
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
 WINDOW_HEIGHT = 520             # Initial window height in pixels
@@ -246,8 +247,46 @@ UNARY_OPS = {
 
 
 # =============================================================================
-#  Built-in constants and functions
+#  Built-in functions and constants
+#
+#  As in a MATLAB function file, every built-in starts with its help text: the
+#  docstring. Its first line, "name - Summary.", is the H1 line listed by 'help';
+#  'help name' shows the whole text. Fields such as {APP_NAME} or {SHORT_DECIMALS}
+#  are filled in from the parameters when the help is displayed.
+#
+#  To add a function, write a Python function with such a docstring and decorate
+#  it with @builtin. It receives MATLAB values (2-D NumPy arrays) and must return
+#  one; the number of inputs it accepts comes from its signature, and parameters
+#  with a default value (None) are optional.
 # =============================================================================
+CAT_COMMANDS = 'Console commands'
+CAT_CONSTANTS = 'Constants'
+CAT_MATH = 'Elementary math'
+CAT_ELEMENTWISE = 'Element-wise arithmetic'
+CAT_TRIG = 'Trigonometry'
+CAT_ROUNDING = 'Rounding'
+CAT_MATRIX = 'Matrices and linear algebra'
+HELP_CATEGORIES = (CAT_COMMANDS, CAT_CONSTANTS, CAT_MATH, CAT_ELEMENTWISE, CAT_TRIG, CAT_ROUNDING, CAT_MATRIX)
+
+FUNCTIONS = {}  # MATLAB name -> (Python function, minimum inputs, maximum inputs)
+
+
+def builtin(*names, category):
+    """Register the decorated Python function as the MATLAB function(s) `names`."""
+    def register(func):
+        params = list(inspect.signature(func).parameters.values())
+        min_args = sum(p.default is inspect.Parameter.empty for p in params)
+        for name in names:
+            FUNCTIONS[name] = (func, min_args, len(params))
+        func.matlab_names, func.help_category = names, category
+        return func
+    return register
+
+
+def _given(*args):
+    return [a for a in args if a is not None]
+
+
 def _size_args(name, args):
     """Size arguments of eye/zeros/ones: (), (n), (r, c) or ([r c])."""
     if not args:
@@ -270,30 +309,11 @@ def _need_square(name, x):
         raise MatlabError(f"Error using {name}\nMatrix must be square.")
 
 
-def fn_inv(x):
-    _need_square('inv', x)
-    try:
-        return to_matrix(np.linalg.inv(x))
-    except np.linalg.LinAlgError:
-        raise MatlabError("Error using inv\nMatrix is singular to working precision.") from None
-
-
-def fn_det(x):
-    _need_square('det', x)
-    return to_matrix(np.linalg.det(x))
-
-
-def _unary_fn(np_func):
-    return lambda x: to_matrix(np_func(x))
-
-
-def _componentwise(func):
+def _componentwise(func, x):
     """Apply func to real and imaginary parts separately, as MATLAB's rounding functions do."""
-    def apply(x):
-        if np.iscomplexobj(x):
-            return to_matrix(func(x.real) + 1j * func(x.imag))
-        return to_matrix(func(x))
-    return apply
+    if np.iscomplexobj(x):
+        return to_matrix(func(x.real) + 1j * func(x.imag))
+    return to_matrix(func(x))
 
 
 def _round_half_away(v):
@@ -306,53 +326,442 @@ def _round_half_away(v):
     return np.copysign(whole + (a - whole >= 0.5), v)
 
 
-def fn_round(x, digits=None):
-    """round(X) to integers, or round(X, N) to N decimals (N < 0 rounds to tens, hundreds, ...)."""
-    if digits is None:
-        return _componentwise(_round_half_away)(x)
-    if digits.size != 1 or np.iscomplexobj(digits) or not float(digits.flat[0]).is_integer():
+# ---- constants ---------------------------------------------------------------
+@builtin('pi', category=CAT_CONSTANTS)
+def fn_pi():
+    """pi - Ratio of a circle's circumference to its diameter.
+
+    pi is 3.141592653589793.
+
+    See also e.
+    """
+    return to_matrix(np.pi)
+
+
+@builtin('e', category=CAT_CONSTANTS)
+def fn_e():
+    """e - Euler's number, the base of the natural logarithm.
+
+    e is 2.718281828459045, the same as exp(1).
+    Note: MATLAB itself has no constant e; use exp(1) there.
+
+    See also exp, log.
+    """
+    return to_matrix(np.e)
+
+
+@builtin('Inf', 'inf', category=CAT_CONSTANTS)
+def fn_inf():
+    """Inf - Infinity.
+
+    Inf is positive infinity, for example the result of 1/0; -Inf is negative
+    infinity.
+
+    See also NaN.
+    """
+    return to_matrix(np.inf)
+
+
+@builtin('NaN', 'nan', category=CAT_CONSTANTS)
+def fn_nan():
+    """NaN - Not-a-Number.
+
+    NaN is the result of undefined operations such as 0/0 or Inf - Inf.
+    NaN is not equal to anything, not even to itself: NaN == NaN is 0.
+
+    See also Inf.
+    """
+    return to_matrix(np.nan)
+
+
+@builtin('i', 'j', category=CAT_CONSTANTS)
+def fn_imaginary_unit():
+    """i - Imaginary unit.
+
+    i and j are the imaginary unit, sqrt(-1). Complex numbers can also be
+    written directly, as in 3 + 4i or 3 + 4j.
+    A variable named i or j hides the constant.
+
+    See also sqrt, abs.
+    """
+    return to_matrix(1j)
+
+
+# ---- elementary math ---------------------------------------------------------
+@builtin('abs', category=CAT_MATH)
+def fn_abs(x):
+    """abs - Absolute value and complex magnitude.
+
+    abs(X) is the absolute value of each element of X. For complex X it is
+    the magnitude: abs(3 + 4i) is 5.
+
+    See also sqrt.
+    """
+    return to_matrix(np.abs(x))
+
+
+@builtin('sqrt', category=CAT_MATH)
+def fn_sqrt(x):
+    """sqrt - Square root.
+
+    sqrt(X) is the square root of each element of X. Negative elements give
+    complex results, as in MATLAB: sqrt(-4) is 0 + 2i.
+
+    See also power, exp, log.
+    """
+    return to_matrix(np.emath.sqrt(x))
+
+
+@builtin('exp', category=CAT_MATH)
+def fn_exp(x):
+    """exp - Exponential.
+
+    exp(X) is e raised to the power of each element of X.
+
+    See also log, power.
+    """
+    return to_matrix(np.exp(x))
+
+
+@builtin('log', category=CAT_MATH)
+def fn_log(x):
+    """log - Natural logarithm.
+
+    log(X) is the natural (base e) logarithm of each element of X. Negative
+    elements give complex results: log(-1) is 0 + 3.1416i. log(0) is -Inf.
+
+    See also log10, exp.
+    """
+    return to_matrix(np.emath.log(x))
+
+
+@builtin('log10', category=CAT_MATH)
+def fn_log10(x):
+    """log10 - Common (base 10) logarithm.
+
+    log10(X) is the base 10 logarithm of each element of X: log10(1000) is 3.
+    Negative elements give complex results.
+
+    See also log, exp.
+    """
+    return to_matrix(np.emath.log10(x))
+
+
+# ---- element-wise arithmetic -------------------------------------------------
+@builtin('power', category=CAT_ELEMENTWISE)
+def fn_power(a, b):
+    """power - Element-wise power, the same as A.^B.
+
+    power(A, B) raises each element of A to the corresponding element of B.
+    A and B must have compatible sizes: the same size, one of them a scalar,
+    or a row and a column vector (which expand to a matrix).
+    A negative base with a non-integer exponent gives a complex result.
+
+    Examples:
+        power([1 2 3], 2)     % 1  4  9
+        power(2, [1 2 3])     % 2  4  8
+
+    The ^ operator is the matrix power (see help ops).
+
+    See also times, sqrt, exp.
+    """
+    return op_power(a, b)
+
+
+@builtin('times', category=CAT_ELEMENTWISE)
+def fn_times(a, b):
+    """times - Element-wise multiplication, the same as A.*B.
+
+    times(A, B) multiplies corresponding elements of A and B. A and B must
+    have compatible sizes: the same size, one of them a scalar, or a row and
+    a column vector (which expand to a matrix).
+
+    Example:
+        times([1 2 3], [4 5 6])     % 4  10  18
+
+    The * operator is the matrix product (see help ops).
+
+    See also power.
+    """
+    return BINARY_OPS['.*'](a, b)
+
+
+# ---- trigonometry ------------------------------------------------------------
+@builtin('sin', category=CAT_TRIG)
+def fn_sin(x):
+    """sin - Sine of an angle in radians.
+
+    sin(X) is the sine of each element of X.
+
+    See also asin, cos, tan.
+    """
+    return to_matrix(np.sin(x))
+
+
+@builtin('cos', category=CAT_TRIG)
+def fn_cos(x):
+    """cos - Cosine of an angle in radians.
+
+    cos(X) is the cosine of each element of X.
+
+    See also acos, sin, tan.
+    """
+    return to_matrix(np.cos(x))
+
+
+@builtin('tan', category=CAT_TRIG)
+def fn_tan(x):
+    """tan - Tangent of an angle in radians.
+
+    tan(X) is the tangent of each element of X.
+
+    See also atan, sin, cos.
+    """
+    return to_matrix(np.tan(x))
+
+
+@builtin('asin', category=CAT_TRIG)
+def fn_asin(x):
+    """asin - Inverse sine, result in radians.
+
+    asin(X) is the arcsine of each element of X, between -pi/2 and pi/2.
+    Elements outside [-1, 1] give NaN (MATLAB returns a complex number).
+
+    See also sin, acos, atan.
+    """
+    return to_matrix(np.arcsin(x))
+
+
+@builtin('acos', category=CAT_TRIG)
+def fn_acos(x):
+    """acos - Inverse cosine, result in radians.
+
+    acos(X) is the arccosine of each element of X, between 0 and pi.
+    Elements outside [-1, 1] give NaN (MATLAB returns a complex number).
+
+    See also cos, asin, atan.
+    """
+    return to_matrix(np.arccos(x))
+
+
+@builtin('atan', category=CAT_TRIG)
+def fn_atan(x):
+    """atan - Inverse tangent, result in radians.
+
+    atan(X) is the arctangent of each element of X, between -pi/2 and pi/2.
+
+    See also tan, asin, acos.
+    """
+    return to_matrix(np.arctan(x))
+
+
+# ---- rounding ----------------------------------------------------------------
+@builtin('round', category=CAT_ROUNDING)
+def fn_round(x, n=None):
+    """round - Round to the nearest integer or to N decimals.
+
+    round(X) rounds each element of X to the nearest integer. Halves are
+    rounded away from zero, as in MATLAB: round(2.5) is 3, round(-2.5) is -3.
+
+    round(X, N) rounds to N digits after the decimal point. A negative N
+    rounds to the left of the decimal point: to tens, hundreds, ...
+
+    Complex numbers are rounded in their real and imaginary parts separately.
+
+    Examples:
+        round(pi, 2)        % 3.14
+        round(1234, -2)     % 1200
+
+    See also floor, ceil.
+    """
+    if n is None:
+        return _componentwise(_round_half_away, x)
+    if n.size != 1 or np.iscomplexobj(n) or not float(n.flat[0]).is_integer():
         raise MatlabError("Error using round\nThe number of digits N must be an integer scalar.")
-    n = int(digits.flat[0])
+    digits = int(n.flat[0])
 
     def round_to(v):
-        if n > 308:   # finer than double precision: nothing to round
+        if digits > 308:   # finer than double precision: nothing to round
             return v
-        if n < -308:  # coarser than the largest double: every finite value rounds to 0
+        if digits < -308:  # coarser than the largest double: every finite value rounds to 0
             return np.where(np.isfinite(v), 0.0 * v, v)
-        if n >= 0:
-            scaled = v * 10.0 ** n
-            return np.where(np.isfinite(scaled), _round_half_away(scaled) / 10.0 ** n, v)
-        return _round_half_away(v / 10.0 ** -n) * 10.0 ** -n
-    return _componentwise(round_to)(x)
+        if digits >= 0:
+            scaled = v * 10.0 ** digits
+            return np.where(np.isfinite(scaled), _round_half_away(scaled) / 10.0 ** digits, v)
+        return _round_half_away(v / 10.0 ** -digits) * 10.0 ** -digits
+    return _componentwise(round_to, x)
 
 
-CONSTANTS = {
-    'pi': np.pi, 'e': np.e,
-    'Inf': np.inf, 'inf': np.inf, 'NaN': np.nan, 'nan': np.nan,
-    'i': 1j, 'j': 1j,
+@builtin('floor', category=CAT_ROUNDING)
+def fn_floor(x):
+    """floor - Round toward minus infinity.
+
+    floor(X) rounds each element of X to the nearest integer less than or
+    equal to it: floor(2.7) is 2, floor(-2.5) is -3.
+    Complex numbers are rounded in their real and imaginary parts separately.
+
+    See also ceil, round.
+    """
+    return _componentwise(np.floor, x)
+
+
+@builtin('ceil', category=CAT_ROUNDING)
+def fn_ceil(x):
+    """ceil - Round toward plus infinity.
+
+    ceil(X) rounds each element of X to the nearest integer greater than or
+    equal to it: ceil(2.1) is 3, ceil(-2.5) is -2.
+    Complex numbers are rounded in their real and imaginary parts separately.
+
+    See also floor, round.
+    """
+    return _componentwise(np.ceil, x)
+
+
+# ---- matrices and linear algebra ---------------------------------------------
+@builtin('eye', category=CAT_MATRIX)
+def fn_eye(m=None, n=None):
+    """eye - Identity matrix.
+
+    eye(N) is the N-by-N identity matrix.
+    eye(M, N) or eye([M N]) is an M-by-N matrix with ones on the diagonal.
+
+    See also zeros, ones.
+    """
+    return to_matrix(np.eye(*_size_args('eye', _given(m, n))))
+
+
+@builtin('zeros', category=CAT_MATRIX)
+def fn_zeros(m=None, n=None):
+    """zeros - Matrix of zeros.
+
+    zeros(N) is an N-by-N matrix of zeros.
+    zeros(M, N) or zeros([M N]) is an M-by-N matrix of zeros.
+
+    See also ones, eye.
+    """
+    return to_matrix(np.zeros(_size_args('zeros', _given(m, n))))
+
+
+@builtin('ones', category=CAT_MATRIX)
+def fn_ones(m=None, n=None):
+    """ones - Matrix of ones.
+
+    ones(N) is an N-by-N matrix of ones.
+    ones(M, N) or ones([M N]) is an M-by-N matrix of ones.
+
+    See also zeros, eye.
+    """
+    return to_matrix(np.ones(_size_args('ones', _given(m, n))))
+
+
+@builtin('inv', category=CAT_MATRIX)
+def fn_inv(x):
+    """inv - Matrix inverse.
+
+    inv(X) is the inverse of the square matrix X. A singular matrix gives
+    an error. To solve A*x = b, A\\b is faster and more accurate than
+    inv(A)*b.
+
+    See also det.
+    """
+    _need_square('inv', x)
+    try:
+        return to_matrix(np.linalg.inv(x))
+    except np.linalg.LinAlgError:
+        raise MatlabError("Error using inv\nMatrix is singular to working precision.") from None
+
+
+@builtin('det', category=CAT_MATRIX)
+def fn_det(x):
+    """det - Determinant.
+
+    det(X) is the determinant of the square matrix X.
+
+    See also inv.
+    """
+    _need_square('det', x)
+    return to_matrix(np.linalg.det(x))
+
+
+# ---- help texts --------------------------------------------------------------
+OPERATORS_HELP = r"""ops - Operators and special characters.
+
+Matrix arithmetic:
+    +     Addition                          -     Subtraction, unary minus
+    *     Matrix multiplication             ^     Matrix power
+    /     Right division: A/B solves X*B = A
+    \     Left division:  A\B solves A*X = B
+    '     Complex conjugate transpose
+
+Element-wise arithmetic:
+    .*    Multiplication (also times(A, B))
+    ./    Right division                    .\    Left division
+    .^    Power (also power(A, B))
+    .'    Transpose (without conjugation)
+
+Comparison (the result is 1 for true, 0 for false):
+    ==  equal    ~=  not equal    <  <=  >  >=
+
+Logical:
+    &  and    |  or    ~  not    &&  ||  short-circuit and / or (scalars)
+
+Special characters:
+    =        Assignment, e.g. x = 2
+    [ ]      Build a matrix: [1 2; 3 4]
+    ,        Separate elements, or statements
+    ;        Separate rows, or suppress output at the end of a statement
+    :        Range: a:b or a:step:b, e.g. 0:0.5:2
+    ( )      Grouping, function arguments and indexing
+    %        Comment: the rest of the line is ignored
+    ...      Continue the statement on the next line
+
+Indexing (elements are numbered from 1):
+    A(i, j)       Element in row i, column j, e.g. A(2,3) + A(1,4)
+    A(k)          Element k, counting down the columns: A(2) is A(2,1)
+    A(i, :)       Row i;  A(:, j) is column j;  A(:) is a column of all
+    A(1:2, [1 3]) Rows 1 to 2 of columns 1 and 3
+    end           Last index in that position: A(end), A(end, 1), v(2:end)
+Subscripts can be any expression giving positive whole numbers.
+
+Precedence, from highest to lowest:
+    ( )   ^ .^ ' .'   unary + - ~   * / \ .* ./ .\   + -   :
+    comparisons   &   |   &&   ||
+Operators of equal precedence are evaluated from left to right."""
+
+OPERATOR_SUMMARY = (
+    ("+  -  *  /  \\  ^  '", "matrix arithmetic"),
+    (".*  ./  .\\  .^  .'", "element-wise arithmetic"),
+    ("==  ~=  <  <=  >  >=", "comparison"),
+    ("&  |  ~  &&  ||", "logical"),
+    ("=  [ ]  ( )", "assignment, matrices, grouping"),
+    (",  ;  :  %  ...", "separators, ranges, comments"),
+    ("A(i, j)  A(k)  A(:, j)  end", "indexing"),
+)
+
+# 'help' followed by any of these shows OPERATORS_HELP
+OPERATOR_TOPICS = {
+    'ops', 'operators', '+', '-', '*', '/', '\\', '^', "'", '.*', './', '.\\', '.^', ".'",
+    '==', '~=', '<', '<=', '>', '>=', '&', '|', '~', '&&', '||', '=', '[', ']', '(', ')', ':', '%', '...',
+    'plus', 'minus', 'uplus', 'uminus', 'mtimes', 'mrdivide', 'mldivide', 'mpower', 'rdivide', 'ldivide',
+    'transpose', 'ctranspose', 'eq', 'ne', 'lt', 'le', 'gt', 'ge', 'and', 'or', 'not', 'colon',
+    'horzcat', 'vertcat', 'end', 'paren', 'indexing', 'index', 'subsref',
 }
 
-FUNCTIONS = {  # name: (callable, minimum number of arguments, maximum number of arguments)
-    'sin': (_unary_fn(np.sin), 1, 1),
-    'cos': (_unary_fn(np.cos), 1, 1),
-    'tan': (_unary_fn(np.tan), 1, 1),
-    'asin': (_unary_fn(np.arcsin), 1, 1),
-    'acos': (_unary_fn(np.arccos), 1, 1),
-    'atan': (_unary_fn(np.arctan), 1, 1),
-    'sqrt': (_unary_fn(np.emath.sqrt), 1, 1),     # sqrt(-4) = 2i, as in MATLAB
-    'exp': (_unary_fn(np.exp), 1, 1),
-    'log': (_unary_fn(np.emath.log), 1, 1),       # log(-1) = pi*i
-    'log10': (_unary_fn(np.emath.log10), 1, 1),
-    'abs': (_unary_fn(np.abs), 1, 1),
-    'round': (fn_round, 1, 2),
-    'floor': (_componentwise(np.floor), 1, 1),
-    'ceil': (_componentwise(np.ceil), 1, 1),
-    'eye': (lambda *a: to_matrix(np.eye(*_size_args('eye', a))), 0, 2),
-    'zeros': (lambda *a: to_matrix(np.zeros(_size_args('zeros', a))), 0, 2),
-    'ones': (lambda *a: to_matrix(np.ones(_size_args('ones', a))), 0, 2),
-    'inv': (fn_inv, 1, 1),
-    'det': (fn_det, 1, 1),
-}
+_HELP_FIELDS = re.compile(r"\{(APP_NAME|APP_VERSION|SHORT_DECIMALS|LONG_DECIMALS)\}")
+
+
+def help_text(func):
+    """Help of a built-in or console command: its docstring, with parameter fields filled in."""
+    doc = inspect.cleandoc(func.__doc__ or '')
+    if not doc:  # docstrings are removed when Python runs with -OO
+        return f"{func.matlab_names[0]} - No help available."
+    return _HELP_FIELDS.sub(lambda m: str(globals()[m.group(1)]), doc)
+
+
+def help_summary(func):
+    """The one-line description from the help's first ("H1") line."""
+    return help_text(func).splitlines()[0].partition(' - ')[2]
 
 
 # =============================================================================
@@ -537,10 +946,13 @@ class Parser:
         nxt = self.peek(1)
         if self.at('id') and nxt[0] == 'op' and nxt[1] == '=':
             target = self.advance()[1]
+            if target == 'end':
+                raise MatlabError("Error: 'end' is a keyword and cannot be used as a variable name.")
             self.advance()
         node = self.parse_expr()
         if self.at_op('='):
-            raise MatlabError("Error: Only assignments of the form 'name = expression' are supported.")
+            raise MatlabError("Error: Only assignments of the form 'name = expression' are supported;\n"
+                              "changing single elements, as in A(2,3) = 5, is not.")
         if not self.at('eof'):
             self.fail()
         return target, node
@@ -601,15 +1013,17 @@ class Parser:
             return ('num', tok[2])
         if tok[0] == 'id':
             self.advance()
+            if tok[1] == 'end':  # last index, as in A(end); checked when evaluated
+                return ('end',)
             if not self.at('('):
                 return ('name', tok[1], None)
-            self.advance()
+            self.advance()  # function arguments, or subscripts if the name is a variable
             args = []
             if not self.at(')'):
-                args.append(self.parse_expr())
+                args.append(self._argument())
                 while self.at(','):
                     self.advance()
-                    args.append(self.parse_expr())
+                    args.append(self._argument())
             self.expect(')')
             return ('name', tok[1], args)
         if tok[0] == '(':
@@ -621,6 +1035,13 @@ class Parser:
             self.advance()
             return self._matrix()
         self.fail()
+
+    def _argument(self):
+        nxt = self.peek(1)
+        if self.at_op(':') and nxt[0] in (',', ')'):  # a lone ':' selects a whole row/column, as in A(:, 1)
+            self.advance()
+            return ('colon_all',)
+        return self.parse_expr()
 
     def _matrix(self):
         rows, row = [], []
@@ -643,48 +1064,93 @@ class Parser:
         return ('matrix', [r for r in rows if r])
 
 
-def evaluate(node, variables):
-    """Evaluate a parse tree. Variables shadow constants and functions, as in MATLAB."""
+def _subscript(node, extent, variables, position):
+    """0-based indices selected by one subscript, and the subscript's shape (None for ':').
+
+    extent is the size of the indexed dimension (the number of elements for A(k));
+    it is also the value of 'end'. position is 1 or 2 for A(i, j), None for A(k).
+    """
+    if node[0] == 'colon_all':
+        return np.arange(extent), None
+    sub = evaluate(node, variables, end_value=extent)
+    vals = sub.ravel(order='F')
+    if np.iscomplexobj(vals) or not np.all(np.isfinite(vals)) or np.any(vals < 1) or np.any(vals != np.floor(vals)):
+        where = f"Index in position {position} is invalid. " if position else ""
+        raise MatlabError(f"{where}Array indices must be positive integers or logical values.")
+    if vals.size and vals.max() > extent:
+        if position:
+            raise MatlabError(f"Index in position {position} exceeds array bounds. Index must not exceed {extent}.")
+        raise MatlabError(f"Index exceeds the number of array elements. Index must not exceed {extent}.")
+    return vals.astype(int) - 1, sub.shape
+
+
+def index_matrix(value, arg_nodes, variables):
+    """MATLAB indexing: A(i, j) selects rows i and columns j; A(k) counts elements down the columns.
+
+    Subscripts are 1-based and may be scalars, vectors, ranges, ':' or use 'end'.
+    """
+    if len(arg_nodes) > 2:
+        raise MatlabError("Error: Only one or two subscripts are supported, as in A(k) or A(i, j).")
+    if len(arg_nodes) == 2:
+        rows, _ = _subscript(arg_nodes[0], value.shape[0], variables, 1)
+        cols, _ = _subscript(arg_nodes[1], value.shape[1], variables, 2)
+        return to_matrix(value[np.ix_(rows, cols)])
+    idx, shape = _subscript(arg_nodes[0], value.size, variables, None)
+    picked = value.ravel(order='F')[idx]
+    if shape is None:  # A(:) is a column of all elements
+        return to_matrix(picked.reshape(-1, 1))
+    if 1 in shape and 1 in value.shape and value.size > 1:  # vector(vector) keeps the orientation of A
+        return to_matrix(picked.reshape((1, -1) if value.shape[0] == 1 else (-1, 1)))
+    return to_matrix(picked.reshape(shape, order='F'))  # otherwise the result has the subscript's shape
+
+
+def evaluate(node, variables, end_value=None):
+    """Evaluate a parse tree. Variables shadow built-in functions and constants, as in MATLAB.
+
+    end_value is what 'end' stands for while a subscript is evaluated, e.g. in A(end - 1).
+    """
     kind = node[0]
     if kind == 'num':
         return to_matrix(node[1])
+    if kind == 'end':
+        if end_value is None:
+            raise MatlabError("Error: 'end' can only be used inside the subscript of a variable, as in A(end).")
+        return to_matrix(end_value)
+    if kind == 'colon_all':
+        raise MatlabError("Error: A colon on its own can only be used as a subscript, as in A(:, 1).")
     if kind == 'name':
         name, args = node[1], node[2]
         if name in variables:
-            if args:  # x() just returns x
-                raise MatlabError(f"Error: Indexing into variables, as in {name}(...), is not supported.")
-            return variables[name]
-        if name in CONSTANTS:
-            if args:
-                raise MatlabError(f"Error using {name}\nToo many input arguments.")
-            return to_matrix(CONSTANTS[name])
+            if not args:  # A and A() are the whole variable
+                return variables[name]
+            return index_matrix(variables[name], args, variables)
         if name in FUNCTIONS:
             func, lo, hi = FUNCTIONS[name]
             args = args or []
             if not lo <= len(args) <= hi:
                 problem = 'Not enough' if len(args) < lo else 'Too many'
                 raise MatlabError(f"Error using {name}\n{problem} input arguments.")
-            return func(*[evaluate(a, variables) for a in args])
+            return func(*[evaluate(a, variables, end_value) for a in args])
         raise MatlabError(f"Unrecognized function or variable '{name}'.")
     if kind == 'un':
-        return UNARY_OPS[node[1]](evaluate(node[2], variables))
+        return UNARY_OPS[node[1]](evaluate(node[2], variables, end_value))
     if kind == 'bin':
         op = node[1]
-        left = evaluate(node[2], variables)
+        left = evaluate(node[2], variables, end_value)
         if op in ('&&', '||'):  # short-circuit
             lv = _logical_scalar(left, op)
             if lv == (op == '||'):
                 return to_matrix(lv)
-            return to_matrix(_logical_scalar(evaluate(node[3], variables), op))
-        return BINARY_OPS[op](left, evaluate(node[3], variables))
+            return to_matrix(_logical_scalar(evaluate(node[3], variables, end_value), op))
+        return BINARY_OPS[op](left, evaluate(node[3], variables, end_value))
     if kind == 'range':
-        start = evaluate(node[1], variables)
-        step = to_matrix(1.0) if node[2] is None else evaluate(node[2], variables)
-        return op_colon(start, step, evaluate(node[3], variables))
+        start = evaluate(node[1], variables, end_value)
+        step = to_matrix(1.0) if node[2] is None else evaluate(node[2], variables, end_value)
+        return op_colon(start, step, evaluate(node[3], variables, end_value))
     if kind == 'matrix':
         rows = []
         for row in node[1]:
-            parts = [m for m in (evaluate(e, variables) for e in row) if m.size]
+            parts = [m for m in (evaluate(e, variables, end_value) for e in row) if m.size]
             if parts:
                 try:
                     rows.append(np.hstack(parts))
@@ -707,11 +1173,51 @@ def evaluate(node, variables):
 CLEAR_SCREEN = object()  # returned by MatlabEngine.execute() for 'clc'
 EXIT_APP = object()      # returned by MatlabEngine.execute() for 'exit' / 'quit'
 
+COMMANDS = {}  # command name -> (unbound MatlabEngine method, maximum number of arguments or None, argument regex)
+
+
+def console_command(*names, max_args=0, arg_pattern=r"\S+"):
+    """Register a MatlabEngine method as the console command(s) `names`."""
+    def register(method):
+        for name in names:
+            COMMANDS[name] = (method, max_args, re.compile(arg_pattern))
+        method.matlab_names, method.help_category = names, CAT_COMMANDS
+        return method
+    return register
+
+
+def help_overview():
+    """Text of 'help' without arguments: every command, operator and function with its summary."""
+    unique = {id(entry[0]): entry[0] for entry in list(COMMANDS.values()) + list(FUNCTIONS.values())}
+    by_category = {}
+    for func in unique.values():
+        by_category.setdefault(func.help_category, []).append((', '.join(func.matlab_names), help_summary(func)))
+    width = max(len(label) for entries in by_category.values() for label, _ in entries)
+    op_width = max(len(ops) for ops, _ in OPERATOR_SUMMARY)
+    lines = [f"{APP_NAME} {APP_VERSION} - commands, operators and functions", ""]
+    for category in list(HELP_CATEGORIES) + [c for c in by_category if c not in HELP_CATEGORIES]:
+        entries = sorted(by_category.get(category, []), key=lambda entry: entry[0].lower())
+        if entries:
+            lines.append(category)
+            lines += [f"  {label:<{width}}  - {summary}" for label, summary in entries]
+            lines.append("")
+        if category == CAT_COMMANDS:
+            lines.append("Operators and special characters (help ops)")
+            lines += [f"  {ops:<{op_width}}  {meaning}" for ops, meaning in OPERATOR_SUMMARY]
+            lines.append("")
+    lines.append('Type "help <name>" for details, e.g. help round.')
+    return "\n".join(lines)
+
+
+def _indent(text):
+    return "\n".join(("  " + line).rstrip() for line in text.splitlines()) + "\n"
+
 
 class MatlabEngine:
     def __init__(self):
         self.format_mode = 'short'  # 'short' or 'long'
         self.variables = {}
+        self.last_error = None      # message of the error that stopped the last command line, if any
 
     # ---- execution ---------------------------------------------------------
     def execute(self, line):
@@ -719,22 +1225,25 @@ class MatlabEngine:
 
         Like MATLAB, the remaining statements on the line are skipped after an error or 'exit'.
         """
-        output = []
+        output, error = [], None
         try:
             for text, suppressed in split_statements(line):
                 output.extend(self._run_statement(text, suppressed))
                 if output and output[-1] is EXIT_APP:
                     break
         except MatlabError as err:
-            output.append(f"{err}\n")
+            error = str(err)
         except np.linalg.LinAlgError as err:
-            output.append(f"Error: {err}.\n")
+            error = f"Error: {err}."
         except MemoryError:
-            output.append("Error: Out of memory.\n")
+            error = "Error: Out of memory."
         except RecursionError:
-            output.append("Error: The expression is nested too deeply.\n")
+            error = "Error: The expression is nested too deeply."
         except Exception as err:  # unexpected NumPy/Python failure: report it, keep the app alive
-            output.append(f"Error: {err}\n")
+            error = f"Error: {err}"
+        self.last_error = error
+        if error is not None:
+            output.append(error + "\n")
         return output
 
     def _run_statement(self, text, suppressed):
@@ -751,43 +1260,132 @@ class MatlabEngine:
             self.variables[target] = value
         return [] if suppressed else [f"{target} =\n{self.format_value(value)}\n"]
 
+    # ---- console commands ----------------------------------------------------
+    # Command syntax, e.g. 'format long'. As for the built-in functions, each
+    # command's docstring is its help text, shown by 'help <name>'.
     def _run_command(self, text, suppressed=False):
-        """Console commands (command syntax). Returns None if text is not a command."""
+        """Run text as a console command. Returns None if it is not one."""
         words = text.split()
-        name, args = words[0], words[1:]
-        if name == 'clc' and not args:
-            return [CLEAR_SCREEN]
-        if name in ('exit', 'quit') and not args:
-            return [EXIT_APP]
-        if name == 'version' and not args:
-            return [] if suppressed else [f"{APP_NAME} {APP_VERSION}\n"]
-        if name == 'whos' and not args:
-            return [self._whos()]
-        if name == 'format' and len(args) <= 1 and all(w.isalpha() for w in args):
-            mode = args[0].lower() if args else 'short'
-            if mode not in ('short', 'long'):
-                raise MatlabError(f"Error using format\nUnsupported format '{args[0]}'. "
-                                  "Use 'format short' or 'format long'.")
-            self.format_mode = mode
-            return []
-        if name == 'clear' and all(_IDENT_RE.fullmatch(w) for w in args):
-            if not args or 'all' in args:
-                self.variables.clear()
-            else:
-                for var in args:
-                    self.variables.pop(var, None)
-            return []
-        return None
+        entry = COMMANDS.get(words[0])
+        if entry is None:
+            return None
+        method, max_args, arg_re = entry
+        args = words[1:]
+        if args and args[0].startswith('=') and not args[0].startswith('==') and (len(args) > 1 or args[0] != '='):
+            return None  # 'help = 3' or 'clear =5' assign a variable; 'help =' still asks about '='
+        if (max_args is not None and len(args) > max_args) or not all(arg_re.fullmatch(a) for a in args):
+            return None  # not command syntax, so the text is evaluated as an expression
+        return method(self, args, suppressed)
 
-    def _whos(self):
+    @console_command('clc')
+    def cmd_clc(self, args, suppressed):
+        """clc - Clear the Command Window.
+
+        clc removes all text from the Command Window. The variables in the
+        workspace are kept.
+
+        See also clear.
+        """
+        return [CLEAR_SCREEN]
+
+    @console_command('clear', max_args=None, arg_pattern=r"[A-Za-z][A-Za-z0-9_]*")
+    def cmd_clear(self, args, suppressed):
+        """clear - Remove variables from the workspace.
+
+        clear or clear all removes all variables.
+        clear X Y removes only the variables X and Y.
+
+        See also whos, clc.
+        """
+        if not args or 'all' in args:
+            self.variables.clear()
+        else:
+            for var in args:
+                self.variables.pop(var, None)
+        return []
+
+    @console_command('exit', 'quit')
+    def cmd_exit(self, args, suppressed):
+        """exit - Close {APP_NAME}.
+
+        exit (or quit) closes the window and ends the program. Statements after
+        exit on the same line are not run.
+        """
+        return [EXIT_APP]
+
+    @console_command('format', max_args=1, arg_pattern=r"[A-Za-z]+")
+    def cmd_format(self, args, suppressed):
+        """format - Set how numbers are displayed.
+
+        format short    shows up to {SHORT_DECIMALS} decimals (the default).
+        format long     shows up to {LONG_DECIMALS} decimals.
+        format          restores the default, format short.
+
+        Only the decimals a result needs are shown, the same number for all
+        elements of a matrix. Very small or very large numbers are shown in
+        scientific notation, e.g. 1e-05.
+        """
+        mode = args[0].lower() if args else 'short'
+        if mode not in ('short', 'long'):
+            raise MatlabError(f"Error using format\nUnsupported format '{args[0]}'. "
+                              "Use 'format short' or 'format long'.")
+        self.format_mode = mode
+        return []
+
+    @console_command('help', max_args=None)
+    def cmd_help(self, args, suppressed):
+        """help - Show help for commands, functions and operators.
+
+        help          lists the available commands, operators and functions.
+        help NAME     shows the help of NAME, e.g. help round.
+        help ops      describes the operators and special characters;
+                      help .* or help + show the same.
+
+        As in MATLAB, the help of each command and function is the comment
+        block at the start of its code: the docstring of the Python function
+        that implements it in matlab_calc.py.
+        """
+        if not args:
+            return [_indent(help_overview())]
+        return [_indent(self._help_topic(topic)) for topic in args]
+
+    def _help_topic(self, topic):
+        for key in (topic, topic.lower()):  # help ROUND works too
+            if key in COMMANDS:
+                return help_text(COMMANDS[key][0])
+            if key in FUNCTIONS:
+                return help_text(FUNCTIONS[key][0])
+            if key in OPERATOR_TOPICS:
+                return OPERATORS_HELP
+        if topic in self.variables:
+            return f"{topic} is a variable in the workspace. Type {topic} to see its value."
+        return f"{topic} not found.\n\nType help to list the available commands, operators and functions."
+
+    @console_command('version')
+    def cmd_version(self, args, suppressed):
+        """version - Show the version number.
+
+        version displays the name and version of the program, for example
+        {APP_NAME} {APP_VERSION}. The version history is in README.md.
+        """
+        return [] if suppressed else [f"{APP_NAME} {APP_VERSION}\n"]
+
+    @console_command('whos')
+    def cmd_whos(self, args, suppressed):
+        """whos - List the variables in the workspace.
+
+        whos shows the name, size and class of every variable.
+
+        See also clear.
+        """
         if not self.variables:
-            return "  Workspace is empty.\n"
+            return ["  Workspace is empty.\n"]
         lines = [f"  {'Name':<10} {'Size':<10} {'Class':<10}", "  " + "-" * 32]
         for name in sorted(self.variables, key=str.lower):
             v = self.variables[name]
             cls = "double (complex)" if np.iscomplexobj(v) else "double"
             lines.append(f"  {name:<10} {f'{v.shape[0]}x{v.shape[1]}':<10} {cls:<10}")
-        return "\n".join(lines) + "\n"
+        return ["\n".join(lines) + "\n"]
 
     # ---- number formatting -------------------------------------------------
     @property
@@ -1045,8 +1643,8 @@ class MatlabConsoleApp:
 
         self.write_output(
             f"{APP_NAME} {APP_VERSION} - MATLAB Syntax Calculator\n"
-            "Commands: format short/long, clear <var>/all, whos, clc, version, exit\n"
-            + "-" * 80 + "\n"
+            "Type help to list commands, operators and functions; help <name> for details.\n"
+            + "-" * 72 + "\n"
         )
         self.show_prompt()
         self.output_area.focus_set()
