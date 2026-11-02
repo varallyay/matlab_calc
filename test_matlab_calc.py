@@ -239,7 +239,7 @@ class TestParsing(EngineCase):
         self.assertError('y = 1 +', 'incomplete')
         self.assertError('1 2', "Invalid expression near '2'")
         self.assertError("'abc'", 'strings are not supported')
-        self.assertError('x(1) = 2', 'Only assignments')
+        self.assertError('x = 1 = 2', "Invalid use of '='")
         self.assertError('sin(1, 2)', 'Too many input arguments')
         self.assertError('sin()', 'Not enough input arguments')
         self.assertError('2 € 3', 'Invalid text character')
@@ -318,7 +318,7 @@ class TestIndexing(EngineCase):
         self.assertError('A(-1)', 'Array indices must be positive integers')
         self.assertError('A(NaN)', 'Array indices must be positive integers')
         self.assertError('A(1, 2, 3)', 'Only one or two subscripts')
-        self.assertError('A(2,3) = 5', 'Only assignments')
+        self.assertError('A([1 0 1])', 'Array indices must be positive integers or logical values')
         self.assertError('end + 1', "'end' can only be used inside the subscript")
         self.assertError('sin(end)', "'end' can only be used inside the subscript")
         self.assertError('sin(:)', 'A colon on its own can only be used as a subscript')
@@ -329,6 +329,131 @@ class TestIndexing(EngineCase):
         self.assertEqual(self.out('A(2,3) + A(1,4)'), 'ans =\n    11\n')
         self.assertEqual(self.out('A(:, end)'), 'ans =\n     4\n     8\n    12\n')
         self.assertIn('A(i, j)', self.out('help end'))
+
+
+class TestAssignment(EngineCase):
+    def setUp(self):
+        super().setUp()
+        self.out('A = [1 2 3 4; 5 6 7 8; 9 10 11 12]; v = [10 20 30 40]; c = [1; 2; 3];')
+
+    def A(self):
+        return np.arange(1, 13, dtype=float).reshape(3, 4)
+
+    def test_change_elements(self):
+        expected = self.A()
+        expected[1, 2] = 5
+        self.assertValue('A(2,3) = 5', expected, var='A')
+        expected[0, 1] = -1                                                # A(4) is A(1,2): down the columns
+        self.assertValue('A(4) = -1', expected, var='A')
+        expected[:, 0] = 0
+        self.assertValue('A(:, 1) = 0', expected, var='A')
+        expected[2, :] = [7, 8, 9, 10]
+        self.assertValue('A(3, :) = [7 8 9 10]', expected, var='A')
+        expected[np.ix_([0, 1], [2, 3])] = [[1, 2], [3, 4]]
+        self.assertValue('A(1:2, end-1:end) = [1 2; 3 4]', expected, var='A')
+        expected[:, 1] = [100, 200, 300]
+        self.assertValue('A(:, 2) = [100 200 300]', expected, var='A')   # a row fits a column
+        self.assertValue('v(end) = v(1) + v(2)', [10, 20, 30, 30], var='v')
+        self.assertValue('c(2) = 5', [[1], [5], [3]], var='c')
+
+    def test_output_and_suppression(self):
+        self.assertEqual(self.out('v(2) = 0'), 'v =\n    10   0   30   40\n')
+        self.assertEqual(self.out('v(1) = 0;'), '')
+        self.assertValue('v', [0, 0, 30, 40], var='v')
+
+    def test_growing(self):
+        self.assertValue('v(6) = 60', [10, 20, 30, 40, 0, 60], var='v')
+        self.assertValue('v(end+1) = 70', [10, 20, 30, 40, 0, 60, 70], var='v')
+        self.assertValue('c(5) = 9', [[1], [2], [3], [0], [9]], var='c')
+        grown = np.zeros((4, 5))
+        grown[:3, :4] = self.A()
+        grown[3, 4] = 1
+        self.assertValue('A(4, 5) = 1', grown, var='A')                   # new rows/columns are 0
+        self.assertValue('w(3) = 7', [0, 0, 7], var='w')                  # creates a new variable
+        self.assertValue('M(2, 3) = 1', [[0, 0, 0], [0, 0, 1]], var='M')
+        self.assertValue('col(:, 1) = [1 2 3]', [[1], [2], [3]], var='col')
+        self.assertValue('s = 5; s(3) = 1', [5, 0, 1], var='s')
+        self.assertError('B = [1 2; 3 4]; B(5) = 1', 'Attempt to grow array along ambiguous dimension')
+
+    def test_conditions(self):
+        expected = self.A()
+        expected[expected > 6] = 0
+        self.assertValue('A(A > 6) = 0', expected, var='A')
+        self.assertValue('v(v > 25) = v(v > 25) / 10', [10, 20, 3, 4], var='v')
+        self.assertValue('v(v == 20) = []', [10, 3, 4], var='v')
+
+    def test_deleting(self):
+        self.assertValue('v([1 3]) = []', [20, 40], var='v')
+        self.assertValue('c(2) = []', [[1], [3]], var='c')
+        self.assertValue('A(2, :) = []', self.A()[[0, 2], :], var='A')
+        self.assertValue('A(:, [1 end]) = []', self.A()[np.ix_([0, 2], [1, 2])], var='A')
+        self.assertValue('B = [1 2; 3 4]; B([1 4]) = []', [3, 2], var='B')   # a matrix becomes a row
+        self.assertError('A(1, 2) = []', 'A null assignment can have only one non-colon index')
+        self.assertError('v(9) = []', 'Index exceeds the number of array elements')
+
+    def test_kinds_of_values(self):
+        self.assertValue('v(2) = 1i', [10, 1j, 30, 40], var='v')           # becomes complex
+        self.assertEqual(self.ans('b = [true false]; b(3) = 5;', var='b').dtype, bool)  # stays logical
+        self.assertError('b(1) = NaN', 'logical array')
+
+    def test_errors(self):
+        self.assertError('v(2) = [1 2]', 'different number of elements')
+        self.assertError('A(1, :) = [1 2 3]', 'the size of the left side is 1-by-4 and the size of the right side is 1-by-3')
+        self.assertError('A(0) = 1', 'Array indices must be positive integers')
+        self.assertError('A(1.5) = 1', 'Array indices must be positive integers')
+        self.assertError('A() = 1', 'needs a subscript')
+        self.assertError('end(1) = 3', "'end' is a keyword")
+        self.assertValue('A(2,3) == 7', True)                              # '==' compares, it does not assign
+
+
+class TestConditionsAndFind(EngineCase):
+    def setUp(self):
+        super().setUp()
+        self.out('A = [1 2 3 4; 5 6 7 8; 9 10 11 12]; v = [10 20 30 40];')
+
+    def test_find_examples_from_the_request(self):
+        self.assertValue('A = [1 2 2.4 2.3]; find(A >= 2)', [2, 3, 4])
+        self.assertValue("A = A'; find(A >= 2)", [[2], [3], [4]])
+
+    def test_find(self):
+        A = np.arange(1, 13, dtype=float).reshape(3, 4)
+        self.assertValue('find(A > 6)', (np.flatnonzero(A.ravel(order='F') > 6) + 1).reshape(-1, 1))
+        self.assertValue('find(eye(3))', [[1], [5], [9]])
+        self.assertValue('find([0 3 0 5])', [2, 4])
+        self.assertValue('find([1 0 1 1], 2)', [1, 3])
+        self.assertValue('v(find(v > 15))', [20, 30, 40])
+        self.assertEqual(self.ans('find([0 0])').shape, (1, 0))
+        self.assertEqual(self.ans('find([0; 0])').shape, (0, 1))
+        self.assertEqual(self.ans('find([])').shape, (0, 0))
+        self.assertError('find(v, 0)', 'positive scalar integer')
+        self.assertIn('find(A >= 2)', self.out('help find'))
+
+    def test_selecting_by_condition(self):
+        A = np.arange(1, 13, dtype=float).reshape(3, 4)
+        self.assertValue('A(A > 6)', A.ravel(order='F')[A.ravel(order='F') > 6].reshape(-1, 1))
+        self.assertValue('v(v > 15)', [20, 30, 40])                        # a row stays a row
+        self.assertValue('v(v > 15 & v < 35)', [20, 30])
+        self.assertValue('v(~(v == 20))', [10, 30, 40])
+        self.assertValue('A(A(:, 1) > 4, :)', A[1:, :])                    # rows chosen by a condition
+        self.assertValue('A(:, A(1, :) >= 3)', A[:, 2:])
+        self.assertValue('v(logical([1 0 1 0]))', [10, 30])
+        self.assertEqual(self.ans('v(v > 100)').size, 0)
+        self.assertError('v([1 0 1])', 'Array indices must be positive integers or logical values')
+
+    def test_logical_values(self):
+        self.assertEqual(self.ans('A > 6').dtype, bool)
+        self.assertValue('true + true', 2)
+        self.assertValue('sum = (v > 15) * 1; sum', [0, 1, 1, 1], var='sum')
+        self.assertValue('-true', -1)
+        self.assertValue('[true 2]', [1, 2])
+        self.assertValue('true(2)', np.ones((2, 2)))
+        self.assertValue('false(1, 3)', np.zeros((1, 3)))
+        self.assertValue('logical([2 0 -1])', [1, 0, 1])
+        self.assertError('logical(NaN)', 'Only real numbers other than NaN can be converted to logical')
+        self.assertEqual(self.out('v > 15'), 'ans =\n  1x4 logical array\n    0   1   1   1\n')
+        self.assertEqual(self.out('3 > 2'), 'ans =\n  logical\n    1\n')
+        self.out('t = v > 15;')
+        self.assertIn('t          1x4        logical', self.out('whos'))
 
 
 class TestDisplay(EngineCase):

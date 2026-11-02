@@ -5,3 +5,4 @@
 {"level":"INFO","time":1793406185539,"source":"extension","module":"RustRpc","code":1,"signal":null,"msg":"child exited"}
 {"level":"ERROR","time":1793406185539,"source":"extension","module":"RustRpc","pid":29651,"code":1,"signal":null,"error":null,"reason":"Server process exited (code 1, signal none)","msg":"gfp serve closed before becoming ready"}
 {"level":"ERROR","time":1793406185540,"source":"extension","module":"RustRpc","reason":"Error: Server process exited","msg":"GF+ server recovery stopped"}
+{"level":"ERROR","time":1793445831943,"source":"extension","module":"RustRpc","message":"Canceled: Canceled","msg":"failed to show server lifecycle notification"}

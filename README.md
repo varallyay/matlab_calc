@@ -1,6 +1,6 @@
 # Matlab_Calc — MATLAB Command Window Emulator (`matlab_calc.py`)
 
-**Version 0.3.0** — see [Version History](#version-history).
+**Version 0.4.0** — see [Version History](#version-history).
 
 A lightweight, interactive desktop calculator built with Python, Tkinter, and NumPy that emulates the look, feel, and matrix-first syntax of the **MATLAB Command Window**.
 
@@ -10,7 +10,7 @@ A lightweight, interactive desktop calculator built with Python, Tkinter, and Nu
 
 - **Inline Interactive Command Window**: Type expressions directly after the `>> ` prompt in a single scrollable console window—just like native MATLAB. Previous outputs and prompts are protected from every kind of edit (typing, Backspace, Delete, cut, paste, Emacs-style shortcuts such as Ctrl+H) while remaining selectable for copying.
 - **Native MATLAB Matrix & Vector Syntax**: Define row vectors (`[1 2 3]` or `[1, 2, 3]`), column vectors (`[1; 2; 3]`), 2D matrices (`[1 2; 3 4]`), block matrices (`[A A; A A]`) and ranges (`1:5`, `0:0.1:1`). MATLAB's whitespace rules apply inside brackets: `[1 -2]` has two elements, `[1 - 2]` has one.
-- **Indexing**: Use single elements, rows, columns and sub-matrices in calculations, as in `A(2,3) + A(1,4)`, `A(end, :)` or `v(2:end)`.
+- **Indexing**: Use single elements, rows, columns and sub-matrices in calculations, as in `A(2,3) + A(1,4)`, `A(end, :)` or `v(2:end)`; change them (`A(2,3) = 5`), delete them (`A(2, :) = []`) or select them by a condition (`A(A > 2)`, `A(A > 2) = 0`). `find` gives the positions where a condition holds.
 - **MATLAB Semantics**: Every value is a matrix (scalars are 1×1), operators follow MATLAB precedence and left-to-right associativity (`2*A.^2`, `-A.^2`, `2^3^2 = 64`), and element-wise operators work on scalars too (`2 ./ 4 = 0.5`).
 - **Distinction Between Matrix & Element-Wise Operators**:
   - Matrix operations: `*`, `/`, `\`, `^`, `'` (conjugate transpose), `.'` (transpose).
@@ -52,7 +52,7 @@ All settings are constants at the top of `matlab_calc.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `'Matlab_Calc'` | Window title, Tk class name and macOS menu-bar name |
-| `APP_VERSION` | `'0.3.0'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
+| `APP_VERSION` | `'0.4.0'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
 | `WINDOW_WIDTH`, `WINDOW_HEIGHT` | `750`, `520` | Initial window size in pixels |
 | `APP_ICON_FILE` | `'icon.png'` | Icon image, looked up next to the script |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size (keeps the Dock icon the same size as native macOS icons) |
@@ -109,7 +109,7 @@ Listed from highest to lowest precedence group:
 | `./` `.\` | Element-wise right / left division | `A ./ B` |
 | `+` `-` | Addition, subtraction (with implicit expansion: `[1 2] + [10; 20]`) | `A + 1` |
 | `:` | Range `start:stop` or `start:step:stop` | `0:0.1:1` |
-| `==` `~=` `<` `<=` `>` `>=` | Comparisons (result is 1 or 0) | `A > 2` |
+| `==` `~=` `<` `<=` `>` `>=` | Comparisons; the result is logical (1 where true, 0 where false) | `A > 2` |
 | `&` `\|` `&&` `\|\|` | Logical AND / OR | `a > 0 & a < 5` |
 
 `/` and `\` use an exact solve for square non-singular matrices and least squares (pseudo-inverse) otherwise.
@@ -149,6 +149,76 @@ ans =
 
 Subscripts can be any expression that gives positive whole numbers, including other indexed values (`A(v(1)/10, end)` is `A(1, 4)`). Positions outside the matrix give MATLAB's error messages, e.g. `Index in position 2 exceeds array bounds. Index must not exceed 4.` A variable hides a function of the same name, so after `sin = [5 6 7]`, `sin(2)` is 6.
 
+#### Changing and deleting elements
+The same subscripts on the left of `=` change elements; the whole variable is shown afterwards (unless the line ends with `;`):
+
+```matlab
+>> A = [1 2 3; 4 5 6];
+>> A(2,3) = 50
+A =
+    1   2    3
+    4   5   50
+
+>> A(:, 1) = 0
+A =
+    0   2    3
+    0   5   50
+
+>> A(3, 4) = 1
+A =
+    0   2    3   0
+    0   5   50   0
+    0   0    0   1
+
+>> A(2, :) = []
+A =
+    0   2   3   0
+    0   0   0   1
+```
+
+- A scalar is copied into every selected element (`A(:, 1) = 0`); otherwise the right side must have one value per selected element (`A(1, :) = [7 8 9 10]`).
+- Assigning beyond the end makes the matrix grow and fills the new elements with 0 (`v(end+1) = 7`, `A(3, 4) = 1`). Assigning to a name that does not exist creates it: `w(3) = 7` gives `w = [0 0 7]`.
+- `= []` deletes: whole rows (`A(2, :) = []`), whole columns (`A(:, [1 3]) = []`) or elements of a vector (`v([1 3]) = []`). Deleting with a single subscript from a matrix leaves a row of the remaining elements, as in MATLAB.
+
+#### Conditions
+Comparisons give *logical* values (shown as `1x4 logical array`): 1 where the condition holds, 0 where it does not. Used as a subscript, they select the elements for which the condition is true; `find` returns their positions:
+
+```matlab
+>> A = [1 2 2.4 2.3];
+>> A >= 2
+ans =
+  1x4 logical array
+    0   1   1   1
+
+>> A(A >= 2)
+ans =
+    2.0   2.4   2.3
+
+>> find(A >= 2)
+ans =
+    2   3   4
+
+>> A = A';
+>> find(A >= 2)
+ans =
+    2
+    3
+    4
+
+>> A(A > 2.35) = 0
+A =
+    1.0
+    2.0
+    0.0
+    2.3
+```
+
+- Conditions can be combined with `&` (and), `|` (or) and `~` (not): `v(v > 15 & v < 35)`.
+- A condition on one row or column selects columns or rows: `A(A(:, 1) > 4, :)` keeps the rows whose first element is greater than 4.
+- `find(X)` numbers the positions down the columns, like `A(k)`. The result is a row if `X` is a row vector and a column otherwise; `find(X, N)` returns at most the first `N` positions.
+- Only logical values select elements: `A(logical([1 0 1]))` picks elements 1 and 3, but `A([1 0 1])` is an error because 0 is not a position.
+- In arithmetic, logical values count as 1 and 0 (`true + true` is 2), so `(v > 15) * 1` turns a condition into numbers.
+
 ### 4. Built-in Constants & Mathematical Functions
 - **Constants**: `pi`, `e`, `Inf`, `NaN`, `i`, `j` (imaginary unit; literals such as `3 + 4i` also work)
 - **Trigonometric**: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`
@@ -168,6 +238,10 @@ Subscripts can be any expression that gives positive whole numbers, including ot
   - `round(x, n)` — round to `n` decimals (`round(pi, 2) = 3.14`); a negative `n` rounds to tens, hundreds, … (`round(1234, -2) = 1200`)
   - `floor(x)` — round toward minus infinity (`floor(-2.5) = -3`)
   - `ceil(x)` — round toward plus infinity (`ceil(-2.5) = -2`)
+- **Logical Values & Searching**:
+  - `find(X)`, `find(X, N)` — positions of the nonzero (true) elements, e.g. `find(A >= 2)`
+  - `logical(X)` — convert numbers to logical values (nonzero becomes true)
+  - `true`, `false` — the logical values 1 and 0; `true(n)`, `false(r, c)` make logical matrices
 
 ### 5. Console & Workspace Commands
 | Command | Description |
@@ -219,7 +293,7 @@ def fn_cube(x):
 Arguments arrive as 2-D NumPy arrays (scalars are 1×1) and the function must return one (`to_matrix` converts any result). The number of inputs comes from the Python signature; parameters with a default value (`n=None`) are optional. Console commands work the same way with the `@console_command` decorator on a `MatlabEngine` method. The tests check that every command and function has a help text whose first line has the form `name - Summary.`
 
 ### 8. Not Supported
-Changing elements by indexed assignment (`A(2,3) = 5`), logical indexing (`A(A > 2)`), more than two subscripts, character strings, user functions/scripts, and control flow (`if`, `for`, …). `asin`/`acos` return `NaN` outside [-1, 1]. Non-integer matrix powers use an eigendecomposition, so they require a diagonalisable matrix.
+More than two subscripts, functions with several outputs (such as `[row, col] = find(A)`), character strings, user functions/scripts, and control flow (`if`, `for`, …). `asin`/`acos` return `NaN` outside [-1, 1]. Non-integer matrix powers use an eigendecomposition, so they require a diagonalisable matrix.
 
 ---
 
@@ -239,11 +313,18 @@ Changing elements by indexed assignment (`A(2,3) = 5`), logical indexing (`A(A >
 python3 test_matlab_calc.py
 ```
 
-Runs 55 tests covering operators, functions, indexing, the help texts, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available.
+Runs 66 tests covering operators, functions, indexing, assignment, conditions and `find`, the help texts, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available.
 
 ---
 
 ## Version History
+
+### 0.4.0 — 2026-11-02
+- **Changing elements:** `A(2,3) = 5`, `A(:, 1) = 0`, `A(1:2, end) = [7; 8]` and so on. Matrices grow when assigning beyond their end (new elements are 0), and assigning to a new name creates the variable.
+- **Deleting elements:** `A(2, :) = []`, `A(:, [1 3]) = []`, `v([1 3]) = []`.
+- **Conditions:** comparisons now give logical values (shown as `logical array`, listed as `logical` by `whos`), which select elements: `A(A > 2)`, `A(A > 2) = 0`, `A(A(:, 1) > 4, :)`.
+- **New functions:** `find` (positions of nonzero or true elements, e.g. `find(A >= 2)`), `logical`, `true` and `false`.
+- **Help:** `help ops` has new sections on conditions and on changing and deleting elements.
 
 ### 0.3.0 — 2026-10-31
 - **Indexing:** elements, rows, columns and sub-matrices can be used in calculations, e.g. `A(2,3) + A(1,4)`, `A(k)`, `A(i, :)`, `A(:, j)`, `A(:)`, `A(1:2, [1 3])`, with `end` for the last position (`v(2:end)`). Results have MATLAB's shapes, and invalid positions give MATLAB's error messages.

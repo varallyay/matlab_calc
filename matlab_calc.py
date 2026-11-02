@@ -20,7 +20,7 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
-APP_VERSION = '0.3.0'           # Shown in the welcome banner; see the version history in README.md
+APP_VERSION = '0.4.0'           # Shown in the welcome banner; see the version history in README.md
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
 WINDOW_HEIGHT = 520             # Initial window height in pixels
@@ -77,9 +77,11 @@ class MatlabError(Exception):
 #  complex128, mirroring MATLAB's "everything is a matrix" model.
 # =============================================================================
 def to_matrix(x):
-    """Convert any numeric value to a 2-D float or complex array."""
+    """Convert any value to a 2-D array of float, complex, or bool (MATLAB's logical values)."""
     a = np.asarray(x)
-    if np.iscomplexobj(a):
+    if a.dtype == bool:
+        pass  # logical (true/false), e.g. the result of a comparison
+    elif np.iscomplexobj(a):
         a = a.astype(complex)
         if not np.any(a.imag):  # MATLAB drops all-zero imaginary parts
             a = a.real.copy()
@@ -92,6 +94,11 @@ def to_matrix(x):
     if a.ndim > 2:
         raise MatlabError("Error: Only 2-D matrices are supported.")
     return a
+
+
+def to_double(a):
+    """Logical values take part in arithmetic and functions as the numbers 1 and 0, as in MATLAB."""
+    return a.astype(float) if a.dtype == bool else a
 
 
 def _is_scalar(a):
@@ -237,9 +244,17 @@ BINARY_OPS = {
     '|': _logical(np.logical_or, '|'),
 }
 
+
+def _with_double_operands(op):
+    return lambda a, b: op(to_double(a), to_double(b))
+
+
+for _symbol in ('+', '-', '.*', './', '.\\', '.^', '*', '/', '\\', '^'):  # true + true is 2, as in MATLAB
+    BINARY_OPS[_symbol] = _with_double_operands(BINARY_OPS[_symbol])
+
 UNARY_OPS = {
-    '-': lambda a: to_matrix(-a),
-    '+': lambda a: a,
+    '-': lambda a: to_matrix(-to_double(a)),
+    '+': to_double,
     '~': lambda a: to_matrix(a == 0),
     "'": lambda a: to_matrix(a.conj().T),   # conjugate transpose
     ".'": lambda a: to_matrix(a.T),         # transpose
@@ -265,8 +280,10 @@ CAT_MATH = 'Elementary math'
 CAT_ELEMENTWISE = 'Element-wise arithmetic'
 CAT_TRIG = 'Trigonometry'
 CAT_ROUNDING = 'Rounding'
+CAT_LOGICAL = 'Logical values and searching'
 CAT_MATRIX = 'Matrices and linear algebra'
-HELP_CATEGORIES = (CAT_COMMANDS, CAT_CONSTANTS, CAT_MATH, CAT_ELEMENTWISE, CAT_TRIG, CAT_ROUNDING, CAT_MATRIX)
+HELP_CATEGORIES = (CAT_COMMANDS, CAT_CONSTANTS, CAT_MATH, CAT_ELEMENTWISE, CAT_TRIG, CAT_ROUNDING, CAT_LOGICAL,
+                   CAT_MATRIX)
 
 FUNCTIONS = {}  # MATLAB name -> (Python function, minimum inputs, maximum inputs)
 
@@ -618,6 +635,75 @@ def fn_ceil(x):
     return _componentwise(np.ceil, x)
 
 
+# ---- logical values and searching --------------------------------------------
+@builtin('find', category=CAT_LOGICAL)
+def fn_find(x, n=None):
+    """find - Positions of nonzero (true) elements.
+
+    find(X) returns the positions of the nonzero elements of X, numbered
+    down the columns as in A(k). With a condition it tells where the
+    condition holds:
+        A = [1 2 2.4 2.3];
+        find(A >= 2)        % 2  3  4
+    The result is a row if X is a row vector, otherwise a column, so after
+    A = A' the same command gives [2; 3; 4].
+
+    find(X, N) returns at most the first N positions.
+
+    See also logical, true, false.
+    """
+    positions = np.flatnonzero(x.ravel(order='F')) + 1.0
+    if n is not None:
+        if n.size != 1 or np.iscomplexobj(n) or not (n.flat[0] >= 1 and float(n.flat[0]).is_integer()):
+            raise MatlabError("Error using find\nSecond argument must be a positive scalar integer.")
+        positions = positions[:int(n.flat[0])]
+    if x.shape == (0, 0):
+        return np.zeros((0, 0))
+    return to_matrix(positions.reshape((1, -1) if x.shape[0] == 1 else (-1, 1)))
+
+
+@builtin('logical', category=CAT_LOGICAL)
+def fn_logical(x):
+    """logical - Convert numbers to logical values (true or false).
+
+    logical(X) is true (1) where X is nonzero and false (0) where X is zero.
+    Logical values select elements: A(logical([1 0 1])) picks elements 1 and
+    3, while A([1 0 1]) is an error because 0 is not a valid position.
+    Comparisons such as A > 2 already give logical values.
+
+    See also true, false, find.
+    """
+    if np.iscomplexobj(x) or np.any(np.isnan(x)):
+        raise MatlabError("Error using logical\nOnly real numbers other than NaN can be converted to logical.")
+    return to_matrix(x != 0)
+
+
+@builtin('true', category=CAT_LOGICAL)
+def fn_true(m=None, n=None):
+    """true - Logical true (1).
+
+    true is the logical value 1.
+    true(N) is an N-by-N logical matrix of ones, true(M, N) or true([M N])
+    an M-by-N one.
+
+    See also false, logical.
+    """
+    return to_matrix(np.ones(_size_args('true', _given(m, n)), dtype=bool))
+
+
+@builtin('false', category=CAT_LOGICAL)
+def fn_false(m=None, n=None):
+    """false - Logical false (0).
+
+    false is the logical value 0.
+    false(N) is an N-by-N logical matrix of zeros, false(M, N) or
+    false([M N]) an M-by-N one.
+
+    See also true, logical.
+    """
+    return to_matrix(np.zeros(_size_args('false', _given(m, n)), dtype=bool))
+
+
 # ---- matrices and linear algebra ---------------------------------------------
 @builtin('eye', category=CAT_MATRIX)
 def fn_eye(m=None, n=None):
@@ -700,14 +786,14 @@ Element-wise arithmetic:
     .^    Power (also power(A, B))
     .'    Transpose (without conjugation)
 
-Comparison (the result is 1 for true, 0 for false):
+Comparison (the result is logical: 1 where true, 0 where false):
     ==  equal    ~=  not equal    <  <=  >  >=
 
 Logical:
     &  and    |  or    ~  not    &&  ||  short-circuit and / or (scalars)
 
 Special characters:
-    =        Assignment, e.g. x = 2
+    =        Assignment, e.g. x = 2 or A(2,3) = 5
     [ ]      Build a matrix: [1 2; 3 4]
     ,        Separate elements, or statements
     ;        Separate rows, or suppress output at the end of a statement
@@ -722,7 +808,14 @@ Indexing (elements are numbered from 1):
     A(i, :)       Row i;  A(:, j) is column j;  A(:) is a column of all
     A(1:2, [1 3]) Rows 1 to 2 of columns 1 and 3
     end           Last index in that position: A(end), A(end, 1), v(2:end)
-Subscripts can be any expression giving positive whole numbers.
+    A(A > 2)      The elements for which a condition is true
+Subscripts are positive whole numbers or conditions (logical values).
+
+Changing elements:
+    A(2,3) = 5    Set an element;  A(:, 1) = 0 sets a whole column
+    A(A > 2) = 0  Set the elements for which a condition is true
+    v(end+1) = 7  Positions beyond the end make the array grow
+    A(2, :) = []  Delete row 2;  v([1 3]) = [] deletes elements 1 and 3
 
 Precedence, from highest to lowest:
     ( )   ^ .^ ' .'   unary + - ~   * / \ .* ./ .\   + -   :
@@ -737,6 +830,7 @@ OPERATOR_SUMMARY = (
     ("=  [ ]  ( )", "assignment, matrices, grouping"),
     (",  ;  :  %  ...", "separators, ranges, comments"),
     ("A(i, j)  A(k)  A(:, j)  end", "indexing"),
+    ("A(A > 2)  A(2,3) = 5  A(2,:) = []", "conditions, changing, deleting"),
 )
 
 # 'help' followed by any of these shows OPERATORS_HELP
@@ -745,7 +839,7 @@ OPERATOR_TOPICS = {
     '==', '~=', '<', '<=', '>', '>=', '&', '|', '~', '&&', '||', '=', '[', ']', '(', ')', ':', '%', '...',
     'plus', 'minus', 'uplus', 'uminus', 'mtimes', 'mrdivide', 'mldivide', 'mpower', 'rdivide', 'ldivide',
     'transpose', 'ctranspose', 'eq', 'ne', 'lt', 'le', 'gt', 'ge', 'and', 'or', 'not', 'colon',
-    'horzcat', 'vertcat', 'end', 'paren', 'indexing', 'index', 'subsref',
+    'horzcat', 'vertcat', 'end', 'paren', 'indexing', 'index', 'subsref', 'subsasgn', 'assignment',
 }
 
 _HELP_FIELDS = re.compile(r"\{(APP_NAME|APP_VERSION|SHORT_DECIMALS|LONG_DECIMALS)\}")
@@ -941,21 +1035,53 @@ class Parser:
                           "or a misplaced delimiter.")
 
     def parse_statement(self):
-        """Returns (assigned variable name or None, expression tree)."""
+        """Returns (target, expression tree).
+
+        target is None for a plain expression, a name for 'name = expression', or
+        ('index', name, subscripts) for 'name(subscripts) = expression', e.g. A(2,3) = 5.
+        """
         target = None
-        nxt = self.peek(1)
-        if self.at('id') and nxt[0] == 'op' and nxt[1] == '=':
-            target = self.advance()[1]
-            if target == 'end':
+        if self.at('id') and self._assignment_follows():
+            name = self.advance()[1]
+            if name == 'end':
                 raise MatlabError("Error: 'end' is a keyword and cannot be used as a variable name.")
-            self.advance()
+            if self.at('('):
+                self.advance()
+                subscripts = [] if self.at(')') else [self._argument()]
+                while self.at(','):
+                    self.advance()
+                    subscripts.append(self._argument())
+                self.expect(')')
+                target = ('index', name, subscripts)
+            else:
+                target = name
+            self.advance()  # '='
         node = self.parse_expr()
         if self.at_op('='):
-            raise MatlabError("Error: Only assignments of the form 'name = expression' are supported;\n"
-                              "changing single elements, as in A(2,3) = 5, is not.")
+            raise MatlabError("Error: Invalid use of '='. Assignments have the form name = expression\n"
+                              "or name(subscripts) = expression.")
         if not self.at('eof'):
             self.fail()
         return target, node
+
+    def _assignment_follows(self):
+        """Is the statement 'name = ...' or 'name(...) = ...'?"""
+        nxt = self.peek(1)
+        if nxt[0] == 'op' and nxt[1] == '=':
+            return True
+        if nxt[0] != '(':
+            return False
+        depth = 0
+        for j in range(self.pos + 1, len(self.tokens)):
+            kind = self.tokens[j][0]
+            if kind in ('(', '['):
+                depth += 1
+            elif kind in (')', ']'):
+                depth -= 1
+                if depth == 0:
+                    after = self.tokens[j + 1]
+                    return after[0] == 'op' and after[1] == '='
+        return False
 
     def parse_expr(self):
         return self._binary(0)
@@ -1064,44 +1190,169 @@ class Parser:
         return ('matrix', [r for r in rows if r])
 
 
-def _subscript(node, extent, variables, position):
-    """0-based indices selected by one subscript, and the subscript's shape (None for ':').
+def _subscript(node, extent, variables, position, check_bounds=True):
+    """Evaluate one subscript. Returns (0-based positions, kind, shape of the subscript).
 
-    extent is the size of the indexed dimension (the number of elements for A(k));
-    it is also the value of 'end'. position is 1 or 2 for A(i, j), None for A(k).
+    kind is 'colon' for a lone ':', 'logical' for a true/false mask such as A > 2, and
+    'numeric' for positions. extent is the size of the indexed dimension (the number of
+    elements for A(k)); it is also the value of 'end'. position is 1 or 2 for A(i, j)
+    and None for A(k). Assignments pass check_bounds=False because they may grow A.
     """
     if node[0] == 'colon_all':
-        return np.arange(extent), None
+        return np.arange(extent), 'colon', None
     sub = evaluate(node, variables, end_value=extent)
-    vals = sub.ravel(order='F')
-    if np.iscomplexobj(vals) or not np.all(np.isfinite(vals)) or np.any(vals < 1) or np.any(vals != np.floor(vals)):
-        where = f"Index in position {position} is invalid. " if position else ""
-        raise MatlabError(f"{where}Array indices must be positive integers or logical values.")
-    if vals.size and vals.max() > extent:
+    if sub.dtype == bool:  # logical indexing: the positions where the mask is true
+        positions = np.flatnonzero(sub.ravel(order='F'))
+        last = positions[-1] + 1 if positions.size else 0
+        kind = 'logical'
+    else:
+        vals = sub.ravel(order='F')
+        if (np.iscomplexobj(vals) or not np.all(np.isfinite(vals)) or np.any(vals < 1)
+                or np.any(vals != np.floor(vals))):
+            where = f"Index in position {position} is invalid. " if position else ""
+            raise MatlabError(f"{where}Array indices must be positive integers or logical values.")
+        last = vals.max() if vals.size else 0
+        if last > MAX_ELEMENTS:
+            raise MatlabError("Error: Requested array exceeds the maximum allowed size.")
+        positions = vals.astype(int) - 1
+        kind = 'numeric'
+    if check_bounds and last > extent:
         if position:
             raise MatlabError(f"Index in position {position} exceeds array bounds. Index must not exceed {extent}.")
         raise MatlabError(f"Index exceeds the number of array elements. Index must not exceed {extent}.")
-    return vals.astype(int) - 1, sub.shape
+    return positions, kind, sub.shape
 
 
 def index_matrix(value, arg_nodes, variables):
     """MATLAB indexing: A(i, j) selects rows i and columns j; A(k) counts elements down the columns.
 
-    Subscripts are 1-based and may be scalars, vectors, ranges, ':' or use 'end'.
+    Subscripts are 1-based and may be scalars, vectors, ranges, ':', use 'end', or be
+    conditions (logical masks) such as A(A > 2).
     """
     if len(arg_nodes) > 2:
         raise MatlabError("Error: Only one or two subscripts are supported, as in A(k) or A(i, j).")
     if len(arg_nodes) == 2:
-        rows, _ = _subscript(arg_nodes[0], value.shape[0], variables, 1)
-        cols, _ = _subscript(arg_nodes[1], value.shape[1], variables, 2)
+        rows, _, _ = _subscript(arg_nodes[0], value.shape[0], variables, 1)
+        cols, _, _ = _subscript(arg_nodes[1], value.shape[1], variables, 2)
         return to_matrix(value[np.ix_(rows, cols)])
-    idx, shape = _subscript(arg_nodes[0], value.size, variables, None)
+    idx, kind, shape = _subscript(arg_nodes[0], value.size, variables, None)
     picked = value.ravel(order='F')[idx]
-    if shape is None:  # A(:) is a column of all elements
+    if kind == 'colon':  # A(:) is a column of all elements
         return to_matrix(picked.reshape(-1, 1))
+    if kind == 'logical':  # a mask acts like find(mask): a row for a row mask, otherwise a column
+        shape = (1, idx.size) if shape[0] == 1 else (idx.size, 1)
     if 1 in shape and 1 in value.shape and value.size > 1:  # vector(vector) keeps the orientation of A
         return to_matrix(picked.reshape((1, -1) if value.shape[0] == 1 else (-1, 1)))
     return to_matrix(picked.reshape(shape, order='F'))  # otherwise the result has the subscript's shape
+
+
+def assign_index(target, arg_nodes, value, variables):
+    """A(subscripts) = B, following MATLAB.
+
+    - Positions beyond the end make A grow; new elements are 0.
+    - A scalar B is copied into every selected element; otherwise B must have one
+      element per selected position (A(2, :) = [1 2 3 4]).
+    - B = [] deletes the selected elements, rows or columns.
+    - A logical A stays logical and a real A becomes complex if B is complex.
+    target is the current value of A, or None if A does not exist yet.
+    """
+    if not arg_nodes:
+        raise MatlabError("Error: An indexed assignment needs a subscript, as in A(2) = 5.")
+    if len(arg_nodes) > 2:
+        raise MatlabError("Error: Only one or two subscripts are supported, as in A(k) or A(i, j).")
+    if target is None:  # the assignment creates the variable
+        target = np.zeros((0, 0), dtype=bool if value.dtype == bool else float)
+    if value.shape == (0, 0):
+        return _delete_elements(target, arg_nodes, variables)
+    if target.dtype == bool and value.dtype != bool:
+        if np.iscomplexobj(value) or np.any(np.isnan(value)):
+            raise MatlabError("Error: Only real numbers other than NaN can be stored in a logical array.")
+        value = value != 0
+    elif np.iscomplexobj(value) and not np.iscomplexobj(target):
+        target = target.astype(complex)
+    if len(arg_nodes) == 1:
+        return _assign_linear(target, arg_nodes[0], value, variables)
+    return _assign_rows_cols(target, arg_nodes, value, variables)
+
+
+def _assign_linear(target, node, value, variables):
+    """A(k) = B, with k counting elements down the columns."""
+    idx, _, _ = _subscript(node, target.size, variables, None, check_bounds=False)
+    if value.size not in (1, idx.size):
+        raise MatlabError("Unable to perform assignment because the left and right sides have a "
+                          "different number of elements.")
+    shape = target.shape
+    needed = int(idx.max()) + 1 if idx.size else 0
+    if needed > target.size:  # grow: rows (and scalars) get longer, columns taller
+        if shape == (0, 0) or shape[0] == 1:
+            shape = (1, needed)
+        elif shape[1] == 1:
+            shape = (needed, 1)
+        else:
+            raise MatlabError("Attempt to grow array along ambiguous dimension.")
+    flat = np.zeros(shape[0] * shape[1], dtype=target.dtype)
+    flat[:target.size] = target.ravel(order='F')
+    flat[idx] = value.flat[0] if value.size == 1 else value.ravel(order='F')
+    return to_matrix(flat.reshape(shape, order='F'))
+
+
+def _assign_rows_cols(target, arg_nodes, value, variables):
+    """A(i, j) = B."""
+    r, c = target.shape
+    rows, rkind, _ = _subscript(arg_nodes[0], r, variables, 1, check_bounds=False)
+    cols, ckind, _ = _subscript(arg_nodes[1], c, variables, 2, check_bounds=False)
+    # ':' on a dimension that is still empty, as in B(:, 1) = [1; 2; 3] for a new B, takes its size from B
+    if rkind == 'colon' and r == 0:
+        rows = np.arange(value.shape[0] if ckind == 'colon' and c == 0 else _fitting_count(value, cols.size))
+    if ckind == 'colon' and c == 0:
+        cols = np.arange(value.shape[1] if rkind == 'colon' and r == 0 else _fitting_count(value, rows.size))
+    m, k = rows.size, cols.size
+    if value.size == 1:
+        block = value.flat[0]
+    elif value.size == m * k and [d for d in value.shape if d != 1] == [d for d in (m, k) if d != 1]:
+        block = value.reshape(m, k)  # same size, or a row stored into a column (and vice versa)
+    else:
+        raise MatlabError(f"Unable to perform assignment because the size of the left side is {m}-by-{k} "
+                          f"and the size of the right side is {value.shape[0]}-by-{value.shape[1]}.")
+    new_r = max(r, int(rows.max()) + 1 if m else 0)
+    new_c = max(c, int(cols.max()) + 1 if k else 0)
+    if new_r * new_c > MAX_ELEMENTS:
+        raise MatlabError("Error: Requested array exceeds the maximum allowed size.")
+    result = np.zeros((new_r, new_c), dtype=target.dtype)
+    result[:r, :c] = target
+    if m and k:
+        result[np.ix_(rows, cols)] = block
+    return to_matrix(result)
+
+
+def _fitting_count(value, other_count):
+    """Length a ':' takes on an empty dimension so that value fits next to other_count positions."""
+    if other_count and value.size % other_count == 0:
+        return value.size // other_count
+    return max(value.shape)
+
+
+def _delete_elements(target, arg_nodes, variables):
+    """A(...) = []: delete elements, or whole rows or columns."""
+    if len(arg_nodes) == 1:
+        idx, _, _ = _subscript(arg_nodes[0], target.size, variables, None)
+        if idx.size == 0:
+            return target
+        keep = np.ones(target.size, dtype=bool)
+        keep[idx] = False
+        remaining = target.ravel(order='F')[keep]
+        if target.shape[1] == 1 and target.shape[0] > 1:  # a column stays a column
+            return to_matrix(remaining.reshape(-1, 1))
+        return to_matrix(remaining.reshape(1, -1))  # a row; a matrix becomes a row, as in MATLAB
+    r, c = target.shape
+    rows, _, _ = _subscript(arg_nodes[0], r, variables, 1)
+    cols, _, _ = _subscript(arg_nodes[1], c, variables, 2)
+    if set(cols.tolist()) == set(range(c)):    # A(i, :) = [] deletes rows
+        return to_matrix(np.delete(target, rows, axis=0))
+    if set(rows.tolist()) == set(range(r)):    # A(:, j) = [] deletes columns
+        return to_matrix(np.delete(target, cols, axis=1))
+    raise MatlabError("A null assignment can have only one non-colon index.\n"
+                      "(Delete whole rows, as in A(2, :) = [], or whole columns, as in A(:, 2) = [].)")
 
 
 def evaluate(node, variables, end_value=None):
@@ -1130,7 +1381,7 @@ def evaluate(node, variables, end_value=None):
             if not lo <= len(args) <= hi:
                 problem = 'Not enough' if len(args) < lo else 'Too many'
                 raise MatlabError(f"Error using {name}\n{problem} input arguments.")
-            return func(*[evaluate(a, variables, end_value) for a in args])
+            return func(*[to_double(evaluate(a, variables, end_value)) for a in args])
         raise MatlabError(f"Unrecognized function or variable '{name}'.")
     if kind == 'un':
         return UNARY_OPS[node[1]](evaluate(node[2], variables, end_value))
@@ -1253,11 +1504,15 @@ class MatlabEngine:
         target, node = Parser(tokenize(text)).parse_statement()
         with np.errstate(all='ignore'):  # 1/0 -> Inf and 0/0 -> NaN, as in MATLAB
             value = evaluate(node, self.variables)
-        if target is None and node[0] == 'name' and node[2] is None and node[1] in self.variables:
-            target = node[1]  # typing a variable's name shows it without changing 'ans'
-        else:
-            target = target or 'ans'
-            self.variables[target] = value
+            if isinstance(target, tuple):  # A(subscripts) = value changes elements of A
+                _, target, subscripts = target
+                value = assign_index(self.variables.get(target), subscripts, value, self.variables)
+                self.variables[target] = value
+            elif target is None and node[0] == 'name' and node[2] is None and node[1] in self.variables:
+                target = node[1]  # typing a variable's name shows it without changing 'ans'
+            else:
+                target = target or 'ans'
+                self.variables[target] = value
         return [] if suppressed else [f"{target} =\n{self.format_value(value)}\n"]
 
     # ---- console commands ----------------------------------------------------
@@ -1383,7 +1638,7 @@ class MatlabEngine:
         lines = [f"  {'Name':<10} {'Size':<10} {'Class':<10}", "  " + "-" * 32]
         for name in sorted(self.variables, key=str.lower):
             v = self.variables[name]
-            cls = "double (complex)" if np.iscomplexobj(v) else "double"
+            cls = "logical" if v.dtype == bool else "double (complex)" if np.iscomplexobj(v) else "double"
             lines.append(f"  {name:<10} {f'{v.shape[0]}x{v.shape[1]}':<10} {cls:<10}")
         return ["\n".join(lines) + "\n"]
 
@@ -1435,11 +1690,19 @@ class MatlabEngine:
     def format_value(self, value):
         a = to_matrix(value)
         rows, cols = a.shape
+        kind = 'logical' if a.dtype == bool else 'double'
         if a.size == 0:
-            return "    []" if (rows, cols) == (0, 0) else f"    {rows}x{cols} empty double matrix"
+            return "    []" if (rows, cols) == (0, 0) and kind == 'double' else f"    {rows}x{cols} empty {kind} matrix"
         if a.size > MAX_DISPLAY_ELEMENTS:
-            return (f"    {rows}x{cols} double matrix (too large to display; "
+            return (f"    {rows}x{cols} {kind} matrix (too large to display; "
                     "end the statement with ';' to suppress output)")
+        if kind == 'logical':  # labelled as in MATLAB, e.g. "1x4 logical array"
+            label = "logical" if a.size == 1 else f"{rows}x{cols} logical array"
+            return f"  {label}\n" + self._format_numbers(a.astype(float))
+        return self._format_numbers(a)
+
+    def _format_numbers(self, a):
+        rows, cols = a.shape
         max_dec = self.max_decimals
         parts = np.concatenate([a.real.ravel(), a.imag.ravel()]) if np.iscomplexobj(a) else a.ravel()
         parts = [float(p) for p in parts]
