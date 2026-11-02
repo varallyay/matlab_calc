@@ -1,6 +1,6 @@
 # Matlab_Calc — MATLAB Command Window Emulator (`matlab_calc.py`)
 
-**Version 0.5.0** — see [Version History](#version-history).
+**Version 0.7.0** — see [Version History](#version-history).
 
 A lightweight, interactive desktop calculator built with Python, Tkinter, and NumPy that emulates the look, feel, and matrix-first syntax of the **MATLAB Command Window**.
 
@@ -16,12 +16,16 @@ A lightweight, interactive desktop calculator built with Python, Tkinter, and Nu
   - Matrix operations: `*`, `/`, `\`, `^`, `'` (conjugate transpose), `.'` (transpose).
   - Element-wise operations: `.*`, `./`, `.\`, `.^`.
   - Raises MATLAB-style errors when operands have incompatible dimensions.
+- **Several Outputs**: functions such as `max`, `min`, `size`, `find`, `fopen` and `fscanf` return more than one result: `[m, i] = max(A)`, `[rows, cols] = size(A)`; `~` skips an output (`[~, i] = min(v)`).
+- **Text and Files**: text in quotes (`'Hello'`), `disp`, `fprintf`, `sprintf` and `num2str` for formatted output, and `fopen` / `fprintf` / `fscanf` / `fclose` with file identifiers to write and read text files.
+- **Data Analysis and Random Numbers**: `max`, `min`, `mean`, `median`, `std`, `rand`, `randn` and more, working down the columns of a matrix as in MATLAB.
 - **Multiple Statements and Comments**: `a = 1; b = 2, c = a + b` runs three statements (a trailing `;` suppresses output); `%` starts a comment and `...` continues a line. Multi-line pastes run line by line.
 - **Smart Adaptive Number Formatting**:
   - Automatically aligns matrix columns and matches the decimal precision across all elements of a vector/matrix to the maximum significant decimals needed by the calculation (capped at 4 digits in `format short` and 15 digits in `format long`).
   - Very small or very large numbers switch to scientific notation (`1e-05`, `1.2346e+11`); `Inf`, `NaN` and complex results (`1 + 2i`) display as in MATLAB.
 - **Workspace Management**: Persistent variables across calculations, automatic `ans` assignment, output suppression with trailing `;`, and built-in workspace commands (`whos`, `clear`, `clc`, `format short`, `format long`).
 - **Installable**: on macOS and Linux it installs itself as a normal application (asked at the first start), so it starts from Launchpad or the application menu.
+- **Automatic Updates**: once a week the installed program looks for a new version on [GitHub](https://github.com/varallyay/matlab_calc) and, if you agree, downloads and installs it.
 - **Built-in Help**: `help` lists every command, operator and function; `help <name>` shows the full help of one of them, as in MATLAB.
 
 ---
@@ -55,7 +59,7 @@ At this first start a window asks whether to install it:
 The question is asked only once. After installing, start Matlab_Calc like any other application: from **Launchpad**, **Spotlight** or the **Applications** folder on macOS, or from the **application menu** on Linux (search for *Matlab_Calc*); the terminal is no longer needed.
 
 - **How it works:** installing copies `matlab_calc.py` and `icon.png` to the place above and creates a launcher (a `Matlab_Calc.app` bundle on macOS, a `.desktop` menu entry on Linux). The launcher starts the copy with the same Python that did the installation, so NumPy is always found, and it keeps working if you move or delete the folder you installed from.
-- **Updating:** when you start a newer version from your download folder (`python3 matlab_calc.py`), it offers to update the installed copy (**Update** / **Not now**; *Not now* is remembered for that version). Typing `install` updates it at any time.
+- **Updating from a downloaded file:** when you start a newer version from your download folder (`python3 matlab_calc.py`), it offers to update the installed copy (**Update** / **Not now**; *Not now* is remembered for that version). Typing `install` updates it at any time.
 - **Later:** the commands `install`, `install systemwide` and `uninstall` do the same from the command window (see `help install`).
 - **From a terminal**, without opening the window:
 
@@ -63,11 +67,27 @@ The question is asked only once. After installing, start Matlab_Calc like any ot
   python3 matlab_calc.py --install              # for you
   python3 matlab_calc.py --install-systemwide   # for all users
   python3 matlab_calc.py --uninstall            # remove installed copies
+  python3 matlab_calc.py --update               # install a newer version from GitHub
   python3 matlab_calc.py --version
   ```
 
   On Linux, installing for all users needs administrator rights: run `sudo python3 matlab_calc.py --install-systemwide` (with the full path of the Python that has NumPy, e.g. `sudo /opt/anaconda3/bin/python3 ...`). If you try it without the rights, the program prints the exact command. On macOS, administrator accounts can install into `/Applications` directly.
-- **Settings file:** `~/.matlab_calc.json` in your home folder records that the question was answered and what was installed. Delete it to be asked again the next time you start the program from your download folder.
+- **Settings file:** `~/.matlab_calc.json` in your home folder records that the question was answered, what was installed and when updates were last looked for. Delete it to be asked again the next time you start the program from your download folder.
+
+### Updates from GitHub
+Once a week (`UPDATE_CHECK_DAYS`), when the installed program starts, it looks in the background for a newer version in the GitHub project [varallyay/matlab_calc](https://github.com/varallyay/matlab_calc) (`UPDATE_REPOSITORY`). The window stays usable meanwhile, and without an internet connection nothing happens until the next start. If a newer version exists, a window with the program icon asks:
+
+| Button | What happens |
+| :--- | :--- |
+| **Update now** | Downloads the new version (and its icon) and installs it over the installed copy. A second window offers **Restart now** (the variables in the workspace are not kept) or **Later**. |
+| **Not now** | Nothing changes; you are asked again at the next weekly check. |
+| **Skip this version** | You are not asked about this version again; a later version is offered as usual. |
+
+The checkbox *Look for new versions on GitHub every week* in this window (and in the installation question) turns the weekly check off or on. In the command window, `update` looks for a new version right away and installs it, and `update off` / `update on` switch the weekly check. Only an installed program is updated; a program started from your download folder is never changed.
+
+**Publishing a new version** (for the maintainer): put `matlab_calc.py`, and `icon.png` if it changed, in the top folder of the repository and increase `APP_VERSION`. If the project has GitHub *releases*, the newest release is used, so a version is offered only once it is released; without releases, the newest version on the main branch is used as soon as it is pushed. An update is offered only when its `APP_VERSION` is higher than the installed one, so an older version is never installed by accident. The downloaded file is checked to be a valid program before it replaces the installed copy.
+
+If Python from the python.org installer on macOS cannot verify GitHub's security certificate, the `update` command says so; running *Install Certificates.command* in that Python's folder in Applications fixes it (Anaconda's Python does not need this).
 
 ---
 
@@ -78,7 +98,7 @@ All settings are constants at the top of `matlab_calc.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `'Matlab_Calc'` | Window title, Tk class name and macOS menu-bar name |
-| `APP_VERSION` | `'0.5.0'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
+| `APP_VERSION` | `'0.7.0'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
 | `WINDOW_WIDTH`, `WINDOW_HEIGHT` | `750`, `520` | Initial window size in pixels |
 | `APP_ICON_FILE` | `'icon.png'` | Icon image, looked up next to the script |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size (keeps the Dock icon the same size as native macOS icons) |
@@ -88,7 +108,9 @@ All settings are constants at the top of `matlab_calc.py`:
 | `WINDOW_PADDING`, `PROMPT` | `10`, `'>> '` | Space around the console; prompt text |
 | `SHORT_DECIMALS`, `LONG_DECIMALS` | `4`, `15` | Maximum decimals for `format short` / `format long` |
 | `MAX_DISPLAY_ELEMENTS` | `10000` | Larger results are summarised instead of printed (end the statement with `;`) |
-| `CONFIG_FILE` | `'~/.matlab_calc.json'` | Settings file in the home folder: remembers the answer to the installation question and what was installed |
+| `CONFIG_FILE` | `'~/.matlab_calc.json'` | Settings file in the home folder: remembers the answer to the installation question, what was installed and the update checks |
+| `UPDATE_REPOSITORY` | `'varallyay/matlab_calc'` | GitHub project (owner/name) where new versions are published |
+| `UPDATE_CHECK_DAYS` | `7` | Look for a new version this often, in days; `0` = only with the `update` command |
 
 ---
 
@@ -246,9 +268,110 @@ A =
 - Only logical values select elements: `A(logical([1 0 1]))` picks elements 1 and 3, but `A([1 0 1])` is an error because 0 is not a position.
 - In arithmetic, logical values count as 1 and 0 (`true + true` is 2), so `(v > 15) * 1` turns a condition into numbers.
 
-### 4. Built-in Constants & Mathematical Functions
+### 4. Several Outputs
+Some functions give more than one result. Put the names of the variables that receive them in square brackets on the left of `=`; `~` skips an output you do not need:
+
+```matlab
+>> A = [8 1 6; 3 5 7; 4 9 2];
+>> [m, i] = max(A)
+m =
+    8   9   7
+
+i =
+    1   3   2
+
+>> [rows, cols] = size(A)
+rows =
+    3
+
+cols =
+    3
+
+>> [r, c] = find(A > 6)
+r =
+    1
+    3
+    2
+
+c =
+    1
+    2
+    3
+
+>> [~, k] = min([4 2 8 2])
+k =
+    2
+```
+
+- Functions with several outputs: `max`, `min` (value and position), `size` (one output per dimension), `find` (rows, columns and values), `fopen` (file identifier and error message) and `fscanf` (data and count).
+- Without brackets only the first output is returned, as in MATLAB: `max(A)` gives just the maximum values.
+- Asking for more outputs than a function has gives MATLAB's error `Too many output arguments.`
+
+### 5. Text
+Text is written in single quotes; a doubled quote inside stands for one quote (`'it''s'`). Double quotes (`"text"`) are accepted too and give the same kind of text. Text is a row of characters (a `char` array), so it can be joined with brackets, indexed and measured like any vector:
+
+```matlab
+>> s = 'Hello'
+s =
+    'Hello'
+
+>> size(s)
+ans =
+    1   5
+
+>> disp(['Result: ' num2str(pi, 4)])
+Result: 3.142
+```
+
+| Function | What it does |
+| :--- | :--- |
+| `disp(X)` | Shows text or a value without the `name =` line |
+| `fprintf(format, A, ...)` | Prints formatted text in the command window; the format is repeated until all values are used |
+| `sprintf(format, A, ...)` | The same formatting, returned as text |
+| `num2str(x)`, `num2str(x, N)`, `num2str(x, format)` | A number as text, with about 5 significant digits, `N` digits or a format |
+
+Formats use the conversions `%d`, `%i`, `%u`, `%f`, `%e`, `%g`, `%x`, `%o`, `%c` and `%s` with optional flags, width and precision (`%8.3f`, `%-5d`, `%+e`), and the escapes `\n`, `\t`, `\\` and `%%`. Values are taken down the columns, so each column of a matrix fills one round of the format:
+
+```matlab
+>> fprintf('%d squared is %d\n', [1 2 3; 1 4 9])
+1 squared is 1
+2 squared is 4
+3 squared is 9
+```
+
+As in MATLAB, output without `\n` at the end leaves the next `>>` prompt on the same line.
+
+### 6. Writing and Reading Files
+A file is opened with `fopen`, which returns a *file identifier*: a number (3, 4, …) that `fprintf`, `fscanf` and `fclose` use to name the file. Identifier `1` is the command window, so `fprintf(1, ...)` is the same as `fprintf(...)`.
+
+```matlab
+>> fid = fopen('data.txt', 'w');
+>> fprintf(fid, '%d %.1f\n', [1 2 3; 0.5 1.5 2.5]);
+>> fclose(fid);
+>> fid = fopen('data.txt');
+>> M = fscanf(fid, '%d %f', [2 Inf])'
+M =
+    1.0   0.5
+    2.0   1.5
+    3.0   2.5
+
+>> fclose(fid);
+```
+
+| Function | What it does |
+| :--- | :--- |
+| `fid = fopen(name)`, `fopen(name, mode)` | Opens a file; `mode` is `'r'` (read, the default), `'w'` (write a new file), `'a'` (append) or `'r+'`, `'w+'`, `'a+'` (read and write). Returns `-1` if the file cannot be opened; `[fid, msg] = fopen(...)` also gives the reason |
+| `fopen('all')` | The identifiers of all open files |
+| `fprintf(fid, format, A, ...)` | Writes formatted text to the file; `n = fprintf(...)` gives the number of bytes |
+| `A = fscanf(fid, format)` | Reads the data that match the format, repeating it, as a column. `fscanf(fid, format, N)` reads at most `N` values, `fscanf(fid, format, [m n])` or `[m Inf]` fills an `m`-row matrix down the columns. With only `%c` / `%s` conversions the result is text. `[A, count] = fscanf(...)` also gives the number of values read |
+| `fclose(fid)`, `fclose('all')` | Closes one or all open files |
+
+File names are relative to the current folder, shown by `pwd` and changed with `cd`. When the program is started from Launchpad or the application menu, the current folder is your home folder.
+
+### 7. Built-in Constants & Functions
 - **Constants**: `pi`, `e`, `Inf`, `NaN`, `i`, `j` (imaginary unit; literals such as `3 + 4i` also work)
 - **Trigonometric**: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`
+- **Hyperbolic**: `sinh`, `cosh`, `tanh` and their inverses `asinh`, `acosh`, `atanh` (`acosh` and `atanh` return `NaN` outside their domain, like `asin` and `acos`)
 - **Exponential & Logarithmic**: `sqrt`, `exp`, `log` (natural log), `log10` — `sqrt`, `log` and `log10` return complex results for negative inputs, as in MATLAB
 - **Element-wise Arithmetic**:
   - `power(A, B)` — element-wise power, the same as `A.^B` (`power(2, [1 2 3])` is `2 4 8`)
@@ -265,12 +388,29 @@ A =
   - `round(x, n)` — round to `n` decimals (`round(pi, 2) = 3.14`); a negative `n` rounds to tens, hundreds, … (`round(1234, -2) = 1200`)
   - `floor(x)` — round toward minus infinity (`floor(-2.5) = -3`)
   - `ceil(x)` — round toward plus infinity (`ceil(-2.5) = -2`)
+  - `rem(x, y)` — remainder after division, with the sign of `x` (`rem(-7, 3) = -1`)
+  - `mod(x, y)` — modulus, with the sign of `y` (`mod(-7, 3) = 2`); `mod(x, 0)` is `x`
+- **Data Analysis** (on a vector: all its elements; on a matrix: each column, or along dimension `dim`; `'all'` uses every element):
+  - `max(A)`, `min(A)` — largest / smallest elements; `[m, i] = max(A)` also gives their positions. `max(A, B)` compares element by element (`max([1 5 3], 4)` is `4 5 4`), `max(A, [], dim)` works along a dimension. `NaN` values are ignored
+  - `mean(A)`, `median(A)` — average and middle value (`mean(A, 2)` per row, `mean(A, 'all')`)
+  - `std(A)` — standard deviation (normalised by `N-1`; `std(A, 1)` by `N`; `std(A, w, dim)`)
+- **Random Numbers**:
+  - `rand(n)`, `rand(r, c)` — uniformly distributed numbers between 0 and 1
+  - `randn(n)`, `randn(r, c)` — normally distributed numbers (mean 0, standard deviation 1)
+  - `rng(seed)`, `rng('default')`, `rng('shuffle')` — repeatable or new random sequences
+- **Size and Shape**:
+  - `size(A)`, `size(A, dim)`, `[r, c] = size(A)` — number of rows and columns
+  - `length(A)` — the largest dimension (0 for an empty matrix)
+  - `linspace(a, b, n)` — `n` evenly spaced numbers from `a` to `b` (100 if `n` is not given): `linspace(0, 1, 5)` is `0 0.25 0.5 0.75 1`
+  - `resize(A, sz)` — pad with zeros or cut to size `sz` (`resize([1 2 3], 5)` is `1 2 3 0 0`); options `'FillValue', v` and `'Side', 'trailing' | 'leading' | 'both'`
+  - `reshape(A, r, c)` — the same elements arranged in `r` rows and `c` columns (one size may be `[]`)
+- **Text and Files**: `disp`, `fprintf`, `sprintf`, `num2str`, `fopen`, `fclose`, `fscanf` (see sections 5 and 6)
 - **Logical Values & Searching**:
-  - `find(X)`, `find(X, N)` — positions of the nonzero (true) elements, e.g. `find(A >= 2)`
+  - `find(X)`, `find(X, N)` — positions of the nonzero (true) elements, e.g. `find(A >= 2)`; `[row, col] = find(X)` or `[row, col, v] = find(X)` give rows, columns and values
   - `logical(X)` — convert numbers to logical values (nonzero becomes true)
   - `true`, `false` — the logical values 1 and 0; `true(n)`, `false(r, c)` make logical matrices
 
-### 5. Console & Workspace Commands
+### 8. Console & Workspace Commands
 | Command | Description |
 | :--- | :--- |
 | `format short` / `format` | Cap display precision at up to 4 decimal places (default) |
@@ -279,17 +419,21 @@ A =
 | `clear <var> ...` | Remove specific variable(s) from the workspace |
 | `clear` / `clear all` | Clear all variables from the workspace |
 | `clc` | Clear the command window screen |
+| `pwd` | Show the current folder, where `fopen` looks for files |
+| `cd <folder>` | Change the current folder (`cd ..`, `cd ~/Documents`); `cd` alone shows it |
 | `help` | List all commands, operators and functions |
 | `help <name>` | Show the help of a command or function, e.g. `help round`; `help ops` (or `help .*`, `help +`, …) explains the operators |
 | `version` | Show the application name and version number |
 | `install` | Install the program for you (or update the installed copy), so it can be started from Launchpad / the application menu |
 | `install systemwide` | Install it for all users of the computer |
 | `uninstall` | Remove the installed copies |
+| `update` | Look for a new version on GitHub and install it over the installed copy |
+| `update off` / `update on` | Turn the weekly look for new versions off or on |
 | `exit` / `quit` | Close the application |
 
 Typing a variable's name shows its value without changing `ans`.
 
-### 6. Getting Help
+### 9. Getting Help
 `help` on its own lists the console commands, the operators and every function grouped by topic, each with a one-line description. `help <name>` shows the full help text:
 
 ```matlab
@@ -305,7 +449,7 @@ Typing a variable's name shows its value without changing `ans`.
 
 As in MATLAB, where a function's help is the comment block at the top of its `.m` file, the help of every command and function here is the comment block at the start of its code: the docstring of the Python function that implements it. The first line (`floor - Round toward minus infinity.`) is the summary shown in the `help` list.
 
-### 7. Adding Your Own Functions
+### 10. Adding Your Own Functions
 A new built-in function needs only a Python function with a help docstring and the `@builtin` decorator, placed next to the others in `matlab_calc.py`. It then works in calculations and appears in `help` automatically:
 
 ```python
@@ -320,10 +464,10 @@ def fn_cube(x):
     return op_power(x, to_matrix(3))
 ```
 
-Arguments arrive as 2-D NumPy arrays (scalars are 1×1) and the function must return one (`to_matrix` converts any result). The number of inputs comes from the Python signature; parameters with a default value (`n=None`) are optional. Console commands work the same way with the `@console_command` decorator on a `MatlabEngine` method. The tests check that every command and function has a help text whose first line has the form `name - Summary.`
+Arguments arrive as 2-D NumPy arrays (scalars are 1×1) and the function must return one (`to_matrix` converts any result). The number of inputs comes from the Python signature; parameters with a default value (`n=None`) are optional. For several outputs, give `outputs=2` (or more) to `@builtin`, add a keyword-only parameter `nargout` and return a tuple with that many values; `keep_types=True` passes logical and text arguments unchanged instead of converting them to numbers. Console commands work the same way with the `@console_command` decorator on a `MatlabEngine` method. The tests check that every command and function has a help text whose first line has the form `name - Summary.`
 
-### 8. Not Supported
-More than two subscripts, functions with several outputs (such as `[row, col] = find(A)`), character strings, user functions/scripts, and control flow (`if`, `for`, …). `asin`/`acos` return `NaN` outside [-1, 1]. Non-integer matrix powers use an eigendecomposition, so they require a diagonalisable matrix.
+### 11. Not Supported
+More than two subscripts and N-dimensional arrays, cell arrays, structures, the separate `string` class (`"text"` gives ordinary `char` text), user functions/scripts, and control flow (`if`, `for`, …). `asin`/`acos` return `NaN` outside [-1, 1], and `acosh` below 1 and `atanh` outside [-1, 1] likewise. Files are read and written as text (UTF-8); `fread`, `fwrite`, `fgetl` and `textscan` are not available. Non-integer matrix powers use an eigendecomposition, so they require a diagonalisable matrix.
 
 ---
 
@@ -343,11 +487,25 @@ More than two subscripts, functions with several outputs (such as `[row, col] = 
 python3 test_matlab_calc.py
 ```
 
-Runs 75 tests covering installation (in temporary folders, so your system is not touched), operators, functions, indexing, assignment, conditions and `find`, the help texts, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available.
+Runs 107 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files (in a temporary folder), the statistics and random-number functions, the help texts, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available.
 
 ---
 
 ## Version History
+
+### 0.7.0 — 2026-11-02
+- **Several outputs:** `[a, b] = f(...)` assigns each output of a function to its own variable, and `~` skips one. `max`, `min`, `size`, `find` (`[row, col, v]`), `fopen` (`[fid, msg]`) and `fscanf` (`[A, count]`) have several outputs.
+- **Text:** `'text'` and `"text"` give character arrays that can be joined, indexed and displayed (`'Hello'`, `2x2 char array`); `whos` lists them as `char`.
+- **Output and files:** `disp`, `fprintf`, `sprintf` and `num2str`; `fopen`, `fclose` and `fscanf` read and write text files through file identifiers (1 is the command window, opened files get 3, 4, …).
+- **New functions:** `rem` and `mod`; the hyperbolic functions `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`; `max`, `min`, `mean`, `median` and `std`; `rand`, `randn` and `rng`; `size`, `length`, `linspace`, `resize` and `reshape`.
+- **New commands:** `pwd` and `cd`. When started from Launchpad or the application menu, the current folder is the home folder, so files are written there.
+- **Help:** new topics *Hyperbolic functions*, *Rounding and remainders*, *Data analysis*, *Random numbers*, *Matrices and arrays* and *Text and files*; `help ops` explains text and several outputs.
+
+### 0.6.0 — 2026-11-02
+- **Updates from GitHub:** the installed program looks for a new version in [varallyay/matlab_calc](https://github.com/varallyay/matlab_calc) once a week (in the background) and offers **Update now**, **Not now** or **Skip this version**; after updating it offers to restart. The newest GitHub release is used, or the main branch if there are no releases.
+- **New command:** `update` looks for a new version right away (`update off` / `update on` switch the weekly check); `--update` does the same from a terminal.
+- **Dialogs:** the installation and update questions show the program icon and a checkbox for the weekly check.
+- **Parameters:** `UPDATE_REPOSITORY` and `UPDATE_CHECK_DAYS`.
 
 ### 0.5.0 — 2026-11-02
 - **Installation on macOS and Linux:** at the first start a window asks whether to install the program systemwide, only for the current user, or not at all. Installed, it is listed in Launchpad / the Applications folder (macOS: a `Matlab_Calc.app` bundle with its own icon) or in the application menu (Linux: a `.desktop` entry) and starts without the terminal.

@@ -3,8 +3,10 @@
 The engine tests need only NumPy. The GUI and icon tests need a display (they are
 skipped otherwise); the anti-aliased icon test also needs Pillow.
 The installation tests work in temporary folders: they never touch your home folder,
-/Applications or /opt.
+/Applications or /opt. The update tests use a local stand-in for GitHub, not the internet.
 """
+import gc
+import http.server
 import importlib.util
 import json
 import os
@@ -14,6 +16,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import tkinter as tk
 import tkinter.font  # noqa: F401  (tk.font)
 import unittest
@@ -244,7 +248,7 @@ class TestParsing(EngineCase):
         self.assertError('(1 + 2))', 'Unbalanced')
         self.assertError('y = 1 +', 'incomplete')
         self.assertError('1 2', "Invalid expression near '2'")
-        self.assertError("'abc'", 'strings are not supported')
+        self.assertError("'abc", 'not terminated')
         self.assertError('x = 1 = 2', "Invalid use of '='")
         self.assertError('sin(1, 2)', 'Too many input arguments')
         self.assertError('sin()', 'Not enough input arguments')
@@ -460,6 +464,269 @@ class TestConditionsAndFind(EngineCase):
         self.assertEqual(self.out('3 > 2'), 'ans =\n  logical\n    1\n')
         self.out('t = v > 15;')
         self.assertIn('t          1x4        logical', self.out('whos'))
+
+
+def text_of(value):
+    return mc.chars_to_text(value)
+
+
+class TestText(EngineCase):
+    def test_literals(self):
+        self.assertEqual(text_of(self.ans("s = 'hello'", var='s')), 'hello')
+        self.assertEqual(text_of(self.ans("'it''s'")), "it's")
+        self.assertEqual(text_of(self.ans('"say ""hi"""')), 'say "hi"')
+        self.assertEqual(text_of(self.ans("'Árvíztűrő'")), 'Árvíztűrő')        # not only ASCII
+        self.assertEqual(self.ans("''").shape, (0, 0))
+        self.assertError("'abc", 'not terminated')
+
+    def test_text_inside_lines(self):
+        self.assertEqual(text_of(self.ans("a = '%d; not, a comment' % but this is", var='a')),
+                         '%d; not, a comment')
+        self.assertEqual(self.out("b = 'x;y'; c = 2"), 'c =\n    2\n')
+        self.assertValue("x = [1 2]'; y = x'", [1, 2], var='y')                 # quotes still transpose
+        self.assertEqual(text_of(self.ans("[x' 'ab']")), '\x01\x02ab')
+
+    def test_operations(self):
+        self.out("s = 'hello';")
+        self.assertEqual(text_of(self.ans('s(end:-1:1)')), 'olleh')
+        self.assertEqual(text_of(self.ans("[s ' world']")), 'hello world')
+        self.assertEqual(text_of(self.ans("['abc', 65]")), 'abcA')              # text with numbers is text
+        self.assertValue("'a' + 1", 98)                                          # arithmetic uses the codes
+        self.assertValue("s == 'hello'", [True] * 5)
+        self.assertEqual(text_of(self.ans("s(1) = 'J'; s", var='s')), 'Jello')
+        self.assertEqual(self.ans("['ab'; 'cd']").shape, (2, 2))
+        self.assertError("['abc'; 'de']", 'Dimensions of arrays being concatenated are not consistent')
+
+    def test_display(self):
+        self.assertEqual(self.out("s = 'hi'"), "s =\n    'hi'\n")
+        self.assertEqual(self.out("['ab'; 'cd']"), "ans =\n  2x2 char array\n    'ab'\n    'cd'\n")
+        self.assertEqual(self.out("''"), "ans =\n    ''\n")
+        self.out("t = 'x';")
+        self.assertIn('t          1x1        char', self.out('whos'))
+
+
+class TestSeveralOutputs(EngineCase):
+    def setUp(self):
+        super().setUp()
+        self.out('A = [3 1 4; 1 5 9; 2 6 5];')
+
+    def test_assigning_several_outputs(self):
+        self.assertEqual(self.out('[m, n] = size(A)'), 'm =\n    3\nn =\n    3\n')  # the window adds blank lines
+        self.assertValue('[r, c] = find(A > 5);', [[3], [2]], var='r')
+        self.assertValue('c', [[2], [3]], var='c')
+        self.assertValue('[r c v] = find(A > 5);', [[1], [1]], var='v')         # v: values of A > 5 (true)
+        self.assertValue('[r c v] = find(A .* (A > 5));', [[6], [9]], var='v')  # spaces separate names too
+        self.assertValue('[~, i] = max([4 9 2]);', 2, var='i')                   # ~ skips an output
+        self.assertNotIn('~', self.eng.variables)
+        self.assertEqual(self.out('[p, q] = size(A);'), '')
+
+    def test_errors(self):
+        self.assertError('[a, b] = sin(1)', 'Error using sin\nToo many output arguments.')
+        self.assertError('[a, b] = A', 'Too many output arguments')
+        self.assertError('[a, b, c, d] = find(A)', 'Too many output arguments')
+        self.assertError('disp(1) + 1', 'Error using disp\nToo many output arguments.')
+        self.assertError('x = rng(1)', 'Too many output arguments')
+
+    def test_functions_without_result_keep_ans(self):
+        self.out('7;')
+        self.assertEqual(self.out("disp('x')"), 'x\n')
+        self.assertEqual(self.out("fprintf('y\\n')"), 'y\n')
+        self.assertValue('ans', 7)
+
+
+class TestNewMath(EngineCase):
+    def test_remainders(self):
+        self.assertValue('rem([7 -7 7], [3 3 -3])', [1, -1, 1])
+        self.assertValue('mod([7 -7 7], [3 3 -3])', [1, 2, -2])
+        self.assertValue('mod(5.5, 2)', 1.5)
+        self.assertValue('mod(7, 0)', 7)
+        self.assertTrue(np.isnan(self.ans('rem(7, 0)')).all())
+        self.assertValue('mod(0:5, 3)', [0, 1, 2, 0, 1, 2])
+        self.assertError('mod([1 2 3], [1 2])', 'Arrays have incompatible sizes')
+
+    def test_hyperbolic(self):
+        x = np.array([-1.5, 0, 0.5, 2])
+        for name, func in (('sinh', np.sinh), ('cosh', np.cosh), ('tanh', np.tanh), ('asinh', np.arcsinh)):
+            self.assertValue(f'{name}([-1.5 0 0.5 2])', func(x))
+        self.assertValue('acosh([1 2 10])', np.arccosh([1, 2, 10]))
+        self.assertValue('atanh([-0.5 0 0.5])', np.arctanh([-0.5, 0, 0.5]))
+        self.assertValue('asinh(sinh(0.7))', 0.7)
+        self.assertTrue(np.isnan(self.ans('acosh(0.5)')).all())
+
+    def test_random_numbers(self):
+        r = self.ans('rng(1); r = rand(3, 4);', var='r')
+        self.assertEqual(r.shape, (3, 4))
+        self.assertTrue(np.all((r >= 0) & (r < 1)))
+        self.assertValue('rng(1); rand(3, 4)', r)                                # same seed, same numbers
+        self.assertEqual(self.ans('rand').shape, (1, 1))
+        self.assertEqual(self.ans('randn(2)').shape, (2, 2))
+        x = self.ans('rng(5); randn(1, 20000)')
+        self.assertLess(abs(x.mean()), 0.05)
+        self.assertLess(abs(x.std() - 1), 0.05)
+        self.assertNotEqual(self.ans('rng(1); rand').item(), self.ans('rng(2); rand').item())
+        self.eng.execute("rng('default')")
+        self.assertIsNone(self.eng.last_error)
+        self.assertError("rng('fast')", 'rng(seed)')
+
+    def test_size_and_length(self):
+        self.out('A = zeros(3, 7);')
+        self.assertValue('size(A)', [3, 7])
+        self.assertValue('size(A, 2)', 7)
+        self.assertValue('size(A, 3)', 1)
+        self.assertValue('[m, n, p] = size(A);', 1, var='p')
+        self.assertValue('length(A)', 7)
+        self.assertValue('length([])', 0)
+        self.assertValue("length('hello')", 5)
+
+    def test_linspace(self):
+        self.assertValue('linspace(0, 1, 5)', [0, 0.25, 0.5, 0.75, 1])
+        self.assertEqual(self.ans('linspace(1, 2)').shape, (1, 100))
+        self.assertValue('linspace(3, 7, 1)', 7)
+        self.assertEqual(self.ans('linspace(0, 1, 0)').shape, (1, 0))
+
+    def test_resize_and_reshape(self):
+        self.assertValue('resize([1 2 3], 5)', [1, 2, 3, 0, 0])
+        self.assertValue('resize([1 2 3], 2)', [1, 2])
+        self.assertValue('resize([1; 2; 3], 4)', [[1], [2], [3], [0]])
+        self.assertValue('resize([1 2; 3 4], [3 3])', [[1, 2, 0], [3, 4, 0], [0, 0, 0]])
+        self.assertValue("resize([1 2 3], 5, 'FillValue', 9)", [1, 2, 3, 9, 9])
+        self.assertValue("resize(1:5, 3, 'Side', 'leading')", [3, 4, 5])
+        self.assertValue("resize([1 2], 4, 'Side', 'both')", [0, 1, 2, 0])
+        self.assertEqual(text_of(self.ans("resize('ab', 4)")), 'ab  ')
+        self.assertValue('reshape(1:6, 2, 3)', [[1, 3, 5], [2, 4, 6]])
+        self.assertValue('reshape(1:6, [3 2])', [[1, 4], [2, 5], [3, 6]])
+        self.assertValue('reshape(1:6, [], 2)', [[1, 4], [2, 5], [3, 6]])
+        self.assertError('reshape(1:6, 4, 2)', 'Number of elements must not change')
+
+
+class TestStatistics(EngineCase):
+    A = np.array([[3.0, 1, 4], [1, 5, 9], [2, 6, 5]])
+
+    def setUp(self):
+        super().setUp()
+        self.out('A = [3 1 4; 1 5 9; 2 6 5];')
+
+    def test_max_and_min(self):
+        self.assertValue('max(A)', self.A.max(axis=0))
+        self.assertValue('min(A)', self.A.min(axis=0))
+        self.assertValue('[m, i] = max(A);', [1, 3, 2], var='i')
+        self.assertValue('max(A, [], 2)', self.A.max(axis=1).reshape(-1, 1))
+        self.assertValue("max(A, [], 'all')", 9)
+        self.assertValue("[m, k] = min(A, [], 'all');", 2, var='k')            # A(2) is the smallest
+        self.assertValue('max([1 5 3])', 5)
+        self.assertValue('max([1; 5; 3])', 5)
+        self.assertValue('max(A, 4)', np.maximum(self.A, 4))
+        self.assertValue('min([4 NaN 2])', 2)                                    # NaN is skipped
+        self.assertTrue(np.isnan(self.ans('max([NaN NaN])')).all())
+        self.assertValue('[m, i] = max([2 7 7]);', 2, var='i')                   # the first of equal values
+        self.assertError('[m, i] = max(A, 4)', 'one output')
+
+    def test_mean_median_std(self):
+        self.assertValue('mean(A)', self.A.mean(axis=0))
+        self.assertValue('mean(A, 2)', self.A.mean(axis=1).reshape(-1, 1))
+        self.assertValue("mean(A, 'all')", self.A.mean())
+        self.assertValue('mean([1 2 3 4])', 2.5)
+        self.assertValue('median([3 1 4 1 5])', 3)
+        self.assertValue('median([3 1 4 1])', 2)
+        self.assertValue('median(A)', np.median(self.A, axis=0))
+        self.assertValue('std([2 4 4 4 5 5 7 9])', np.std([2, 4, 4, 4, 5, 5, 7, 9], ddof=1))
+        self.assertValue('std([2 4 4 4 5 5 7 9], 1)', 2)
+        self.assertValue('std(A)', np.std(self.A, axis=0, ddof=1))
+        self.assertValue('std(A, 0, 2)', np.std(self.A, axis=1, ddof=1).reshape(-1, 1))
+        self.assertValue('std(5)', 0)
+        self.assertTrue(np.isnan(self.ans('mean([])')).all())
+        self.assertTrue(np.isnan(self.ans('mean([1 NaN 3])')).all())
+        self.assertError('std(A, 2)', 'weight must be 0')
+
+
+class TestTextOutputAndFiles(EngineCase):
+    def setUp(self):
+        super().setUp()
+        self.folder = os.getcwd()
+        self.tmp = tempfile.mkdtemp()
+        os.chdir(self.tmp)
+
+    def tearDown(self):
+        self.eng.execute("fclose('all');")
+        os.chdir(self.folder)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_disp(self):
+        self.assertEqual(self.out("disp('Hello')"), 'Hello\n')
+        self.assertEqual(self.out('disp(pi)'), '    3.1416\n')
+        self.assertEqual(self.out('disp([1 2; 3 4])'), '    1   2\n    3   4\n')
+        self.assertEqual(self.out("disp(['ab'; 'cd'])"), 'ab\ncd\n')
+        self.assertEqual(self.out('disp([])'), '')
+        self.assertEqual(self.out("disp(['x = ' num2str(2.5)])"), 'x = 2.5\n')
+        self.assertTrue(all(isinstance(c, mc.RawText) for c in self.eng.execute("disp('a')")))
+
+    def test_fprintf_to_the_screen(self):
+        self.assertEqual(self.out("fprintf('%d squared is %d\\n', [1 2 3; 1 4 9])"),
+                         '1 squared is 1\n2 squared is 4\n3 squared is 9\n')
+        self.assertEqual(self.out("fprintf('%d, %d\\n', 1, 2, 3)"), '1, 2\n3, ')     # stops without data
+        self.assertEqual(self.out("fprintf('%s = %.3f\\n', 'pi', pi)"), 'pi = 3.142\n')
+        self.assertEqual(self.out("fprintf('100%% done\\t|\\n')"), '100% done\t|\n')
+        self.assertEqual(self.out("fprintf('%5.1f|%-4d|%e\\n', 2.5, 7, 12345)"), '  2.5|7   |1.234500e+04\n')
+        self.assertEqual(self.out("fprintf(1, 'x%c\\n', 'yz')"), 'xy\nxz\n')
+        self.assertEqual(self.out("fprintf('%d\\n', [NaN Inf])"), 'NaN\nInf\n')
+        self.assertEqual(self.out("fprintf('no newline')"), 'no newline')
+        self.assertValue("n = fprintf('abc\\n');", 4, var='n')
+
+    def test_sprintf_and_num2str(self):
+        self.assertEqual(text_of(self.ans("sprintf('%.2f', pi)")), '3.14')
+        self.assertEqual(text_of(self.ans("sprintf('%d, ', 1:3)")), '1, 2, 3, ')
+        self.assertEqual(text_of(self.ans("sprintf('%d', 3.5)")), '3.500000e+00')    # as in MATLAB
+        self.assertEqual(text_of(self.ans("sprintf('%s', 65)")), 'A')
+        for expr, text in (('num2str(pi)', '3.1416'), ('num2str(42)', '42'), ('num2str([1 2 3])', '1  2  3'),
+                           ('num2str(pi, 8)', '3.1415927'), ('num2str(-0.5)', '-0.5'),
+                           ("num2str(pi, '%10.5f')", '   3.14159'), ('num2str(NaN)', 'NaN'),
+                           ("num2str('abc')", 'abc'), ('num2str(123456.789)', '123456.789')):
+            self.assertEqual(text_of(self.ans(expr)), text, expr)
+
+    def test_write_and_read_a_file(self):
+        self.assertValue("fid = fopen('data.txt', 'w');", 3, var='fid')
+        self.assertEqual(self.out("fprintf(fid, '%f %f\\n', [1 2 3; 10 20 30]);"), '')
+        self.assertValue('fclose(fid)', 0)
+        with open(os.path.join(self.tmp, 'data.txt')) as f:
+            self.assertEqual(f.read(), '1.000000 10.000000\n2.000000 20.000000\n3.000000 30.000000\n')
+        self.assertValue("fid = fopen('data.txt'); B = fscanf(fid, '%f %f', [2 Inf])'; fclose(fid);",
+                         [[1, 10], [2, 20], [3, 30]], var='B')
+        self.out("fid = fopen('data.txt', 'r');")
+        self.assertValue('[v, count] = fscanf(fid, "%f", 4);', [[1], [10], [2], [20]], var='v')
+        self.assertValue('count', 4, var='count')
+        self.assertValue('rest = fscanf(fid, "%f");', [[3], [30]], var='rest')   # continues where it stopped
+        self.out('fclose(fid);')
+        self.out("fid = fopen('log.txt', 'a'); fprintf(fid, 'one\\n'); fclose(fid);")
+        self.out("fid = fopen('log.txt', 'a'); fprintf(fid, 'two\\n'); fclose(fid);")
+        self.assertEqual(text_of(self.ans("fid = fopen('log.txt'); w = fscanf(fid, '%s'); fclose(fid);", var='w')),
+                         'onetwo')
+        self.assertValue("fid = fopen('csv.txt', 'w'); fprintf(fid, '1,2,3\\n4,5,6\\n'); fclose(fid); "
+                         "fid = fopen('csv.txt'); M = fscanf(fid, '%d,%d,%d\\n', [3 Inf])'; fclose(fid);",
+                         [[1, 2, 3], [4, 5, 6]], var='M')
+
+    def test_file_identifiers(self):
+        self.assertValue("[f, msg] = fopen('missing.txt');", -1, var='f')
+        self.assertIn('No such file', text_of(self.eng.variables['msg']))
+        self.assertValue("a = fopen('a.txt', 'w'); b = fopen('b.txt', 'w'); [a b]", [3, 4])
+        self.assertValue("fopen('all')", [3, 4])
+        self.assertValue("fclose(a); c = fopen('c.txt', 'w')", 3, var='c')       # free identifiers are reused
+        self.assertError("fprintf(9, 'x')", 'Invalid file identifier')
+        self.assertError('fclose(9)', 'Invalid file identifier')
+        self.assertError("fscanf(b, '%f')", 'not open for reading')
+        self.assertError("r = fopen('a.txt'); fprintf(r, 'x')", 'not open for writing')
+        self.assertError("fopen('x.txt', 'q')", 'Invalid permission')
+        self.assertValue("fclose('all'); fopen('all')", np.zeros((1, 0)))
+
+    def test_current_folder(self):
+        self.assertIn(os.path.realpath(self.tmp), os.path.realpath(self.out('pwd').strip()))
+        os.mkdir(os.path.join(self.tmp, 'My Data'))
+        self.out("cd 'My Data'")
+        self.assertEqual(os.path.realpath(os.getcwd()), os.path.realpath(os.path.join(self.tmp, 'My Data')))
+        self.out("fid = fopen('x.txt', 'w'); fclose(fid);")
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, 'My Data', 'x.txt')))
+        self.out('cd ..')
+        self.assertEqual(os.path.realpath(os.getcwd()), os.path.realpath(self.tmp))
+        self.assertError('cd nowhere', 'Unable to change current folder')
 
 
 class TestDisplay(EngineCase):
@@ -721,8 +988,8 @@ class TestEventLoop(unittest.TestCase):
             pass  # the application was destroyed, as expected
 
 
-class TestInstallation(unittest.TestCase):
-    """Installing, updating and removing - redirected to a temporary folder."""
+class InstallationCase(unittest.TestCase):
+    """Base for the installation tests: every folder they write to is a temporary one."""
 
     PATCHED = ('CONFIG_FILE', 'MAC_SYSTEM_DIR', 'MAC_USER_DIR', 'LINUX_SYSTEM_DIRS', 'LINUX_USER_DIRS', '_can_write')
 
@@ -747,6 +1014,10 @@ class TestInstallation(unittest.TestCase):
     def config(self):
         with open(mc.CONFIG_FILE, encoding='utf-8') as f:
             return json.load(f)
+
+
+class TestInstallation(InstallationCase):
+    """Installing, updating from a local file and removing."""
 
     def test_linux_install_update_and_uninstall(self):
         ok, message = mc.install_app(False, 'linux')
@@ -865,6 +1136,216 @@ class TestInstallation(unittest.TestCase):
             self.assertTrue(self.config()['first_start_done'])
         finally:
             root.destroy()
+
+
+class FakeGitHub:
+    """A local web server answering like api.github.com and raw.githubusercontent.com.
+
+    files maps a branch or tag name to {file name: bytes}; release is the tag of the
+    newest release, or None for a project without releases.
+    """
+
+    def __init__(self):
+        self.files, self.release, self.requests = {}, None, []
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                fake.requests.append(self.path)
+                api = f'/api/repos/{mc.UPDATE_REPOSITORY}/releases/latest'
+                raw = f'/raw/{mc.UPDATE_REPOSITORY}/'
+                body = None
+                if self.path == api and fake.release:
+                    body = json.dumps({'tag_name': fake.release}).encode()
+                elif self.path.startswith(raw):
+                    ref, _, name = self.path[len(raw):].partition('/')
+                    body = fake.files.get(ref, {}).get(name)
+                self.send_response(200 if body is not None else 404)
+                self.end_headers()
+                self.wfile.write(body if body is not None else b'Not Found')
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f'http://127.0.0.1:{self.server.server_address[1]}'
+
+    def publish(self, version, ref='HEAD', icon=True):
+        """Put a copy of this program with APP_VERSION = version on the fake GitHub."""
+        with open(mc.THIS_SCRIPT, encoding='utf-8') as f:
+            source = re.sub(r"^APP_VERSION = '[^']*'", f"APP_VERSION = '{version}'", f.read(), flags=re.M)
+        self.files.setdefault(ref, {})[mc.APP_SLUG + '.py'] = source.encode()
+        if icon and os.path.isfile(ICON):
+            with open(ICON, 'rb') as f:
+                self.files[ref][mc.APP_ICON_FILE] = f.read()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestUpdates(InstallationCase):
+    """Looking for, downloading and installing new versions - against a local fake GitHub."""
+
+    PATCHED = InstallationCase.PATCHED + ('GITHUB_API', 'GITHUB_RAW')
+
+    def setUp(self):
+        gc.collect()  # free Tk objects of earlier tests here, not in a web server thread
+        super().setUp()
+        self.github = FakeGitHub()
+        mc.GITHUB_API, mc.GITHUB_RAW = self.github.url + '/api', self.github.url + '/raw'
+
+    def tearDown(self):
+        self.github.stop()
+        super().tearDown()
+
+    def installed_version(self):
+        return mc.file_version(mc.install_target(False, 'linux')['script'])
+
+    def test_newest_version_from_main_branch(self):
+        self.github.publish('9.9.9')
+        latest = mc.find_latest_version()
+        self.assertEqual(latest['version'], '9.9.9')
+        self.assertTrue(latest['base'].endswith('/HEAD/'))
+
+    def test_newest_release_is_preferred(self):
+        self.github.publish('9.9.9')                       # newer, but not released yet
+        self.github.publish('1.2.3', ref='v1.2.3')
+        self.github.release = 'v1.2.3'
+        self.assertEqual(mc.find_latest_version()['version'], '1.2.3')
+
+    def test_invalid_download_is_rejected(self):
+        self.github.files['HEAD'] = {mc.APP_SLUG + '.py': b'<html>Rate limit exceeded</html>'}
+        with self.assertRaisesRegex(mc.UpdateError, 'not a valid'):
+            mc.find_latest_version()
+        self.github.files['HEAD'] = {}
+        with self.assertRaisesRegex(mc.UpdateError, 'HTTP error 404'):
+            mc.find_latest_version()
+
+    def test_github_unreachable(self):
+        mc.GITHUB_API = mc.GITHUB_RAW = 'http://127.0.0.1:9'   # nothing listens there
+        with self.assertRaisesRegex(mc.UpdateError, 'Could not connect to GitHub'):
+            mc.find_latest_version()
+        mc.install_app(False, 'linux')
+        ok, message = mc.update_installed_app('linux')
+        self.assertFalse(ok)
+        self.assertEqual(self.installed_version(), mc.APP_VERSION)    # nothing changed
+
+    def test_update_installed_copy(self):
+        self.assertIn('not installed', mc.update_installed_app('linux')[1])
+        mc.install_app(False, 'linux')
+        self.github.publish('9.9.9')
+        ok, message = mc.update_installed_app('linux')
+        self.assertTrue(ok, message)
+        self.assertIn(f'updated from {mc.APP_VERSION} to 9.9.9', message)
+        self.assertIn('Restart', message)
+        self.assertEqual(self.installed_version(), '9.9.9')
+        self.assertEqual(self.config()['installed']['version'], '9.9.9')
+        self.assertGreater(self.config()['last_update_check'], time.time() - 60)
+        self.assertIn('9.9.9 is up to date', mc.update_installed_app('linux')[1])  # nothing newer now
+
+    def test_never_downgrades(self):
+        mc.install_app(False, 'linux')
+        self.github.publish('0.0.1')
+        self.assertIn('is up to date', mc.update_installed_app('linux')[1])
+        self.assertEqual(self.installed_version(), mc.APP_VERSION)
+
+    def test_mac_bundle_update(self):
+        mc.install_app(False, 'darwin')
+        self.github.publish('9.9.9')
+        self.assertTrue(mc.update_installed_app('darwin')[0])
+        app = os.path.join(mc.MAC_USER_DIR, mc.APP_NAME + '.app')
+        with open(os.path.join(app, 'Contents', 'Info.plist'), 'rb') as f:
+            self.assertEqual(plistlib.load(f)['CFBundleShortVersionString'], '9.9.9')
+
+    def test_weekly_schedule(self):
+        week = mc.UPDATE_CHECK_DAYS * 86400
+        now = time.time()
+        self.assertTrue(mc.update_check_due({}, now))
+        self.assertFalse(mc.update_check_due({'last_update_check': now - week + 3600}, now))
+        self.assertTrue(mc.update_check_due({'last_update_check': now - week - 1}, now))
+        self.assertFalse(mc.update_check_due({'last_update_check': 0, 'check_updates': False}, now))
+        mc.install_app(False, 'linux')                     # installing starts the first week
+        self.assertFalse(mc.update_check_due(self.config(), time.time()))
+
+    def test_update_command(self):
+        eng = mc.MatlabEngine()
+        self.assertIn('off', ''.join(eng.execute('update off')))
+        self.assertFalse(self.config()['check_updates'])
+        self.assertIn('on', ''.join(eng.execute('update on')))
+        self.assertTrue(self.config()['check_updates'])
+        if mc.install_target(False) is None:
+            self.skipTest('installing is not supported on this system')
+        eng.execute('install')
+        self.github.publish('9.9.9')
+        self.assertIn('updated', ''.join(eng.execute('update')))
+        self.assertIsNone(eng.last_error)
+        self.assertIn('look every', ''.join(eng.execute('help update')))
+
+    def answer_dialogs(self, answers, seen):
+        """Make every InstallDialog answer by itself: answers[title] is the button to press."""
+        original = mc.InstallDialog.show
+
+        def show(dialog):
+            seen.append((dialog.title(), dialog.icon_label is not None, dialog.checkbox is not None))
+            dialog.after(100, dialog.buttons[answers[dialog.title()]].invoke)
+            return original(dialog)
+        mc.InstallDialog.show = show
+        return original
+
+    def test_weekly_check_in_the_window(self):
+        root = make_root(visible=True)
+        original = None
+        try:
+            app = mc.MatlabConsoleApp(root)
+            mc.install_app(False, 'linux')
+            config = self.config()
+            config['last_update_check'] = 0                # the last check was long ago
+            mc.save_config(config)
+            self.github.publish('9.9.9')
+            seen, restarted = [], []
+            app.restart = restarted.append
+            original = self.answer_dialogs({f'Update {mc.APP_NAME}?': 'update',
+                                            f'Restart {mc.APP_NAME}?': 'restart'}, seen)
+            app.startup_check('linux')                     # starts the look in the background
+            deadline = time.time() + 20
+            while len(seen) < 2 and time.time() < deadline:
+                root.update()
+                time.sleep(0.02)
+            titles = [title for title, _, _ in seen]
+            self.assertEqual(titles, [f'Update {mc.APP_NAME}?', f'Restart {mc.APP_NAME}?'])
+            if os.path.isfile(ICON):
+                self.assertTrue(all(has_icon for _, has_icon, _ in seen), 'both dialogs show the icon')
+            self.assertTrue(seen[0][2], 'the update question has the weekly checkbox')
+            self.assertEqual(self.installed_version(), '9.9.9')
+            self.assertEqual(restarted, [mc.install_target(False, 'linux')['script']])
+            self.assertIn('updated from', app.output_area.get('1.0', 'end'))
+        finally:
+            if original:
+                mc.InstallDialog.show = original
+            root.destroy()
+            gc.collect()
+
+    def test_skip_this_version(self):
+        root = make_root(visible=True)
+        original = None
+        try:
+            app = mc.MatlabConsoleApp(root)
+            mc.install_app(False, 'linux')
+            self.github.publish('9.9.9')
+            seen = []
+            original = self.answer_dialogs({f'Update {mc.APP_NAME}?': 'skip'}, seen)
+            app.offer_update(mc.find_latest_version(), 'linux')
+            app.offer_update(mc.find_latest_version(), 'linux')   # not asked again for 9.9.9
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(self.config()['skipped_version'], '9.9.9')
+            self.assertEqual(self.installed_version(), mc.APP_VERSION)
+        finally:
+            if original:
+                mc.InstallDialog.show = original
+            root.destroy()
+            gc.collect()
 
 
 class TestIcon(unittest.TestCase):

@@ -4,6 +4,7 @@ Matlab_Calc - a MATLAB Command Window emulator built with Tkinter and NumPy.
 Run with:  python3 matlab_calc.py
 """
 
+import gc
 import inspect
 import json
 import math
@@ -15,7 +16,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import tkinter as tk
+import urllib.error
+import urllib.parse
+import urllib.request
 import tkinter.font as tkfont
 from fractions import Fraction
 from tkinter import scrolledtext, ttk
@@ -26,7 +32,7 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
-APP_VERSION = '0.5.0'           # Shown in the welcome banner; see the version history in README.md
+APP_VERSION = '0.7.0'           # Shown in the welcome banner; see the version history in README.md
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
 WINDOW_HEIGHT = 520             # Initial window height in pixels
@@ -49,6 +55,8 @@ LONG_DECIMALS = 15              # Maximum decimals shown by 'format long'
 MAX_DISPLAY_ELEMENTS = 10000    # Bigger results are summarised instead of printed in full
 
 CONFIG_FILE = '~/.matlab_calc.json'  # Settings file in the home folder: first start, installation
+UPDATE_REPOSITORY = 'varallyay/matlab_calc'  # GitHub project (owner/name) that publishes new versions
+UPDATE_CHECK_DAYS = 7           # Look for a new version this often (days); 0 = only with the update command
 # =============================================================================
 
 __version__ = APP_VERSION
@@ -84,11 +92,18 @@ class MatlabError(Exception):
 #  Every value is a 2-D NumPy array (scalars are 1x1) of dtype float64 or
 #  complex128, mirroring MATLAB's "everything is a matrix" model.
 # =============================================================================
+CHAR = np.uint16  # MATLAB text (char arrays) is stored as UTF-16 character codes
+
+
+class RawText(str):
+    """Output shown exactly as it is (from disp or fprintf), without the usual blank line after it."""
+
+
 def to_matrix(x):
-    """Convert any value to a 2-D array of float, complex, or bool (MATLAB's logical values)."""
+    """Convert any value to a 2-D array of float, complex, bool (logical) or CHAR (text)."""
     a = np.asarray(x)
-    if a.dtype == bool:
-        pass  # logical (true/false), e.g. the result of a comparison
+    if a.dtype == bool or a.dtype == CHAR:
+        pass  # logical (true/false), e.g. the result of a comparison, or text
     elif np.iscomplexobj(a):
         a = a.astype(complex)
         if not np.any(a.imag):  # MATLAB drops all-zero imaginary parts
@@ -105,8 +120,33 @@ def to_matrix(x):
 
 
 def to_double(a):
-    """Logical values take part in arithmetic and functions as the numbers 1 and 0, as in MATLAB."""
-    return a.astype(float) if a.dtype == bool else a
+    """In arithmetic and most functions logical values count as 1 and 0, and text as its
+    character codes ('a' + 1 is 98), as in MATLAB."""
+    return a.astype(float) if a.dtype == bool or a.dtype == CHAR else a
+
+
+def is_text(a):
+    return a.dtype == CHAR
+
+
+def text_to_chars(text):
+    """A Python string as a MATLAB char row vector ('' is 0x0, as in MATLAB)."""
+    if not text:
+        return np.zeros((0, 0), dtype=CHAR)
+    return np.frombuffer(text.encode('utf-16-le', 'surrogatepass'), dtype='<u2').astype(CHAR).reshape(1, -1)
+
+
+def chars_to_text(a):
+    """The text in a char array (or numbers used as character codes), row after row."""
+    codes = np.clip(np.real(np.asarray(a)).astype(np.int64).ravel(), 0, 0xFFFF).astype('<u2')
+    return codes.tobytes().decode('utf-16-le', 'replace')
+
+
+def text_argument(value, function, what='The argument'):
+    """The Python string in a text argument such as a file name; an error for anything else."""
+    if not is_text(value) and value.size:
+        raise MatlabError(f"Error using {function}\n{what} must be text, e.g. 'data.txt'.")
+    return chars_to_text(value)
 
 
 def _is_scalar(a):
@@ -287,25 +327,65 @@ CAT_CONSTANTS = 'Constants'
 CAT_MATH = 'Elementary math'
 CAT_ELEMENTWISE = 'Element-wise arithmetic'
 CAT_TRIG = 'Trigonometry'
-CAT_ROUNDING = 'Rounding'
+CAT_HYPERBOLIC = 'Hyperbolic functions'
+CAT_ROUNDING = 'Rounding and remainders'
+CAT_STATS = 'Data analysis'
 CAT_LOGICAL = 'Logical values and searching'
-CAT_MATRIX = 'Matrices and linear algebra'
-HELP_CATEGORIES = (CAT_COMMANDS, CAT_CONSTANTS, CAT_MATH, CAT_ELEMENTWISE, CAT_TRIG, CAT_ROUNDING, CAT_LOGICAL,
-                   CAT_MATRIX)
+CAT_RANDOM = 'Random numbers'
+CAT_MATRIX = 'Matrices and arrays'
+CAT_TEXT = 'Text and files'
+HELP_CATEGORIES = (CAT_COMMANDS, CAT_CONSTANTS, CAT_MATH, CAT_ELEMENTWISE, CAT_TRIG, CAT_HYPERBOLIC, CAT_ROUNDING,
+                   CAT_STATS, CAT_LOGICAL, CAT_RANDOM, CAT_MATRIX, CAT_TEXT)
 
 FUNCTIONS = {}  # MATLAB name -> (Python function, minimum inputs, maximum inputs)
 
 
-def builtin(*names, category):
-    """Register the decorated Python function as the MATLAB function(s) `names`."""
+def builtin(*names, category, outputs=1, keep_types=False):
+    """Register the decorated Python function as the MATLAB function(s) `names`.
+
+    outputs is the largest number of results it returns ([a, b] = f(...) asks for 2; a
+    function returning tuples must give at least as many as asked). Arguments arrive as
+    numbers, with logical values and text converted, unless keep_types is set. If the
+    function has the keyword-only parameter nargout, it learns how many results are wanted
+    (0 for a statement such as disp(x), where it may return None for "no result"); a
+    keyword-only parameter engine receives the MatlabEngine, e.g. to print text.
+    """
     def register(func):
         params = list(inspect.signature(func).parameters.values())
-        min_args = sum(p.default is inspect.Parameter.empty for p in params)
+        positional = [p for p in params if p.kind == p.POSITIONAL_OR_KEYWORD]
+        keywords = {p.name for p in params if p.kind == p.KEYWORD_ONLY}
+        variadic = any(p.kind == p.VAR_POSITIONAL for p in params)
+        min_args = sum(p.default is inspect.Parameter.empty for p in positional)
         for name in names:
-            FUNCTIONS[name] = (func, min_args, len(params))
+            FUNCTIONS[name] = (func, min_args, None if variadic else len(positional))
         func.matlab_names, func.help_category = names, category
+        func.max_outputs, func.keep_types = outputs, keep_types
+        func.wants_nargout, func.wants_engine = 'nargout' in keywords, 'engine' in keywords
         return func
     return register
+
+
+_CURRENT_ENGINE = None  # the MatlabEngine running a command line (disp and fprintf print through it)
+
+
+def call_function(name, arg_nodes, variables, end_value=None, nargout=1):
+    """Call the built-in function `name`, checking the numbers of inputs and outputs as MATLAB does."""
+    func, lo, hi = FUNCTIONS[name]
+    arg_nodes = arg_nodes or []
+    if len(arg_nodes) < lo or (hi is not None and len(arg_nodes) > hi):
+        problem = 'Not enough' if len(arg_nodes) < lo else 'Too many'
+        raise MatlabError(f"Error using {name}\n{problem} input arguments.")
+    if nargout > func.max_outputs:
+        raise MatlabError(f"Error using {name}\nToo many output arguments.")
+    args = [evaluate(a, variables, end_value) for a in arg_nodes]
+    if not func.keep_types:
+        args = [to_double(a) for a in args]
+    options = {}
+    if func.wants_nargout:
+        options['nargout'] = nargout
+    if func.wants_engine:
+        options['engine'] = _CURRENT_ENGINE or MatlabEngine()
+    return func(*args, **options)
 
 
 def _given(*args):
@@ -644,8 +724,8 @@ def fn_ceil(x):
 
 
 # ---- logical values and searching --------------------------------------------
-@builtin('find', category=CAT_LOGICAL)
-def fn_find(x, n=None):
+@builtin('find', category=CAT_LOGICAL, outputs=3)
+def fn_find(x, n=None, *, nargout=1):
     """find - Positions of nonzero (true) elements.
 
     find(X) returns the positions of the nonzero elements of X, numbered
@@ -657,17 +737,25 @@ def fn_find(x, n=None):
     A = A' the same command gives [2; 3; 4].
 
     find(X, N) returns at most the first N positions.
+    [row, col] = find(X) gives row and column numbers instead, and
+    [row, col, v] = find(X) also the values.
 
-    See also logical, true, false.
+    See also logical, max, min.
     """
-    positions = np.flatnonzero(x.ravel(order='F')) + 1.0
+    positions = np.flatnonzero(x.ravel(order='F'))
     if n is not None:
         if n.size != 1 or np.iscomplexobj(n) or not (n.flat[0] >= 1 and float(n.flat[0]).is_integer()):
             raise MatlabError("Error using find\nSecond argument must be a positive scalar integer.")
         positions = positions[:int(n.flat[0])]
     if x.shape == (0, 0):
-        return np.zeros((0, 0))
-    return to_matrix(positions.reshape((1, -1) if x.shape[0] == 1 else (-1, 1)))
+        return np.zeros((0, 0)) if nargout <= 1 else (np.zeros((0, 0)),) * nargout
+    shape = (1, -1) if x.shape[0] == 1 else (-1, 1)
+    if nargout <= 1:
+        return to_matrix((positions + 1.0).reshape(shape))
+    results = (to_matrix((positions % x.shape[0] + 1.0).reshape(shape)),
+               to_matrix((positions // x.shape[0] + 1.0).reshape(shape)),
+               to_matrix(x.ravel(order='F')[positions].reshape(shape)))
+    return results[:nargout]
 
 
 @builtin('logical', category=CAT_LOGICAL)
@@ -778,6 +866,848 @@ def fn_det(x):
     return to_matrix(np.linalg.det(x))
 
 
+# ---- helpers for the functions below ------------------------------------------
+def _whole_number(value, function, what, minimum=0):
+    """A non-negative (or >= minimum) whole number given as a scalar argument."""
+    if value.size != 1 or np.iscomplexobj(value) or is_text(value):
+        raise MatlabError(f"Error using {function}\n{what} must be a whole number.")
+    number = float(value.flat[0])
+    if not number.is_integer() or number < minimum:
+        raise MatlabError(f"Error using {function}\n{what} must be a whole number of at least {minimum}.")
+    return int(number)
+
+
+def _reduce_axis(a, dim, function):
+    """Direction for max, mean, ...: 0 down the columns, 1 along the rows, 'all', or None (dim > 2).
+
+    Without dim MATLAB uses the first dimension longer than 1: columns of a matrix, the
+    elements of a row vector.
+    """
+    if dim is None:
+        return 1 if a.shape[0] == 1 and a.shape[1] != 1 else 0
+    if is_text(dim):
+        if chars_to_text(dim).lower() == 'all':
+            return 'all'
+        raise MatlabError(f"Error using {function}\nThe dimension must be 1, 2 or 'all'.")
+    return {1: 0, 2: 1}.get(_whole_number(dim, function, 'The dimension', 1))
+
+
+def _reduced_shape(a, axis):
+    return (1, 1) if axis == 'all' else (1, a.shape[1]) if axis == 0 else (a.shape[0], 1)
+
+
+# ---- hyperbolic functions ------------------------------------------------------
+@builtin('sinh', category=CAT_HYPERBOLIC)
+def fn_sinh(x):
+    """sinh - Hyperbolic sine.
+
+    sinh(X) is (exp(X) - exp(-X)) / 2 for each element of X.
+
+    See also asinh, cosh, tanh.
+    """
+    return to_matrix(np.sinh(x))
+
+
+@builtin('cosh', category=CAT_HYPERBOLIC)
+def fn_cosh(x):
+    """cosh - Hyperbolic cosine.
+
+    cosh(X) is (exp(X) + exp(-X)) / 2 for each element of X.
+
+    See also acosh, sinh, tanh.
+    """
+    return to_matrix(np.cosh(x))
+
+
+@builtin('tanh', category=CAT_HYPERBOLIC)
+def fn_tanh(x):
+    """tanh - Hyperbolic tangent.
+
+    tanh(X) is sinh(X) ./ cosh(X) for each element of X; it lies between
+    -1 and 1.
+
+    See also atanh, sinh, cosh.
+    """
+    return to_matrix(np.tanh(x))
+
+
+@builtin('asinh', category=CAT_HYPERBOLIC)
+def fn_asinh(x):
+    """asinh - Inverse hyperbolic sine.
+
+    asinh(X) is the number whose sinh is X, for each element of X:
+    log(X + sqrt(X.^2 + 1)).
+
+    See also sinh, acosh, atanh.
+    """
+    return to_matrix(np.arcsinh(x))
+
+
+@builtin('acosh', category=CAT_HYPERBOLIC)
+def fn_acosh(x):
+    """acosh - Inverse hyperbolic cosine.
+
+    acosh(X) is the number (>= 0) whose cosh is X, for each element of X.
+    Elements below 1 give NaN (MATLAB returns a complex number).
+
+    See also cosh, asinh, atanh.
+    """
+    return to_matrix(np.arccosh(x))
+
+
+@builtin('atanh', category=CAT_HYPERBOLIC)
+def fn_atanh(x):
+    """atanh - Inverse hyperbolic tangent.
+
+    atanh(X) is the number whose tanh is X, for each element of X;
+    atanh(1) is Inf. Elements outside [-1, 1] give NaN (MATLAB returns a
+    complex number).
+
+    See also tanh, asinh, acosh.
+    """
+    return to_matrix(np.arctanh(x))
+
+
+# ---- remainders ----------------------------------------------------------------
+def _remainder(function, a, b, rule):
+    if np.iscomplexobj(a) or np.iscomplexobj(b):
+        raise MatlabError(f"Error using {function}\nComplex numbers are not supported.")
+    return _elementwise(rule, a, b, function)
+
+
+@builtin('rem', category=CAT_ROUNDING)
+def fn_rem(a, b):
+    """rem - Remainder after division.
+
+    rem(A, B) is A - fix(A./B).*B: the remainder has the sign of A,
+    e.g. rem(7, 3) is 1 and rem(-7, 3) is -1. rem(A, 0) is NaN.
+    A and B can be matrices of compatible sizes.
+
+    See also mod, floor, round.
+    """
+    return _remainder('rem', a, b, np.fmod)
+
+
+@builtin('mod', category=CAT_ROUNDING)
+def fn_mod(a, b):
+    """mod - Remainder after division (modulo).
+
+    mod(A, B) is A - floor(A./B).*B: the result has the sign of B,
+    e.g. mod(7, 3) is 1 and mod(-7, 3) is 2. mod(A, 0) is A.
+    A and B can be matrices of compatible sizes.
+
+    See also rem, floor, round.
+    """
+    return _remainder('mod', a, b, lambda x, y: np.where(y == 0, x, np.mod(x, y)))
+
+
+# ---- data analysis -------------------------------------------------------------
+def _extreme(function, a, b, dim, nargout, largest):
+    """max / min: of a vector, of each column, element-wise between two arrays, or along dim."""
+    a = to_double(a)
+    if b is not None and b.shape != (0, 0):  # max(A, B): element by element
+        if dim is not None or nargout > 1:
+            raise MatlabError(f"Error using {function}\nWith two arrays to compare, {function} has one "
+                              "output and no dimension argument.")
+        return _elementwise(np.fmax if largest else np.fmin, a, to_double(b), function)
+    axis = _reduce_axis(a, dim, function)
+    if axis is None:  # along a dimension of length 1: the values themselves
+        return (a, to_matrix(np.ones(a.shape))) if nargout > 1 else a
+    work = a.ravel(order='F').reshape(-1, 1) if axis == 'all' else a
+    if work.size == 0:
+        empty = np.zeros((0, 0))
+        return (empty, empty) if nargout > 1 else empty
+    slices = work.T if axis in (0, 'all') else work
+    key = np.abs(slices) if np.iscomplexobj(slices) else slices  # complex: by magnitude
+    pick = np.nanargmax if largest else np.nanargmin
+    positions = [0 if np.all(np.isnan(k)) else int(pick(k)) for k in key]  # NaN is skipped, as in MATLAB
+    values = np.array([s[p] for s, p in zip(slices, positions)])
+    shape = _reduced_shape(a, axis)
+    result = to_matrix(values.reshape(shape))
+    return (result, to_matrix(np.array(positions, dtype=float).reshape(shape) + 1)) if nargout > 1 else result
+
+
+@builtin('max', category=CAT_STATS, outputs=2, keep_types=True)
+def fn_max(a, b=None, dim=None, *, nargout=1):
+    """max - Largest element.
+
+    max(V) is the largest element of a vector V; max(A) of a matrix is a
+    row with the largest element of each column. NaN is ignored.
+    [M, I] = max(A) also gives the positions I of the largest elements
+    (the first one if several are equal).
+    max(A, B) is the larger of A and B, element by element.
+    max(A, [], dim) works along dimension dim (1: columns, 2: rows), and
+    max(A, [], 'all') gives the largest element of all.
+
+    See also min, find, mean, median.
+    """
+    return _extreme('max', a, b, dim, nargout, largest=True)
+
+
+@builtin('min', category=CAT_STATS, outputs=2, keep_types=True)
+def fn_min(a, b=None, dim=None, *, nargout=1):
+    """min - Smallest element.
+
+    min(V) is the smallest element of a vector V; min(A) of a matrix is a
+    row with the smallest element of each column. NaN is ignored.
+    [M, I] = min(A) also gives the positions I of the smallest elements
+    (the first one if several are equal).
+    min(A, B) is the smaller of A and B, element by element.
+    min(A, [], dim) works along dimension dim (1: columns, 2: rows), and
+    min(A, [], 'all') gives the smallest element of all.
+
+    See also max, find, mean, median.
+    """
+    return _extreme('min', a, b, dim, nargout, largest=False)
+
+
+def _statistic(function, a, dim, compute):
+    a = to_double(a)
+    axis = _reduce_axis(a, dim, function)
+    if axis is None:
+        return compute(a, None, True)
+    if axis == 'all':
+        a, axis = a.ravel(order='F').reshape(-1, 1), 0
+    if a.size == 0:
+        return to_matrix(np.nan) if a.shape == (0, 0) else to_matrix(np.full(_reduced_shape(a, axis), np.nan))
+    return to_matrix(compute(a, axis, False))
+
+
+@builtin('mean', category=CAT_STATS, keep_types=True)
+def fn_mean(a, dim=None):
+    """mean - Average value.
+
+    mean(V) is the average of the elements of a vector V; mean(A) of a
+    matrix is a row with the average of each column.
+    mean(A, dim) works along dimension dim (1: columns, 2: rows), and
+    mean(A, 'all') averages all elements. NaN values give NaN.
+
+    See also median, std, max, min.
+    """
+    return _statistic('mean', a, dim, lambda x, axis, same: x if same else np.mean(x, axis=axis, keepdims=True))
+
+
+@builtin('median', category=CAT_STATS, keep_types=True)
+def fn_median(a, dim=None):
+    """median - Middle value.
+
+    median(V) is the middle value of a vector V when sorted (the average
+    of the two middle values for an even count); median(A) of a matrix is
+    a row with the median of each column.
+    median(A, dim) works along dimension dim, median(A, 'all') uses all
+    elements. NaN values give NaN.
+
+    See also mean, std, max, min.
+    """
+    return _statistic('median', a, dim,
+                      lambda x, axis, same: x if same else np.median(x, axis=axis, keepdims=True))
+
+
+@builtin('std', category=CAT_STATS, keep_types=True)
+def fn_std(a, w=None, dim=None):
+    """std - Standard deviation.
+
+    std(V) is the standard deviation of the elements of a vector V,
+    normalized by N-1 (N values); std(A) of a matrix is a row with one
+    value per column.
+    std(A, 1) normalizes by N instead; std(A, 0) is the same as std(A).
+    std(A, w, dim) works along dimension dim, std(A, w, 'all') uses all
+    elements. NaN values give NaN.
+
+    See also mean, median.
+    """
+    weight = 0 if w is None or w.shape == (0, 0) else _whole_number(w, 'std', 'The weight')
+    if weight not in (0, 1):
+        raise MatlabError("Error using std\nThe weight must be 0 (divide by N-1) or 1 (divide by N).")
+
+    def compute(x, axis, same):
+        if same:
+            return np.zeros(x.shape)
+        count = x.shape[axis]
+        return np.std(x, axis=axis, ddof=1 if weight == 0 and count > 1 else 0, keepdims=True)
+    return _statistic('std', a, dim, compute)
+
+
+# ---- random numbers ------------------------------------------------------------
+_RANDOM = np.random.default_rng()
+
+
+@builtin('rand', category=CAT_RANDOM)
+def fn_rand(m=None, n=None):
+    """rand - Uniformly distributed random numbers.
+
+    rand is a random number between 0 and 1. rand(N) is an N-by-N matrix
+    of them, rand(M, N) or rand([M N]) an M-by-N one.
+    For other ranges: a + (b - a) * rand(...).
+
+    See also randn, rng.
+    """
+    return to_matrix(_RANDOM.random(_size_args('rand', _given(m, n))))
+
+
+@builtin('randn', category=CAT_RANDOM)
+def fn_randn(m=None, n=None):
+    """randn - Normally distributed random numbers.
+
+    randn is a random number from the standard normal distribution (mean
+    0, standard deviation 1). randn(N) is an N-by-N matrix of them,
+    randn(M, N) or randn([M N]) an M-by-N one.
+    For mean mu and standard deviation s: mu + s * randn(...).
+
+    See also rand, rng.
+    """
+    return to_matrix(_RANDOM.standard_normal(_size_args('randn', _given(m, n))))
+
+
+@builtin('rng', category=CAT_RANDOM, outputs=0, keep_types=True)
+def fn_rng(seed):
+    """rng - Control the random number generator.
+
+    rng(seed) restarts rand and randn from the whole number seed, so they
+    give the same numbers again. rng('default') is the same as rng(0),
+    and rng('shuffle') starts from an unpredictable state.
+
+    See also rand, randn.
+    """
+    global _RANDOM
+    if is_text(seed):
+        choice = chars_to_text(seed).lower()
+        if choice not in ('default', 'shuffle'):
+            raise MatlabError("Error using rng\nUse rng(seed), rng('default') or rng('shuffle').")
+        _RANDOM = np.random.default_rng(0 if choice == 'default' else None)
+    else:
+        _RANDOM = np.random.default_rng(_whole_number(seed, 'rng', 'The seed'))
+
+
+# ---- sizes and shapes ----------------------------------------------------------
+@builtin('size', category=CAT_MATRIX, outputs=3, keep_types=True)
+def fn_size(a, dim=None, *, nargout=1):
+    """size - Size of an array.
+
+    size(A) is [rows columns]; [m, n] = size(A) gives them separately
+    (a third output is 1). size(A, 1) is the number of rows, size(A, 2)
+    the number of columns.
+
+    See also length, reshape, resize.
+    """
+    rows, cols = a.shape
+    if dim is not None:
+        d = _whole_number(dim, 'size', 'The dimension', 1)
+        return to_matrix(rows if d == 1 else cols if d == 2 else 1)
+    if nargout <= 1:
+        return to_matrix([rows, cols])
+    return tuple(to_matrix(v) for v in [rows, cols] + [1] * (nargout - 2))
+
+
+@builtin('length', category=CAT_MATRIX, keep_types=True)
+def fn_length(a):
+    """length - Length of the largest dimension.
+
+    length(A) is the number of elements of a vector A, and the larger of
+    the number of rows and columns of a matrix; 0 if A is empty.
+
+    See also size.
+    """
+    return to_matrix(0 if a.size == 0 else max(a.shape))
+
+
+@builtin('linspace', category=CAT_MATRIX)
+def fn_linspace(a, b, n=None):
+    """linspace - Evenly spaced numbers.
+
+    linspace(a, b) is a row of 100 evenly spaced numbers from a to b, and
+    linspace(a, b, n) has n of them: linspace(0, 1, 5) is
+    0  0.25  0.5  0.75  1.
+
+    See also the colon operator a:step:b, resize.
+    """
+    if a.size != 1 or b.size != 1:
+        raise MatlabError("Error using linspace\nThe start and end values must be scalars.")
+    count = 100 if n is None else n.flat[0]
+    if np.iscomplexobj(n) or not np.isfinite(count):
+        raise MatlabError("Error using linspace\nThe number of points must be a whole number.")
+    count = int(math.floor(np.real(count)))
+    if count > MAX_ELEMENTS:
+        raise MatlabError("Error using linspace\nRequested array exceeds the maximum allowed size.")
+    if count < 1:
+        return np.zeros((1, 0))
+    if count == 1:
+        return b
+    return to_matrix(np.linspace(a.flat[0], b.flat[0], count))
+
+
+def _size_vector(value, function):
+    """[m n] from a size argument; a scalar m means "m in the first dimension that is not 1"."""
+    sizes = np.real(value).ravel()
+    if is_text(value) or np.iscomplexobj(value) or not sizes.size or np.any(sizes < 0) or \
+            np.any(sizes != np.floor(sizes)) or not np.all(np.isfinite(sizes)):
+        raise MatlabError(f"Error using {function}\nThe size must be whole numbers, e.g. 4 or [2 3].")
+    return [int(v) for v in sizes]
+
+
+@builtin('resize', category=CAT_MATRIX, keep_types=True)
+def fn_resize(a, size, *options):
+    """resize - Make an array larger or smaller.
+
+    resize(A, [m n]) makes A m-by-n: elements are added at the end (0, or
+    false/space for logical/text values) or removed from the end.
+    resize(A, m) changes only the first dimension that is not 1 (the length
+    of a vector): resize([1 2 3], 5) is 1 2 3 0 0.
+    Options: resize(A, sz, 'FillValue', v) adds v instead of 0, and
+    resize(A, sz, 'Side', 'leading') or 'both' changes the start (or both
+    ends) instead of the end.
+
+    See also reshape, size, linspace.
+    """
+    fill, side = None, 'trailing'
+    if len(options) % 2:
+        raise MatlabError("Error using resize\nOptions come in pairs, e.g. 'FillValue', 5.")
+    for name, value in zip(options[::2], options[1::2]):
+        option = text_argument(name, 'resize', 'The option name').lower()
+        if option == 'fillvalue':
+            if value.size != 1:
+                raise MatlabError("Error using resize\nThe FillValue must be a single value.")
+            fill = value
+        elif option == 'side':
+            side = text_argument(value, 'resize', 'The side').lower()
+            if side not in ('trailing', 'leading', 'both'):
+                raise MatlabError("Error using resize\nThe side must be 'trailing', 'leading' or 'both'.")
+        else:
+            raise MatlabError(f"Error using resize\nUnknown option '{option}'. Use 'FillValue' or 'Side'.")
+    sizes = _size_vector(size, 'resize')
+    if len(sizes) == 1:
+        target = list(a.shape)
+        target[1 if a.shape[0] == 1 and a.shape[1] != 1 else 0] = sizes[0]
+    elif len(sizes) == 2:
+        target = sizes
+    else:
+        raise MatlabError("Error using resize\nOnly 2-D sizes are supported.")
+    if target[0] * target[1] > MAX_ELEMENTS:
+        raise MatlabError("Error using resize\nRequested array exceeds the maximum allowed size.")
+    result = a
+    for axis, new in enumerate(target):
+        old = result.shape[axis]
+        if new <= old:  # remove elements
+            start = 0 if side == 'trailing' else old - new if side == 'leading' else (old - new) // 2
+            result = result[start:start + new, :] if axis == 0 else result[:, start:start + new]
+        else:          # add elements
+            grow = new - old
+            lead = grow if side == 'leading' else grow // 2 if side == 'both' else 0
+            pad = [(0, 0), (0, 0)]
+            pad[axis] = (lead, grow - lead)
+            value = 0 if fill is None else (fill.flat[0] if fill.dtype == result.dtype else to_double(fill).flat[0])
+            if is_text(result) and fill is None:
+                value = 32  # space
+            result = np.pad(result, pad, constant_values=value)
+    return to_matrix(result)
+
+
+@builtin('reshape', category=CAT_MATRIX, keep_types=True)
+def fn_reshape(a, m, n=None):
+    """reshape - Arrange the elements of an array in a new shape.
+
+    reshape(A, m, n) or reshape(A, [m n]) is an m-by-n array with the
+    elements of A, taken down the columns: reshape(1:6, 2, 3) is
+    [1 3 5; 2 4 6]. The number of elements must stay the same; [] for one
+    size calculates it: reshape(1:6, [], 2).
+
+    See also resize, size.
+    """
+    if n is None:
+        sizes = [None if m.shape == (0, 0) else v for v in _size_vector(m, 'reshape')]
+    else:
+        sizes = [None if s.shape == (0, 0) else _whole_number(s, 'reshape', 'A size') for s in (m, n)]
+    if len(sizes) != 2:
+        raise MatlabError("Error using reshape\nOnly 2-D sizes are supported.")
+    if sizes.count(None) > 1:
+        raise MatlabError("Error using reshape\nOnly one size can be [].")
+    known = [s for s in sizes if s is not None]
+    if None in sizes:
+        if known[0] == 0 or a.size % known[0]:
+            raise MatlabError(f"Error using reshape\nThe {a.size} elements cannot be split into parts of {known[0]}.")
+        sizes = [a.size // known[0] if s is None else s for s in sizes]
+    if sizes[0] * sizes[1] != a.size:
+        raise MatlabError("Error using reshape\nNumber of elements must not change. Use [] as one of the size "
+                          "inputs to automatically calculate the appropriate size for that dimension.")
+    return to_matrix(a.ravel(order='F').reshape(sizes, order='F'))
+
+
+# ---- text and files ------------------------------------------------------------
+# File identifiers (fid), as in MATLAB: 1 is the command window (standard output),
+# 2 the command window too (standard error); fopen gives 3, 4, ... for files.
+_FORMAT_SPEC = r"%(?P<flags>[-+ 0#]*)(?P<width>\d+)?(?:\.(?P<precision>\d+))?(?P<conversion>[diouxXfeEgGcs])"
+_ESCAPES = {'n': '\n', 't': '\t', '\\': '\\', 'a': '\a', 'b': '\b', 'f': '\f', 'r': '\r', 'v': '\v'}
+
+
+def _unescape(fmt):
+    """Escape sequences in a format: \\n \\t \\\\ \\a \\b \\f \\r \\v, \\xN (hexadecimal), \\N (octal)."""
+    def replace(match):
+        code = match.group(1)
+        if code[0] == 'x':
+            return chr(min(int(code[1:], 16), 0x10FFFF))
+        if code[0] in '01234567':
+            return chr(int(code, 8))
+        return _ESCAPES.get(code, '\\' + code)
+    return re.sub(r"\\(x[0-9a-fA-F]+|[0-7]{1,3}|.)", replace, fmt, flags=re.S)
+
+
+def _format_one(spec, value):
+    """One conversion such as %6.2f. value is a number, or a str for %s / %c of text."""
+    flags, width, precision, conv = spec.group('flags'), spec.group('width') or '', spec.group('precision'), \
+        spec.group('conversion')
+    prec = '' if precision is None else '.' + precision
+    if conv in 'cs':
+        if isinstance(value, str):
+            return ("%" + flags.replace('0', '') + width + (prec if conv == 's' else '') + "s") % value
+        if float(value).is_integer() and 0 <= value <= 0x10FFFF:  # a number printed as text: its character
+            return ("%" + flags.replace('0', '') + width + "s") % chr(int(value))
+        conv = 'e'  # as in MATLAB: a number that is not a character code is shown with %e
+    if isinstance(value, str):
+        value = ord(value)
+    if math.isnan(value) or math.isinf(value):
+        text = 'NaN' if math.isnan(value) else 'Inf' if value > 0 else '-Inf'
+        return ("%" + flags.replace('0', '') + width + "s") % text
+    if conv in 'diouxX':
+        if not float(value).is_integer():
+            conv = 'e'  # as in MATLAB: %d of a fraction is shown with %e
+        else:
+            return ("%" + flags + width + prec + {'i': 'd', 'u': 'd'}.get(conv, conv)) % int(value)
+    return ("%" + flags + width + prec + conv) % value
+
+
+def format_text(fmt, args):
+    """MATLAB's sprintf: the format is used again and again until all values are printed.
+
+    The values of all arguments are taken one after the other (down the columns);
+    %s takes a whole text argument at once, other conversions take one element.
+    """
+    fmt, pieces, pos = _unescape(fmt), [], 0
+    for match in re.finditer("%%|" + _FORMAT_SPEC, fmt):
+        if match.start() > pos:
+            pieces.append(('text', fmt[pos:match.start()]))
+        pieces.append(('text', '%') if match.group() == '%%' else ('spec', match))
+        pos = match.end()
+    if pos < len(fmt):
+        pieces.append(('text', fmt[pos:]))
+    items = []
+    for a in args:
+        if is_text(a):
+            if a.size:
+                items.append(chars_to_text(a.ravel(order='F')))
+        else:
+            items.extend(float(v) for v in np.real(to_double(a)).ravel(order='F'))
+    if not items or not any(kind == 'spec' for kind, _ in pieces):
+        return ''.join(piece for kind, piece in pieces if kind == 'text')
+    out, i, offset = [], 0, 0  # next value: items[i], and inside a text item its character offset
+    while i < len(items):
+        for kind, piece in pieces:
+            if kind == 'text':
+                out.append(piece)
+                continue
+            if i >= len(items):  # values used up: stop at the first conversion without a value
+                return ''.join(out)
+            item, conv = items[i], piece.group('conversion')
+            if isinstance(item, str) and conv == 's':
+                value, i, offset = item[offset:], i + 1, 0
+            elif isinstance(item, str):
+                value, offset = item[offset], offset + 1
+                if offset >= len(item):
+                    i, offset = i + 1, 0
+            else:
+                value, i = item, i + 1
+            out.append(_format_one(piece, value))
+    return ''.join(out)
+
+
+def _file_id(value, function):
+    if is_text(value) or value.size != 1 or np.iscomplexobj(value) or not float(value.flat[0]).is_integer():
+        raise MatlabError(f"Error using {function}\nInvalid file identifier. Use fopen to generate a valid "
+                          "file identifier.")
+    return int(value.flat[0])
+
+
+@builtin('disp', category=CAT_TEXT, outputs=0, keep_types=True)
+def fn_disp(x, *, engine):
+    """disp - Show a value without its name.
+
+    disp(X) shows the value of X - a number, a matrix or text - without
+    the "X =" line:
+        disp('Hello')
+        disp(['The result is ' num2str(pi)])
+    An empty value shows nothing.
+
+    See also fprintf, num2str, sprintf.
+    """
+    if x.size == 0:
+        return None
+    if is_text(x):
+        engine.write(''.join(chars_to_text(row) + "\n" for row in x))
+    else:
+        engine.write(engine.format_value(to_double(x) if x.dtype == bool else x) + "\n")
+    return None
+
+
+@builtin('fprintf', category=CAT_TEXT, keep_types=True)
+def fn_fprintf(first, *rest, nargout=1, engine=None):
+    """fprintf - Write formatted text to the screen or to a file.
+
+    fprintf(format, A, ...) writes to the command window, and
+    fprintf(fid, format, A, ...) to a file opened with fid = fopen(...).
+    The conversions in the format are replaced by the values in turn:
+        %d whole number   %f fixed point   %e exponent   %g shortest
+        %s text           %c character     %% percent sign
+    with optional width and precision, e.g. %8.3f; \\n is a new line and
+    \\t a tab. The format is repeated until all values are written:
+        fprintf('%d squared is %d\\n', [1 2 3; 1 4 9])
+    File identifier 1 is the command window. n = fprintf(...) gives the
+    number of bytes written.
+
+    See also sprintf, disp, fopen, fclose, fscanf, num2str.
+    """
+    if is_text(first):
+        fid, fmt, values = 1, first, rest
+    elif rest:
+        fid, fmt, values = _file_id(first, 'fprintf'), rest[0], rest[1:]
+    else:
+        raise MatlabError("Error using fprintf\nThe format must be text, e.g. fprintf('%d\\n', x).")
+    text = format_text(text_argument(fmt, 'fprintf', 'The format'), values)
+    engine.write_to(fid, text, 'fprintf')
+    return to_matrix(len(text.encode('utf-8'))) if nargout else None
+
+
+@builtin('sprintf', category=CAT_TEXT, keep_types=True)
+def fn_sprintf(fmt, *values):
+    """sprintf - Format values as text.
+
+    sprintf(format, A, ...) works like fprintf but returns the text
+    instead of printing it:
+        s = sprintf('%.2f', pi)          % '3.14'
+        s = sprintf('%d, ', 1:3)         % '1, 2, 3, '
+
+    See also fprintf, num2str, disp.
+    """
+    return text_to_chars(format_text(text_argument(fmt, 'sprintf', 'The format'), values))
+
+
+def _number_text(value, digits):
+    """One number as num2str writes it."""
+    if np.iscomplexobj(value):
+        imag = _number_text(abs(value.imag), digits)
+        return _number_text(value.real, digits) + ('-' if value.imag < 0 else '+') + imag + 'i'
+    value = float(value)
+    if math.isnan(value) or math.isinf(value):
+        return 'NaN' if math.isnan(value) else 'Inf' if value > 0 else '-Inf'
+    if digits is None and value.is_integer():
+        return str(int(value))
+    return f"{value:.{digits or 5}g}"
+
+
+@builtin('num2str', category=CAT_TEXT, keep_types=True)
+def fn_num2str(x, precision=None):
+    """num2str - Convert numbers to text.
+
+    num2str(X) writes the numbers in X as text: num2str(pi) is '3.1416',
+    num2str(42) is '42', num2str([1 2 3]) is '1  2  3'.
+    num2str(X, N) uses N significant digits, and num2str(X, format) a
+    format as in sprintf, e.g. num2str(pi, '%10.5f').
+    Typical use: disp(['x = ' num2str(x)])
+
+    See also sprintf, disp, fprintf.
+    """
+    if is_text(x):
+        return x
+    x = to_double(x)
+    if x.size == 0:
+        return text_to_chars('')
+    if precision is not None and is_text(precision):
+        fmt = chars_to_text(precision)
+        rows = [format_text(fmt, [row.reshape(1, -1)]) for row in x]
+    else:
+        digits = None if precision is None else _whole_number(precision, 'num2str', 'The precision', 1)
+        finite = np.abs(x[np.isfinite(x)])
+        if digits is None and not np.all(np.isfinite(x) & (np.real(x) == np.round(np.real(x)))
+                                         & (np.imag(x) == np.round(np.imag(x)))):
+            biggest = finite.max() if finite.size and finite.max() > 0 else 1
+            digits = max(int(math.floor(math.log10(biggest))) + 5, 5)
+        cells = [[_number_text(v, digits) for v in row] for row in x]
+        widths = [max(len(cells[r][c]) for r in range(len(cells))) for c in range(x.shape[1])]
+        rows = ['  '.join(cell.rjust(widths[c]) for c, cell in enumerate(row)) for row in cells]
+    width = max(len(r) for r in rows)
+    return to_matrix(np.vstack([text_to_chars(r.ljust(width)) if width else np.zeros((1, 0), CHAR) for r in rows]))
+
+
+@builtin('fopen', category=CAT_TEXT, outputs=2, keep_types=True)
+def fn_fopen(filename, permission=None, *, nargout=1, engine):
+    """fopen - Open a file.
+
+    fid = fopen(filename, permission) opens a file and returns its file
+    identifier for fprintf, fscanf and fclose; fid is -1 if it cannot be
+    opened, and [fid, message] = fopen(...) also says why. Permissions:
+        'r'  read (the default)      'r+'  read and write
+        'w'  write a new file        'w+'  write and read
+        'a'  add to the end          'a+'  add and read
+    A file name without a folder is in the current folder (see pwd, cd).
+    fopen('all') lists the identifiers of the open files.
+
+    See also fclose, fprintf, fscanf.
+    """
+    name = text_argument(filename, 'fopen', 'The file name')
+    if name == 'all' and permission is None:
+        return to_matrix(np.array(sorted(engine.files), dtype=float).reshape(1, -1))
+    mode = 'r' if permission is None else text_argument(permission, 'fopen', 'The permission')
+    modes = {'r': 'rb', 'w': 'wb', 'a': 'ab', 'r+': 'r+b', 'w+': 'w+b', 'a+': 'a+b'}
+    key = mode.replace('t', '').replace('b', '')
+    if key not in modes:
+        raise MatlabError(f"Error using fopen\nInvalid permission '{mode}'. Use 'r', 'w', 'a', 'r+', 'w+' or 'a+'.")
+    try:
+        handle = open(os.path.expanduser(name), modes[key])
+    except OSError as err:
+        fid, message = -1, err.strerror or str(err)
+    else:
+        fid, message = 3, ''
+        while fid in engine.files:
+            fid += 1
+        engine.files[fid] = {'file': handle, 'name': name, 'mode': key}
+    return (to_matrix(fid), text_to_chars(message)) if nargout >= 2 else to_matrix(fid)
+
+
+@builtin('fclose', category=CAT_TEXT, keep_types=True)
+def fn_fclose(fid, *, engine):
+    """fclose - Close a file.
+
+    fclose(fid) closes the file opened with fid = fopen(...), so that all
+    text written to it is saved; it gives 0. fclose('all') closes every
+    open file.
+
+    See also fopen, fprintf, fscanf.
+    """
+    if is_text(fid):
+        if chars_to_text(fid) != 'all':
+            raise MatlabError("Error using fclose\nUse fclose(fid) or fclose('all').")
+        for entry in engine.files.values():
+            entry['file'].close()
+        engine.files.clear()
+        return to_matrix(0)
+    number = _file_id(fid, 'fclose')
+    if number not in (0, 1, 2):
+        engine.file(number, 'fclose')['file'].close()
+        del engine.files[number]
+    return to_matrix(0)
+
+
+_SCAN_NUMBER = r"[+-]?(?:(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?|[iI][nN][fF](?:inity)?|[nN][aA][nN])"
+_SCAN_PATTERNS = {'d': r"[+-]?\d+", 'i': r"[+-]?\d+", 'u': r"[+-]?\d+", 'x': r"[+-]?(?:0[xX])?[0-9a-fA-F]+",
+                  'o': r"[+-]?[0-7]+", 's': r"\S+"}
+
+
+def _scan(text, fmt, limit):
+    """Read values from text with a scanf format, cycling through it as MATLAB's fscanf does.
+
+    Returns (values, characters read, text_only) - values are numbers, or character
+    codes for %s and %c; text_only is True if the format reads only text.
+    """
+    parts = re.findall(r"(\s+)|%(\*?)(\d*)(?:\.\d+)?([diouxfeEgGsc])|(%%|[^%\s]+)", fmt)
+    conversions = [p for p in parts if p[3]]
+    if not conversions:
+        return [], 0, False
+    text_only = all(p[3] in 'sc' for p in conversions)
+    values, pos = [], 0
+    while len(values) < limit:
+        start = pos
+        for space, skip, width, conv, literal in parts:
+            if space:
+                pos = len(text) - len(text[pos:].lstrip())
+                continue
+            if literal:
+                literal = literal.replace('%%', '%')
+                if not text.startswith(literal, pos):
+                    return values, pos, text_only
+                pos += len(literal)
+                continue
+            if conv != 'c':
+                pos = len(text) - len(text[pos:].lstrip())
+            segment = text[pos:pos + int(width)] if width else text[pos:]
+            if conv == 'c':
+                match_text = segment[:int(width) if width else 1]
+                if not match_text:
+                    return values, pos, text_only
+            else:
+                match = re.match(_SCAN_PATTERNS.get(conv, _SCAN_NUMBER), segment)
+                if not match:
+                    return values, pos, text_only
+                match_text = match.group()
+            pos += len(match_text)
+            if skip:
+                continue
+            if conv in 'sc':
+                values.extend(ord(ch) for ch in match_text)
+            elif conv == 'x':
+                values.append(float(int(match_text, 16)))
+            elif conv == 'o':
+                values.append(float(int(match_text, 8)))
+            else:
+                values.append(float(match_text))
+            if len(values) >= limit:
+                return values[:limit], pos, text_only
+        if pos == start or pos >= len(text):
+            break
+    return values, pos, text_only
+
+
+@builtin('fscanf', category=CAT_TEXT, outputs=2, keep_types=True)
+def fn_fscanf(fid, fmt, size=None, *, nargout=1, engine):
+    """fscanf - Read formatted data from a file.
+
+    A = fscanf(fid, format) reads the rest of a file opened with fopen,
+    using the format again and again; the numbers read form a column:
+        fid = fopen('data.txt');  A = fscanf(fid, '%f');  fclose(fid);
+    %d reads whole numbers, %f, %e and %g any numbers, %s words and %c
+    characters; a format of only %s and %c gives text.
+    fscanf(fid, format, n) reads at most n values, and fscanf(fid, format,
+    [m n]) fills an m-by-n matrix column by column (n can be Inf):
+        A = fscanf(fid, '%f %f', [2 Inf])'    % two numbers per line
+    [A, count] = fscanf(...) also gives the number of values read.
+
+    See also fopen, fclose, fprintf.
+    """
+    number = _file_id(fid, 'fscanf')
+    if number in (0, 1, 2):
+        raise MatlabError("Error using fscanf\nReading from the command window is not supported; open a file "
+                          "with fopen.")
+    entry = engine.file(number, 'fscanf')
+    shape = None
+    if size is None:
+        limit = math.inf
+    else:
+        sizes = np.real(to_double(size)).ravel()
+        if size.size not in (1, 2) or np.any(np.isnan(sizes)) or np.any(sizes < 0):
+            raise MatlabError("Error using fscanf\nThe size must be n, Inf or [m n].")
+        limit = float(math.prod(sizes))
+        limit = int(limit) if math.isfinite(limit) else math.inf
+        shape = [int(s) if math.isfinite(s) else None for s in sizes] if size.size == 2 else None
+    handle = entry['file']
+    try:
+        start = handle.tell()
+        data = handle.read().decode('utf-8', errors='replace')
+    except (OSError, ValueError):
+        raise MatlabError(f"Error using fscanf\nThe file {entry['name']} is not open for reading "
+                          f"(it was opened with '{entry['mode']}').") from None
+    values, used, text_only = _scan(data, _unescape(text_argument(fmt, 'fscanf', 'The format')), limit)
+    handle.seek(start + len(data[:used].encode('utf-8')))
+    count = len(values)
+    if text_only:
+        result = text_to_chars(''.join(chr(v) for v in values))
+    elif shape is not None:
+        rows = shape[0]
+        cols = shape[1] if shape[1] is not None else (math.ceil(count / rows) if rows else 0)
+        padded = np.zeros(rows * cols)
+        padded[:min(count, rows * cols)] = values[:rows * cols]
+        result = to_matrix(padded.reshape((rows, cols), order='F'))
+    else:
+        result = to_matrix(np.array(values, dtype=float).reshape(-1, 1)) if values else np.zeros((0, 1))
+    return (result, to_matrix(count)) if nargout >= 2 else result
+
+
 # ---- help texts --------------------------------------------------------------
 OPERATORS_HELP = r"""ops - Operators and special characters.
 
@@ -819,6 +1749,14 @@ Indexing (elements are numbered from 1):
     A(A > 2)      The elements for which a condition is true
 Subscripts are positive whole numbers or conditions (logical values).
 
+Text:
+    'text'  "text"   Text (a char array), e.g. disp('Hello'); a quote
+                     inside is doubled: 'it''s'
+
+Several outputs:
+    [r, c] = find(A)   Some functions give several results: find, size,
+    [~, i] = max(v)    max, min, fopen, fscanf; ~ skips one.
+
 Changing elements:
     A(2,3) = 5    Set an element;  A(:, 1) = 0 sets a whole column
     A(A > 2) = 0  Set the elements for which a condition is true
@@ -839,6 +1777,7 @@ OPERATOR_SUMMARY = (
     (",  ;  :  %  ...", "separators, ranges, comments"),
     ("A(i, j)  A(k)  A(:, j)  end", "indexing"),
     ("A(A > 2)  A(2,3) = 5  A(2,:) = []", "conditions, changing, deleting"),
+    ("'text'  \"text\"  [a, b] = f(x)", "text, several outputs"),
 )
 
 # 'help' followed by any of these shows OPERATORS_HELP
@@ -848,9 +1787,11 @@ OPERATOR_TOPICS = {
     'plus', 'minus', 'uplus', 'uminus', 'mtimes', 'mrdivide', 'mldivide', 'mpower', 'rdivide', 'ldivide',
     'transpose', 'ctranspose', 'eq', 'ne', 'lt', 'le', 'gt', 'ge', 'and', 'or', 'not', 'colon',
     'horzcat', 'vertcat', 'end', 'paren', 'indexing', 'index', 'subsref', 'subsasgn', 'assignment',
+    'text', 'char', 'string', 'strings', '"', 'outputs', 'nargout',
 }
 
-_HELP_FIELDS = re.compile(r"\{(APP_NAME|APP_VERSION|SHORT_DECIMALS|LONG_DECIMALS|CONFIG_FILE)\}")
+_HELP_FIELDS = re.compile(r"\{(APP_NAME|APP_VERSION|SHORT_DECIMALS|LONG_DECIMALS|CONFIG_FILE|"
+                          r"UPDATE_REPOSITORY|UPDATE_CHECK_DAYS)\}")
 
 
 def help_text(func):
@@ -883,9 +1824,14 @@ def split_statements(text):
     Statements end at ',', ';' or a newline outside brackets/parentheses.
     '%' starts a comment and '...' continues the statement on the next line.
     """
-    statements, buf, depth, i = [], [], 0, 0
+    statements, buf, stack, i = [], [], [], 0
     while i < len(text):
         ch = text[i]
+        if ch == '"' or (ch == "'" and _quote_starts_text(text, i, bool(stack) and stack[-1] == '[')):
+            end = _text_end(text, i) or len(text)  # % ; , inside text are just characters
+            buf.append(text[i:end])
+            i = end
+            continue
         if ch == '%':
             end = text.find('\n', i)
             i = len(text) if end < 0 else end
@@ -896,10 +1842,10 @@ def split_statements(text):
             buf.append(' ')
             continue
         if ch in '([':
-            depth += 1
-        elif ch in ')]':
-            depth = max(depth - 1, 0)
-        if depth == 0 and ch in ',;\n':
+            stack.append(ch)
+        elif ch in ')]' and stack:
+            stack.pop()
+        if not stack and ch in ',;\n':
             statements.append((''.join(buf).strip(), ch == ';'))
             buf = []
         else:
@@ -907,6 +1853,33 @@ def split_statements(text):
         i += 1
     statements.append((''.join(buf).strip(), False))
     return [(s, suppressed) for s, suppressed in statements if s]
+
+
+def _quote_starts_text(text, i, in_brackets):
+    """Does the ' at text[i] start text (rather than being the transpose operator)?
+
+    As in MATLAB, a quote right after a value - a name, a number, a closing bracket or the
+    end of other text - is a transpose; inside [...] a space before it makes it text again.
+    """
+    j = i - 1
+    while j >= 0 and text[j] in ' \t':
+        j -= 1
+    after_value = j >= 0 and (text[j].isalnum() or text[j] in "_)]}.'\"")
+    return not after_value or (in_brackets and j < i - 1)
+
+
+def _text_end(text, i):
+    """Index just after the text literal starting with the quote at text[i] (None if unterminated).
+    Inside, a doubled quote stands for one quote, as in 'it''s'."""
+    quote, j = text[i], i + 1
+    while True:
+        k = text.find(quote, j)
+        if k < 0:
+            return None
+        if text.startswith(quote * 2, k):
+            j = k + 2
+            continue
+        return k + 1
 
 
 def _starts_new_element(text, j):
@@ -921,7 +1894,7 @@ def _starts_new_element(text, j):
         return nxt not in ('', ' ', '\t', '\r', '\n')
     if c == '~':
         return nxt != '='
-    return False
+    return c in '\'"'  # text
 
 
 def tokenize(text):
@@ -932,7 +1905,7 @@ def tokenize(text):
         if not tokens:
             return False
         kind, tok = tokens[-1][0], tokens[-1][1]
-        return kind in ('num', 'id', ')', ']') or (kind == 'op' and tok in ("'", ".'"))
+        return kind in ('num', 'id', 'str', ')', ']') or (kind == 'op' and tok in ("'", ".'"))
 
     while i < n:
         ch = text[i]
@@ -978,13 +1951,19 @@ def tokenize(text):
             tokens.append((ch, ch, None))
             i += 1
             continue
-        if ch == "'":
-            # Transpose when it directly follows an operand; otherwise it would open a character string
-            if prev_ends_operand() and not (in_brackets and text[i - 1] in ' \t'):
+        if ch in '\'"':
+            # Transpose when ' directly follows an operand; otherwise text in quotes
+            if ch == "'" and prev_ends_operand() and not (in_brackets and text[i - 1] in ' \t'):
                 tokens.append(('op', "'", None))
                 i += 1
                 continue
-            raise MatlabError("Error: Character strings are not supported by this calculator.")
+            end = _text_end(text, i)
+            if end is None:
+                raise MatlabError("Error: Text is not terminated properly: the closing "
+                                  + ("quote ' is missing." if ch == "'" else 'quote " is missing.'))
+            tokens.append(('str', text[i + 1:end - 1].replace(ch * 2, ch), None))
+            i = end
+            continue
         for op in _OPERATORS:
             if text.startswith(op, i):
                 tokens.append(('op', op, None))
@@ -1049,6 +2028,8 @@ class Parser:
         ('index', name, subscripts) for 'name(subscripts) = expression', e.g. A(2,3) = 5.
         """
         target = None
+        if self.at('[') and self._closing_followed_by_assignment(self.pos):
+            return self._several_outputs()
         if self.at('id') and self._assignment_follows():
             name = self.advance()[1]
             if name == 'end':
@@ -1077,10 +2058,35 @@ class Parser:
         nxt = self.peek(1)
         if nxt[0] == 'op' and nxt[1] == '=':
             return True
-        if nxt[0] != '(':
-            return False
+        return nxt[0] == '(' and self._closing_followed_by_assignment(self.pos + 1)
+
+    def _several_outputs(self):
+        """[a, b, ~] = f(...): returns (('outputs', names), call), with None for each ~."""
+        self.advance()  # '['
+        names = []
+        while not self.at(']'):
+            if self.at(','):
+                self.advance()
+            elif self.at_op('~'):
+                self.advance()
+                names.append(None)
+            elif self.at('id') and self.peek()[1] != 'end':
+                names.append(self.advance()[1])
+            else:
+                raise MatlabError("Error: On the left of [a, b] = f(...) only variable names and ~ can be used.")
+        self.advance()  # ']'
+        self.advance()  # '='
+        node = self.parse_expr()
+        if not self.at('eof'):
+            self.fail()
+        if not names:
+            raise MatlabError("Error: [] = ... has no variables to assign.")
+        return ('outputs', names), node
+
+    def _closing_followed_by_assignment(self, start):
+        """Is the bracket opened at tokens[start] closed by a token followed by '='?"""
         depth = 0
-        for j in range(self.pos + 1, len(self.tokens)):
+        for j in range(start, len(self.tokens)):
             kind = self.tokens[j][0]
             if kind in ('(', '['):
                 depth += 1
@@ -1145,6 +2151,9 @@ class Parser:
         if tok[0] == 'num':
             self.advance()
             return ('num', tok[2])
+        if tok[0] == 'str':
+            self.advance()
+            return ('str', tok[1])
         if tok[0] == 'id':
             self.advance()
             if tok[1] == 'end':  # last index, as in A(end); checked when evaluated
@@ -1363,6 +2372,14 @@ def _delete_elements(target, arg_nodes, variables):
                       "(Delete whole rows, as in A(2, :) = [], or whole columns, as in A(:, 2) = [].)")
 
 
+def _same_kind(parts):
+    """Text joined with numbers gives text, as in MATLAB: ['abc', 65] is 'abcA'."""
+    if any(is_text(p) for p in parts) and not all(is_text(p) for p in parts):
+        return [p if is_text(p) else np.clip(np.round(np.real(to_double(p))), 0, 0xFFFF).astype(CHAR)
+                for p in parts]
+    return parts
+
+
 def evaluate(node, variables, end_value=None):
     """Evaluate a parse tree. Variables shadow built-in functions and constants, as in MATLAB.
 
@@ -1371,6 +2388,8 @@ def evaluate(node, variables, end_value=None):
     kind = node[0]
     if kind == 'num':
         return to_matrix(node[1])
+    if kind == 'str':
+        return text_to_chars(node[1])
     if kind == 'end':
         if end_value is None:
             raise MatlabError("Error: 'end' can only be used inside the subscript of a variable, as in A(end).")
@@ -1384,12 +2403,7 @@ def evaluate(node, variables, end_value=None):
                 return variables[name]
             return index_matrix(variables[name], args, variables)
         if name in FUNCTIONS:
-            func, lo, hi = FUNCTIONS[name]
-            args = args or []
-            if not lo <= len(args) <= hi:
-                problem = 'Not enough' if len(args) < lo else 'Too many'
-                raise MatlabError(f"Error using {name}\n{problem} input arguments.")
-            return func(*[to_double(evaluate(a, variables, end_value)) for a in args])
+            return call_function(name, args, variables, end_value)
         raise MatlabError(f"Unrecognized function or variable '{name}'.")
     if kind == 'un':
         return UNARY_OPS[node[1]](evaluate(node[2], variables, end_value))
@@ -1412,14 +2426,14 @@ def evaluate(node, variables, end_value=None):
             parts = [m for m in (evaluate(e, variables, end_value) for e in row) if m.size]
             if parts:
                 try:
-                    rows.append(np.hstack(parts))
+                    rows.append(np.hstack(_same_kind(parts)))
                 except ValueError:
                     raise MatlabError("Error using horzcat\nDimensions of arrays being concatenated "
                                       "are not consistent.") from None
         if not rows:
             return np.zeros((0, 0))
         try:
-            return to_matrix(np.vstack(rows))
+            return to_matrix(np.vstack(_same_kind(rows)))
         except ValueError:
             raise MatlabError("Error using vertcat\nDimensions of arrays being concatenated "
                               "are not consistent.") from None
@@ -1477,6 +2491,8 @@ class MatlabEngine:
         self.format_mode = 'short'  # 'short' or 'long'
         self.variables = {}
         self.last_error = None      # message of the error that stopped the last command line, if any
+        self.files = {}             # open files: file identifier -> {'file', 'name', 'mode'}
+        self._output = []
 
     # ---- execution ---------------------------------------------------------
     def execute(self, line):
@@ -1484,7 +2500,9 @@ class MatlabEngine:
 
         Like MATLAB, the remaining statements on the line are skipped after an error or 'exit'.
         """
+        global _CURRENT_ENGINE
         output, error = [], None
+        previous, _CURRENT_ENGINE, self._output = _CURRENT_ENGINE, self, output
         try:
             for text, suppressed in split_statements(line):
                 output.extend(self._run_statement(text, suppressed))
@@ -1500,6 +2518,8 @@ class MatlabEngine:
             error = "Error: The expression is nested too deeply."
         except Exception as err:  # unexpected NumPy/Python failure: report it, keep the app alive
             error = f"Error: {err}"
+        finally:
+            _CURRENT_ENGINE = previous
         self.last_error = error
         if error is not None:
             output.append(error + "\n")
@@ -1511,7 +2531,14 @@ class MatlabEngine:
             return result
         target, node = Parser(tokenize(text)).parse_statement()
         with np.errstate(all='ignore'):  # 1/0 -> Inf and 0/0 -> NaN, as in MATLAB
-            value = evaluate(node, self.variables)
+            if isinstance(target, tuple) and target[0] == 'outputs':
+                return self._assign_outputs(target[1], node, suppressed)
+            if target is None and self._is_function_call(node):
+                value = call_function(node[1], node[2], self.variables, nargout=0)
+                if value is None:  # e.g. disp(x) or fprintf(...): nothing to show or keep in ans
+                    return []
+            else:
+                value = evaluate(node, self.variables)
             if isinstance(target, tuple):  # A(subscripts) = value changes elements of A
                 _, target, subscripts = target
                 value = assign_index(self.variables.get(target), subscripts, value, self.variables)
@@ -1522,6 +2549,50 @@ class MatlabEngine:
                 target = target or 'ans'
                 self.variables[target] = value
         return [] if suppressed else [f"{target} =\n{self.format_value(value)}\n"]
+
+    def _is_function_call(self, node):
+        return node[0] == 'name' and node[1] not in self.variables and node[1] in FUNCTIONS
+
+    def _assign_outputs(self, names, node, suppressed):
+        """[a, b] = f(...): store and show each result (except those marked ~)."""
+        if not self._is_function_call(node):
+            raise MatlabError("Error: Too many output arguments. Only a function call, such as "
+                              "[r, c] = find(A), can give several results.")
+        values = call_function(node[1], node[2], self.variables, nargout=len(names))
+        values = values if isinstance(values, tuple) else (values,)
+        if len(values) < len(names):
+            raise MatlabError(f"Error using {node[1]}\nToo many output arguments.")
+        shown = []
+        for name, value in zip(names, values):
+            if name is not None:
+                self.variables[name] = value
+                if not suppressed:
+                    shown.append(f"{name} =\n{self.format_value(value)}\n")
+        return shown
+
+    def write(self, text):
+        """Print text exactly as given (disp, fprintf to the screen)."""
+        self._output.append(RawText(text))
+
+    def file(self, fid, function):
+        """The open file with identifier fid; an error if there is none."""
+        if fid not in self.files:
+            raise MatlabError(f"Error using {function}\nInvalid file identifier. Use fopen to generate a "
+                              "valid file identifier.")
+        return self.files[fid]
+
+    def write_to(self, fid, text, function):
+        """Write text to file identifier fid: 1 and 2 are the command window, 3, 4, ... open files."""
+        if fid in (1, 2):
+            self.write(text)
+            return
+        entry = self.file(fid, function)
+        try:
+            entry['file'].write(text.encode('utf-8'))
+            entry['file'].flush()
+        except (OSError, ValueError):
+            raise MatlabError(f"Error using {function}\nThe file {entry['name']} is not open for writing "
+                              f"(it was opened with '{entry['mode']}').") from None
 
     # ---- console commands ----------------------------------------------------
     # Command syntax, e.g. 'format long'. As for the built-in functions, each
@@ -1659,6 +2730,70 @@ class MatlabEngine:
             raise MatlabError(message)
         return [_indent(message)]
 
+    @console_command('pwd')
+    def cmd_pwd(self, args, suppressed):
+        """pwd - Show the current folder.
+
+        pwd shows the current folder: files opened with fopen without a
+        folder in their name are read from and written to this folder.
+        At the start it is the folder the program was started from (your
+        home folder when started from Launchpad or the application menu).
+
+        See also cd, fopen.
+        """
+        return [_indent(os.getcwd())]
+
+    @console_command('cd', max_args=None)
+    def cmd_cd(self, args, suppressed):
+        """cd - Change the current folder.
+
+        cd folder     makes folder the current folder, e.g. cd Documents,
+                      cd .. (one level up) or cd ~ (your home folder).
+                      Put a name with spaces in quotes: cd 'My Data'.
+        cd            shows the current folder, like pwd.
+
+        See also pwd, fopen.
+        """
+        if not args:
+            return [_indent(os.getcwd())]
+        folder = ' '.join(args).strip()
+        if len(folder) > 1 and folder[0] == folder[-1] and folder[0] in '\'"':
+            folder = folder[1:-1]
+        try:
+            os.chdir(os.path.expanduser(folder))
+        except OSError:
+            raise MatlabError(f"Error using cd\nUnable to change current folder to '{folder}' "
+                              "(Name is nonexistent or not a folder).") from None
+        return []
+
+    @console_command('update', max_args=1, arg_pattern=r"on|off")
+    def cmd_update(self, args, suppressed):
+        """update - Look for a new version and install it.
+
+        update      looks on GitHub ({UPDATE_REPOSITORY}) for a newer
+                    version; if there is one, it is downloaded and the
+                    installed copy of {APP_NAME} is updated. Restart to use it.
+        update off  turns off the automatic look every {UPDATE_CHECK_DAYS} days.
+        update on   turns it on again.
+
+        Only an installed {APP_NAME} is updated; see install.
+
+        See also install, version.
+        """
+        if args:
+            config = load_config()
+            config['check_updates'] = args[0] == 'on'
+            save_config(config)
+            if args[0] == 'off':
+                return [_indent("Automatic update checks are off. Type update to look for a new version.")]
+            return [_indent(f"Automatic update checks are on: every {UPDATE_CHECK_DAYS} days."
+                            if UPDATE_CHECK_DAYS > 0 else
+                            "Automatic update checks are disabled by UPDATE_CHECK_DAYS = 0 in the program.")]
+        ok, message = update_installed_app()
+        if not ok:
+            raise MatlabError(message)
+        return [_indent(message)]
+
     @console_command('version')
     def cmd_version(self, args, suppressed):
         """version - Show the version number.
@@ -1681,7 +2816,8 @@ class MatlabEngine:
         lines = [f"  {'Name':<10} {'Size':<10} {'Class':<10}", "  " + "-" * 32]
         for name in sorted(self.variables, key=str.lower):
             v = self.variables[name]
-            cls = "logical" if v.dtype == bool else "double (complex)" if np.iscomplexobj(v) else "double"
+            cls = ("logical" if v.dtype == bool else "char" if v.dtype == CHAR
+                   else "double (complex)" if np.iscomplexobj(v) else "double")
             lines.append(f"  {name:<10} {f'{v.shape[0]}x{v.shape[1]}':<10} {cls:<10}")
         return ["\n".join(lines) + "\n"]
 
@@ -1733,12 +2869,17 @@ class MatlabEngine:
     def format_value(self, value):
         a = to_matrix(value)
         rows, cols = a.shape
-        kind = 'logical' if a.dtype == bool else 'double'
+        kind = 'logical' if a.dtype == bool else 'char' if a.dtype == CHAR else 'double'
         if a.size == 0:
-            return "    []" if (rows, cols) == (0, 0) and kind == 'double' else f"    {rows}x{cols} empty {kind} matrix"
+            if (rows, cols) == (0, 0) and kind != 'logical':
+                return "    ''" if kind == 'char' else "    []"
+            return f"    {rows}x{cols} empty {kind} " + ("array" if kind == 'char' else "matrix")
         if a.size > MAX_DISPLAY_ELEMENTS:
             return (f"    {rows}x{cols} {kind} matrix (too large to display; "
                     "end the statement with ';' to suppress output)")
+        if kind == 'char':  # text in quotes, as in MATLAB
+            lines = [f"    '{chars_to_text(a[r])}'" for r in range(rows)]
+            return lines[0] if rows == 1 else f"  {rows}x{cols} char array\n" + "\n".join(lines)
         if kind == 'logical':  # labelled as in MATLAB, e.g. "1x4 logical array"
             label = "logical" if a.size == 1 else f"{rows}x{cols} logical array"
             return f"  {label}\n" + self._format_numbers(a.astype(float))
@@ -1975,23 +3116,47 @@ def _admin_hint(option):
     return (f"    sudo {shlex.quote(sys.executable or 'python3')} {shlex.quote(THIS_SCRIPT)} {option}")
 
 
-def install_app(systemwide, platform=None):
-    """Install this version (or update an installation). Returns (success, message)."""
+_VERSION_RE = re.compile(r"""^APP_VERSION\s*=\s*['"]([^'"]+)['"]""", re.M)
+
+
+def file_version(path):
+    """APP_VERSION written in a copy of this program, or None."""
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            match = _VERSION_RE.search(f.read())
+        return match.group(1) if match else None
+    except OSError:
+        return None
+
+
+def _icon_for(source):
+    """The icon file to install with `source`: the one next to it, else the one next to this script."""
+    for folder in (os.path.dirname(source), os.path.dirname(THIS_SCRIPT)):
+        if os.path.isfile(os.path.join(folder, APP_ICON_FILE)):
+            return os.path.join(folder, APP_ICON_FILE)
+    return None
+
+
+def install_app(systemwide, platform=None, source=None, admin_option='--install-systemwide'):
+    """Install this program, or the script `source` (a downloaded update). Returns (success, message)."""
     platform = platform or sys.platform
+    source = source or THIS_SCRIPT
+    version = file_version(source) or APP_VERSION
     target = install_target(systemwide, platform)
     if target is None:
         return False, f"Installing is only supported on macOS and Linux, not on {_platform_name(platform)}."
     if not all(_can_write(p) for p in target['parents']):
         if systemwide:
             return False, ("Installing for all users needs administrator rights. In a terminal, run\n"
-                           f"{_admin_hint('--install-systemwide')}\n"
+                           f"{_admin_hint(admin_option)}\n"
                            "or type install to install it only for you.")
         return False, f"Cannot write to {' or '.join(target['parents'])}; nothing was installed."
+    previous = file_version(target['script'])
     try:
         if platform == 'darwin':
-            _install_mac(target)
+            _install_mac(target, source, version)
         else:
-            _install_linux(target)
+            _install_linux(target, source)
     except (OSError, subprocess.SubprocessError) as err:
         return False, f"The installation failed: {err}"
     # A systemwide installation replaces a personal one, so the program is not listed twice
@@ -2003,13 +3168,16 @@ def install_app(systemwide, platform=None):
             pass
     config = load_config()
     config.update(first_start_done=True, update_declined=None, installed={
-        'version': APP_VERSION, 'systemwide': systemwide, 'launcher': target['launcher'],
+        'version': version, 'systemwide': systemwide, 'launcher': target['launcher'],
         'python': sys.executable})
+    config.setdefault('last_update_check', time.time())  # the first automatic check comes a week later
     save_config(config)
     scope = "for all users" if systemwide else "for you"
+    if previous and previous != version:
+        return True, f"{APP_NAME} is updated from {previous} to {version} ({scope}):\n    {target['launcher']}"
     where = ("from Launchpad or the Applications folder" if platform == 'darwin'
              else "from the application menu (search for " + APP_NAME + ")")
-    return True, (f"{APP_NAME} {APP_VERSION} is installed {scope}:\n    {target['launcher']}\n"
+    return True, (f"{APP_NAME} {version} is installed {scope}:\n    {target['launcher']}\n"
                   f"From now on it can be started {where}.")
 
 
@@ -2092,15 +3260,15 @@ def _save_rounded_icon(src, dst):
         _copy(src, dst)
 
 
-def _install_linux(target):
+def _install_linux(target, source):
     files = target['files']
     os.makedirs(files, exist_ok=True)
-    _copy(THIS_SCRIPT, target['script'])
+    _copy(source, target['script'])
     lines = ["[Desktop Entry]", "Type=Application", f"Name={APP_NAME}", "GenericName=Calculator",
              "Comment=MATLAB-style matrix calculator",
              "Exec=" + _desktop_exec([sys.executable or 'python3', target['script']])]
-    icon = os.path.join(os.path.dirname(THIS_SCRIPT), APP_ICON_FILE)
-    if os.path.isfile(icon):
+    icon = _icon_for(source)
+    if icon:
         _copy(icon, os.path.join(files, APP_ICON_FILE))
         menu_icon = os.path.join(files, APP_SLUG + '_menu_icon.png')
         _save_rounded_icon(os.path.join(files, APP_ICON_FILE), menu_icon)
@@ -2131,15 +3299,15 @@ def _refresh_menus(menu_dir):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
 
-def _install_mac(target):
+def _install_mac(target, source, version):
     app, resources = target['launcher'], target['files']
     macos = os.path.join(app, 'Contents', 'MacOS')
     os.makedirs(resources, exist_ok=True)
     os.makedirs(macos, exist_ok=True)
-    _copy(THIS_SCRIPT, target['script'])
-    icon = os.path.join(os.path.dirname(THIS_SCRIPT), APP_ICON_FILE)
+    _copy(source, target['script'])
+    icon = _icon_for(source)
     has_icon = False
-    if os.path.isfile(icon):
+    if icon:
         _copy(icon, os.path.join(resources, APP_ICON_FILE))
         has_icon = _save_icns(os.path.join(resources, APP_ICON_FILE), os.path.join(resources, 'AppIcon.icns'))
     executable = os.path.join(macos, APP_NAME)
@@ -2152,7 +3320,7 @@ def _install_mac(target):
         'CFBundleName': APP_NAME, 'CFBundleDisplayName': APP_NAME, 'CFBundleExecutable': APP_NAME,
         'CFBundleIdentifier': 'local.' + re.sub(r'[^A-Za-z0-9.-]', '-', APP_NAME.lower()),
         'CFBundlePackageType': 'APPL', 'CFBundleInfoDictionaryVersion': '6.0',
-        'CFBundleShortVersionString': APP_VERSION, 'CFBundleVersion': APP_VERSION,
+        'CFBundleShortVersionString': version, 'CFBundleVersion': version,
         'LSMinimumSystemVersion': '10.13', 'NSHighResolutionCapable': True,
     }
     if has_icon:
@@ -2212,6 +3380,133 @@ def startup_question(config, platform=None):
     return None
 
 
+# ---- updates from GitHub -------------------------------------------------------
+# New versions are published in the GitHub project UPDATE_REPOSITORY: the program
+# file matlab_calc.py (and icon.png) in its top folder. If the project has GitHub
+# releases, the newest release is used, otherwise the newest version of the main
+# branch. Its APP_VERSION decides whether it is newer than the installed copy.
+GITHUB_API = 'https://api.github.com'
+GITHUB_RAW = 'https://raw.githubusercontent.com'
+UPDATE_TIMEOUT = 15          # seconds allowed for each download
+MAX_DOWNLOAD = 5_000_000     # bytes; the program file is about 100 kB
+
+
+class UpdateError(Exception):
+    """No new version could be found or downloaded; the message says why."""
+
+
+def _download(url):
+    request = urllib.request.Request(url, headers={'User-Agent': f"{APP_NAME}/{APP_VERSION}"})
+    with urllib.request.urlopen(request, timeout=UPDATE_TIMEOUT) as response:
+        data = response.read(MAX_DOWNLOAD + 1)
+    if len(data) > MAX_DOWNLOAD:
+        raise UpdateError(f"{url} is unexpectedly large; it was not used.")
+    return data
+
+
+def _connection_problem(err):
+    reason = getattr(err, 'reason', err)
+    text = f"Could not connect to GitHub to look for a new version ({reason})."
+    if 'CERTIFICATE_VERIFY_FAILED' in str(reason):
+        text += ("\nPython cannot check GitHub's security certificate. With Python from python.org on macOS,\n"
+                 "run 'Install Certificates.command' in its folder in Applications.")
+    return text
+
+
+def find_latest_version():
+    """The newest version on GitHub: {'version', 'source' (the program text), 'base' (its folder URL)}.
+
+    Raises UpdateError when GitHub cannot be reached or the file is not a valid program.
+    """
+    ref = 'HEAD'  # the main branch, used when the project has no releases
+    try:
+        release = json.loads(_download(f"{GITHUB_API}/repos/{UPDATE_REPOSITORY}/releases/latest"))
+        if isinstance(release, dict) and release.get('tag_name'):
+            ref = release['tag_name']
+    except (OSError, ValueError, UpdateError):  # no releases (404), API limit reached, offline, ...
+        pass
+    base = f"{GITHUB_RAW}/{UPDATE_REPOSITORY}/{urllib.parse.quote(ref)}/"
+    try:
+        data = _download(base + APP_SLUG + '.py')
+    except urllib.error.HTTPError as err:
+        raise UpdateError(f"{base}{APP_SLUG}.py could not be downloaded (HTTP error {err.code}).") from None
+    except OSError as err:
+        raise UpdateError(_connection_problem(err)) from None
+    source = data.decode('utf-8', errors='replace')
+    match = _VERSION_RE.search(source)
+    try:
+        compile(source, APP_SLUG + '.py', 'exec')  # a valid Python program, not e.g. an error page
+    except (SyntaxError, ValueError):
+        match = None
+    if not match:
+        raise UpdateError(f"The file downloaded from {base} is not a valid {APP_NAME} program.")
+    return {'version': match.group(1), 'source': source, 'base': base}
+
+
+def installed_copy(platform=None):
+    """The installation to update: {'version', 'systemwide', 'script'}, or None if not installed."""
+    recorded = (load_config().get('installed') or {}).get('systemwide')
+    for systemwide in ((True, False) if recorded else (False, True)):
+        target = install_target(systemwide, platform)
+        if target and os.path.isfile(target['script']):
+            return {'version': file_version(target['script']), 'systemwide': systemwide,
+                    'script': target['script']}
+    return None
+
+
+def is_newer(version, than):
+    return _version_tuple(version) > _version_tuple(than)
+
+
+def update_check_due(config, now=None):
+    """Is it time for the automatic look for a new version (every UPDATE_CHECK_DAYS days)?"""
+    if UPDATE_CHECK_DAYS <= 0 or not config.get('check_updates', True):
+        return False
+    now = time.time() if now is None else now
+    return now - float(config.get('last_update_check') or 0) >= UPDATE_CHECK_DAYS * 86400
+
+
+def remember_update_check():
+    config = load_config()
+    config['last_update_check'] = time.time()
+    save_config(config)
+
+
+def install_update(latest, systemwide, platform=None):
+    """Install a version found by find_latest_version (with its icon, if GitHub has one)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        script = os.path.join(tmp, APP_SLUG + '.py')
+        with open(script, 'w', encoding='utf-8') as f:
+            f.write(latest['source'])
+        try:
+            icon = _download(latest['base'] + APP_ICON_FILE)
+            if icon.startswith(b'\x89PNG'):
+                with open(os.path.join(tmp, APP_ICON_FILE), 'wb') as f:
+                    f.write(icon)
+        except (OSError, UpdateError):
+            pass  # keep the current icon
+        return install_app(systemwide, platform, source=script, admin_option='--update')
+
+
+def update_installed_app(platform=None):
+    """Look for a newer version on GitHub and install it over the installed copy. Returns (success, message)."""
+    installed = installed_copy(platform)
+    if installed is None:
+        return False, f"{APP_NAME} is not installed, so there is nothing to update. Type install to install it."
+    try:
+        latest = find_latest_version()
+    except UpdateError as err:
+        return False, str(err)
+    remember_update_check()
+    if not is_newer(latest['version'], installed['version']):
+        return True, (f"{APP_NAME} {installed['version']} is up to date "
+                      f"(newest version on GitHub: {latest['version']}).")
+    ok, message = install_update(latest, installed['systemwide'], platform)
+    if ok:
+        message += f"\nRestart {APP_NAME} to use version {latest['version']}."
+    return ok, message
+
+
 # =============================================================================
 #  GUI
 # =============================================================================
@@ -2261,10 +3556,32 @@ class ConsoleText(scrolledtext.ScrolledText):
         super().destroy()
 
 
-class InstallDialog(tk.Toplevel):
-    """Modal question with a row of buttons; show() returns the key of the chosen button."""
+def make_dialog_icon(root, size=64):
+    """The rounded app icon, size x size pixels, for dialog windows (None without an icon file)."""
+    path = os.path.join(os.path.dirname(THIS_SCRIPT), APP_ICON_FILE)
+    if not os.path.isfile(path):
+        return None
+    try:
+        from PIL import Image, ImageTk
+        lanczos = getattr(Image, 'Resampling', Image).LANCZOS
+        return ImageTk.PhotoImage(rounded_icon_image(path, margin=0).resize((size, size), lanczos), master=root)
+    except Exception:  # no Pillow: plain Tk, scaled down by a whole factor
+        pass
+    try:
+        image = _rounded_icon_tk(root, path, 0, APP_ICON_ROUNDING)
+        factor = max(1, round(image.width() / size))
+        return image.subsample(factor) if factor > 1 else image
+    except tk.TclError:
+        return None
 
-    def __init__(self, root, title, message, buttons, note=''):
+
+class InstallDialog(tk.Toplevel):
+    """Modal question with the app icon and a row of buttons; show() returns the chosen button's key.
+
+    checkbox is an optional (label, tkinter.BooleanVar) pair shown above the buttons.
+    """
+
+    def __init__(self, root, title, message, buttons, note='', icon=None, checkbox=None):
         super().__init__(root)
         self.root, self.choice = root, None
         self.title(title)
@@ -2272,7 +3589,18 @@ class InstallDialog(tk.Toplevel):
         self.transient(root)
         frame = ttk.Frame(self, padding=16)
         frame.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text=message, justify=tk.LEFT, wraplength=460).pack(anchor=tk.W)
+        top = ttk.Frame(frame)
+        top.pack(anchor=tk.W, fill=tk.X)
+        self.icon_label = None
+        if icon is not None:
+            self.icon_label = ttk.Label(top, image=icon)
+            self.icon_label.image = icon  # keep a reference, or Tk shows an empty square
+            self.icon_label.pack(side=tk.LEFT, anchor=tk.N, padx=(0, 16))
+        ttk.Label(top, text=message, justify=tk.LEFT, wraplength=420).pack(side=tk.LEFT, anchor=tk.W)
+        self.checkbox = None
+        if checkbox:
+            self.checkbox = ttk.Checkbutton(frame, text=checkbox[0], variable=checkbox[1])
+            self.checkbox.pack(anchor=tk.W, pady=(14, 0))
         row = ttk.Frame(frame)
         row.pack(anchor=tk.E, pady=(16, 0))
         self.buttons = {}
@@ -2441,6 +3769,9 @@ class MatlabConsoleApp:
                 return False
             if chunk is CLEAR_SCREEN:
                 self.output_area.clear()
+            elif isinstance(chunk, RawText):  # disp / fprintf output, exactly as printed
+                self.output_area.insert(tk.END, chunk)
+                self.output_area.see(tk.END)
             else:
                 self.write_output(chunk)
         return True
@@ -2455,9 +3786,12 @@ class MatlabConsoleApp:
             if not config.get('first_start_done'):
                 config['first_start_done'] = True
                 save_config(config)
+            if update_check_due(config) and installed_copy(platform):
+                self.check_for_update(platform)
             return
         mac = platform == 'darwin'
         message = None
+        icon = self.dialog_icon()
         if question == 'install':
             home = os.path.expanduser('~')
 
@@ -2475,11 +3809,13 @@ class MatlabConsoleApp:
                 f"Only for me: just for your user account\n    ({place(False)})",
                 [('systemwide', "Install systemwide"), ('user', "Only for me"), ('no', "Don't install")],
                 note="This question is asked only once. The commands install and uninstall "
-                     "can do the same later.").show()
+                     "can do the same later.", icon=icon, checkbox=self._weekly_checkbox(True)).show()
             if choice in ('systemwide', 'user'):
                 message = install_app(choice == 'systemwide', platform)[1]
             config = load_config()
             config['first_start_done'] = True
+            if self.weekly is not None:
+                config['check_updates'] = self.weekly.get()
         else:
             installed = config['installed']
             choice = InstallDialog(
@@ -2488,7 +3824,7 @@ class MatlabConsoleApp:
                 f"Update it to version {APP_VERSION}, the version you are running now?",
                 [('update', "Update"), ('later', "Not now")],
                 note="If you choose Not now, you are not asked again for this version; "
-                     "the command install updates it later.").show()
+                     "the command install updates it later.", icon=icon).show()
             if choice == 'update':
                 message = install_app(bool(installed.get('systemwide')), platform)[1]
             config = load_config()
@@ -2497,6 +3833,84 @@ class MatlabConsoleApp:
         save_config(config)
         if message:
             self.print_message(message)
+
+    def dialog_icon(self):
+        if getattr(self, '_dialog_icon', None) is None:
+            self._dialog_icon = make_dialog_icon(self.root)
+        return self._dialog_icon
+
+    def _weekly_checkbox(self, checked):
+        """(label, variable) for the 'look for new versions' checkbox, or None if checks are off."""
+        self.weekly = None
+        if UPDATE_CHECK_DAYS <= 0:
+            return None
+        self.weekly = tk.BooleanVar(self.root, value=checked)
+        period = "every week" if UPDATE_CHECK_DAYS == 7 else f"every {UPDATE_CHECK_DAYS} days"
+        return (f"Look for new versions on GitHub {period}", self.weekly)
+
+    def check_for_update(self, platform=None):
+        """Look for a new version on GitHub without blocking the window; offer it if there is one."""
+        result = {}
+
+        def look():  # runs in a background thread: no Tk calls here
+            try:
+                result['latest'] = find_latest_version()
+            except Exception as err:  # offline, GitHub unreachable, ...: try again at the next start
+                result['error'] = err
+
+        # Free unused Tk objects (e.g. of closed dialogs) here in the main thread: if Python's
+        # garbage collector ran into them in the background thread, Tcl would abort the program.
+        gc.collect()
+        thread = threading.Thread(target=look, daemon=True)
+        thread.start()
+
+        def wait():
+            if thread.is_alive():
+                self.root.after(200, wait)
+            elif 'latest' in result:
+                self.offer_update(result['latest'], platform)
+        self.root.after(200, wait)
+        return thread
+
+    def offer_update(self, latest, platform=None):
+        """Ask whether to install the newer version found on GitHub; install it and offer a restart."""
+        remember_update_check()
+        config = load_config()
+        installed = installed_copy(platform)
+        if (installed is None or not is_newer(latest['version'], installed['version'])
+                or config.get('skipped_version') == latest['version']):
+            return
+        icon = self.dialog_icon()
+        choice = InstallDialog(
+            self.root, f"Update {APP_NAME}?",
+            f"A new version of {APP_NAME} is available.\n\n"
+            f"    Installed version:  {installed['version']}\n"
+            f"    New version:  {latest['version']}\n\n"
+            "Download and install it now?",
+            [('update', "Update now"), ('later', "Not now"), ('skip', "Skip this version")],
+            note=f"From github.com/{UPDATE_REPOSITORY}. The command update looks for a new version at any time.",
+            icon=icon, checkbox=self._weekly_checkbox(config.get('check_updates', True))).show()
+        config = load_config()
+        if self.weekly is not None:
+            config['check_updates'] = self.weekly.get()
+        if choice == 'skip':
+            config['skipped_version'] = latest['version']
+        save_config(config)
+        if choice != 'update':
+            return
+        ok, message = install_update(latest, installed['systemwide'], platform)
+        self.print_message(message)
+        if ok and InstallDialog(
+                self.root, f"Restart {APP_NAME}?",
+                f"{APP_NAME} {latest['version']} is installed.\n\n"
+                "Restart now to use it? The variables in the workspace are not kept.",
+                [('restart', "Restart now"), ('later', "Later")], icon=icon).show() == 'restart':
+            self.restart(installed['script'])
+
+    def restart(self, script):
+        """Close the window and run `script` (the updated program) in place of this process."""
+        self.root.destroy()
+        os.execv(sys.executable, [sys.executable, script])
 
     def print_message(self, text):
         """Show text above the prompt, as if a command had printed it; typed input is kept."""
@@ -2510,7 +3924,7 @@ class MatlabConsoleApp:
 
 
 def main(argv=None):
-    """Start the program. --install, --install-systemwide and --uninstall work without a window."""
+    """Start the program. --install, --install-systemwide, --uninstall and --update work without a window."""
     import argparse
     parser = argparse.ArgumentParser(prog=os.path.basename(THIS_SCRIPT),
                                      description=f"{APP_NAME} {APP_VERSION} - a MATLAB Command Window emulator.")
@@ -2520,12 +3934,24 @@ def main(argv=None):
     action.add_argument('--install-systemwide', action='store_true',
                         help="install the application for all users (e.g. with sudo), then exit")
     action.add_argument('--uninstall', action='store_true', help="remove the installed application, then exit")
+    action.add_argument('--update', action='store_true',
+                        help="install a newer version from GitHub over the installed one, then exit")
     parser.add_argument('--version', action='version', version=f"{APP_NAME} {APP_VERSION}")
     args, _ = parser.parse_known_args(argv)  # macOS may add an argument such as -psn_0_123 from Finder
-    if args.install or args.install_systemwide or args.uninstall:
-        ok, message = uninstall_app() if args.uninstall else install_app(args.install_systemwide)
+    if args.install or args.install_systemwide or args.uninstall or args.update:
+        if args.update:
+            ok, message = update_installed_app()
+        elif args.uninstall:
+            ok, message = uninstall_app()
+        else:
+            ok, message = install_app(args.install_systemwide)
         print(message)
         return 0 if ok else 1
+    try:  # started from Launchpad or Finder the current folder is '/': files would go there
+        if os.getcwd() == os.path.abspath(os.sep) or not os.access(os.getcwd(), os.W_OK):
+            os.chdir(os.path.expanduser('~'))
+    except OSError:
+        pass
     set_macos_app_name(APP_NAME)
     root = tk.Tk(className=APP_NAME)
     app = MatlabConsoleApp(root)
