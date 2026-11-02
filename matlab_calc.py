@@ -5,14 +5,20 @@ Run with:  python3 matlab_calc.py
 """
 
 import inspect
+import json
 import math
 import os
+import plistlib
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tempfile
 import tkinter as tk
 import tkinter.font as tkfont
 from fractions import Fraction
-from tkinter import scrolledtext
+from tkinter import scrolledtext, ttk
 
 import numpy as np
 
@@ -20,7 +26,7 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
-APP_VERSION = '0.4.0'           # Shown in the welcome banner; see the version history in README.md
+APP_VERSION = '0.5.0'           # Shown in the welcome banner; see the version history in README.md
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
 WINDOW_HEIGHT = 520             # Initial window height in pixels
@@ -41,6 +47,8 @@ PROMPT = '>> '
 SHORT_DECIMALS = 4              # Maximum decimals shown by 'format short' (the default)
 LONG_DECIMALS = 15              # Maximum decimals shown by 'format long'
 MAX_DISPLAY_ELEMENTS = 10000    # Bigger results are summarised instead of printed in full
+
+CONFIG_FILE = '~/.matlab_calc.json'  # Settings file in the home folder: first start, installation
 # =============================================================================
 
 __version__ = APP_VERSION
@@ -842,7 +850,7 @@ OPERATOR_TOPICS = {
     'horzcat', 'vertcat', 'end', 'paren', 'indexing', 'index', 'subsref', 'subsasgn', 'assignment',
 }
 
-_HELP_FIELDS = re.compile(r"\{(APP_NAME|APP_VERSION|SHORT_DECIMALS|LONG_DECIMALS)\}")
+_HELP_FIELDS = re.compile(r"\{(APP_NAME|APP_VERSION|SHORT_DECIMALS|LONG_DECIMALS|CONFIG_FILE)\}")
 
 
 def help_text(func):
@@ -1616,6 +1624,41 @@ class MatlabEngine:
             return f"{topic} is a variable in the workspace. Type {topic} to see its value."
         return f"{topic} not found.\n\nType help to list the available commands, operators and functions."
 
+    @console_command('install', max_args=1, arg_pattern=r"systemwide")
+    def cmd_install(self, args, suppressed):
+        """install - Install {APP_NAME} as an application.
+
+        install             installs {APP_NAME} for you: it is then listed in
+                            Launchpad (macOS) or in the application menu
+                            (Linux) and starts without the terminal.
+        install systemwide  installs it for all users of the computer; this
+                            may need administrator rights.
+
+        Typing install again updates the installed copy to this version.
+        The settings file {CONFIG_FILE} records the installation.
+
+        See also uninstall.
+        """
+        ok, message = install_app(systemwide=bool(args))
+        if not ok:
+            raise MatlabError(message)
+        return [_indent(message)]
+
+    @console_command('uninstall')
+    def cmd_uninstall(self, args, suppressed):
+        """uninstall - Remove the installed application.
+
+        uninstall removes the installed copies of {APP_NAME} (systemwide and
+        personal) with their launchers. The program that is running keeps
+        working until you close it, and the settings file stays.
+
+        See also install.
+        """
+        ok, message = uninstall_app()
+        if not ok:
+            raise MatlabError(message)
+        return [_indent(message)]
+
     @console_command('version')
     def cmd_version(self, args, suppressed):
         """version - Show the version number.
@@ -1824,6 +1867,352 @@ def pick_font_family(root, candidates=FONT_FAMILIES):
 
 
 # =============================================================================
+#  Installation on macOS and Linux
+#
+#  Installing copies this script and its icon to a fixed place and adds a launcher,
+#  so the program starts like any other application instead of from the terminal:
+#    macOS   Matlab_Calc.app in /Applications (systemwide) or ~/Applications (only
+#            for you); it appears in Launchpad and Spotlight.
+#    Linux   program files in /opt/matlab_calc and a menu entry in
+#            /usr/local/share/applications (systemwide), or ~/.local/share/matlab_calc
+#            and ~/.local/share/applications (only for you).
+#  The launcher runs the copy with the Python interpreter that did the installation,
+#  which has NumPy. CONFIG_FILE in the home folder records that the question at the
+#  first start was answered and what was installed.
+# =============================================================================
+MAC_SYSTEM_DIR = '/Applications'
+MAC_USER_DIR = '~/Applications'
+LINUX_SYSTEM_DIRS = ('/opt', '/usr/local/share/applications')   # program files, menu entry
+LINUX_USER_DIRS = ('~/.local/share', '~/.local/share/applications')
+
+THIS_SCRIPT = os.path.realpath(__file__)
+APP_SLUG = re.sub(r'[^a-z0-9_]+', '_', APP_NAME.lower())  # file and folder names, e.g. matlab_calc
+
+
+def load_config():
+    """Settings from CONFIG_FILE; empty if the file is missing or unreadable."""
+    try:
+        with open(os.path.expanduser(CONFIG_FILE), encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(config):
+    """Write the settings (via a temporary file, so a crash cannot leave half a file)."""
+    path = os.path.expanduser(CONFIG_FILE)
+    try:
+        with open(path + '.tmp', 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, sort_keys=True)
+        os.replace(path + '.tmp', path)
+        return True
+    except OSError:
+        return False
+
+
+def _platform_name(platform):
+    return 'macOS' if platform == 'darwin' else 'Linux' if platform.startswith('linux') else platform
+
+
+def install_target(systemwide, platform=None):
+    """Where an installation goes, or None on unsupported systems.
+
+    Returns a dict with 'files' (the folder that gets the script), 'launcher' (the .app
+    bundle or the .desktop file), 'script' (the installed script) and 'parents' (the
+    folders that must be writable).
+    """
+    platform = platform or sys.platform
+    if platform == 'darwin':
+        base = MAC_SYSTEM_DIR if systemwide else MAC_USER_DIR
+        app = os.path.join(os.path.expanduser(base), APP_NAME + '.app')
+        files = os.path.join(app, 'Contents', 'Resources')
+        parents = [os.path.expanduser(base)]
+    elif platform.startswith('linux'):
+        if systemwide:
+            files_root, menu_dir = LINUX_SYSTEM_DIRS
+        elif os.environ.get('XDG_DATA_HOME'):  # personal data folder set by the desktop
+            files_root = os.environ['XDG_DATA_HOME']
+            menu_dir = os.path.join(files_root, 'applications')
+        else:
+            files_root, menu_dir = LINUX_USER_DIRS
+        files_root, menu_dir = os.path.expanduser(files_root), os.path.expanduser(menu_dir)
+        files = os.path.join(files_root, APP_SLUG)
+        app = os.path.join(menu_dir, APP_SLUG + '.desktop')
+        parents = [files_root, menu_dir]
+    else:
+        return None
+    return {'files': files, 'launcher': app, 'script': os.path.join(files, APP_SLUG + '.py'), 'parents': parents}
+
+
+def _can_write(path):
+    """Can this user create `path` (or write into it if it exists)?"""
+    while not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        path = parent
+    return os.access(path, os.W_OK)
+
+
+def running_installed_copy(platform=None):
+    """'systemwide' or 'user' if this script is an installed copy, otherwise None."""
+    for systemwide in (True, False):
+        target = install_target(systemwide, platform)
+        if target and os.path.realpath(target['script']) == THIS_SCRIPT:
+            return 'systemwide' if systemwide else 'user'
+    return None
+
+
+def _version_tuple(version):
+    try:
+        return tuple(int(part) for part in str(version).split('.'))
+    except ValueError:
+        return (0,)
+
+
+def _admin_hint(option):
+    return (f"    sudo {shlex.quote(sys.executable or 'python3')} {shlex.quote(THIS_SCRIPT)} {option}")
+
+
+def install_app(systemwide, platform=None):
+    """Install this version (or update an installation). Returns (success, message)."""
+    platform = platform or sys.platform
+    target = install_target(systemwide, platform)
+    if target is None:
+        return False, f"Installing is only supported on macOS and Linux, not on {_platform_name(platform)}."
+    if not all(_can_write(p) for p in target['parents']):
+        if systemwide:
+            return False, ("Installing for all users needs administrator rights. In a terminal, run\n"
+                           f"{_admin_hint('--install-systemwide')}\n"
+                           "or type install to install it only for you.")
+        return False, f"Cannot write to {' or '.join(target['parents'])}; nothing was installed."
+    try:
+        if platform == 'darwin':
+            _install_mac(target)
+        else:
+            _install_linux(target)
+    except (OSError, subprocess.SubprocessError) as err:
+        return False, f"The installation failed: {err}"
+    # A systemwide installation replaces a personal one, so the program is not listed twice
+    other = install_target(not systemwide, platform)
+    if systemwide and os.path.lexists(other['launcher']):
+        try:
+            _remove_installation(other)
+        except OSError:
+            pass
+    config = load_config()
+    config.update(first_start_done=True, update_declined=None, installed={
+        'version': APP_VERSION, 'systemwide': systemwide, 'launcher': target['launcher'],
+        'python': sys.executable})
+    save_config(config)
+    scope = "for all users" if systemwide else "for you"
+    where = ("from Launchpad or the Applications folder" if platform == 'darwin'
+             else "from the application menu (search for " + APP_NAME + ")")
+    return True, (f"{APP_NAME} {APP_VERSION} is installed {scope}:\n    {target['launcher']}\n"
+                  f"From now on it can be started {where}.")
+
+
+def uninstall_app(platform=None):
+    """Remove the installed copies (systemwide and personal). Returns (success, message)."""
+    platform = platform or sys.platform
+    if install_target(False, platform) is None:
+        return False, f"Installing is only supported on macOS and Linux, not on {_platform_name(platform)}."
+    removed, failed = [], []
+    for systemwide in (True, False):
+        target = install_target(systemwide, platform)
+        if not (os.path.lexists(target['launcher']) or os.path.exists(target['script'])):
+            continue
+        try:
+            _remove_installation(target)
+            removed.append(target['launcher'])
+        except OSError:
+            failed.append(target['launcher'])
+    config = load_config()
+    if not failed:
+        config.pop('installed', None)
+        save_config(config)
+    if failed:
+        return False, ("Removing " + ", ".join(failed) + " needs administrator rights. In a terminal, run\n"
+                       + _admin_hint('--uninstall'))
+    if not removed:
+        return True, f"{APP_NAME} is not installed."
+    return True, "Removed " + ", ".join(removed) + "."
+
+
+def _remove_installation(target):
+    """Delete an installation; only folders that really contain an installed copy are removed."""
+    if os.path.isdir(target['launcher']):          # macOS .app bundle
+        if not os.path.exists(target['script']):
+            raise OSError(f"{target['launcher']} does not look like a {APP_NAME} installation")
+        shutil.rmtree(target['launcher'])
+        return
+    if os.path.lexists(target['launcher']):        # Linux menu entry
+        os.remove(target['launcher'])
+        _refresh_menus(os.path.dirname(target['launcher']))
+    if os.path.exists(target['script']):
+        shutil.rmtree(target['files'])
+
+
+def _copy(src, dst):
+    if os.path.exists(dst) and os.path.samefile(src, dst):
+        return  # running the installed copy: nothing to copy
+    shutil.copyfile(src, dst)
+
+
+def _make_readable(folder):
+    """Let every user read (and enter) the installed files, whatever the umask was."""
+    for path, dirs, files in os.walk(folder):
+        os.chmod(path, 0o755)
+        for name in files:
+            full = os.path.join(path, name)
+            os.chmod(full, 0o755 if os.access(full, os.X_OK) else 0o644)
+
+
+def _save_rounded_icon(src, dst):
+    """Save the shrunk, rounded icon as a PNG (Pillow, else Tk, else a plain copy)."""
+    try:
+        rounded_icon_image(src).save(dst)
+        return
+    except Exception:
+        pass
+    root = tk._default_root
+    try:
+        temporary = root is None
+        if temporary:
+            root = tk.Tk()
+            root.withdraw()
+        try:
+            _rounded_icon_tk(root, src, APP_ICON_MARGIN, APP_ICON_ROUNDING).write(dst, format='png')
+            return
+        finally:
+            if temporary:
+                root.destroy()
+    except tk.TclError:  # no display, e.g. when installing over ssh
+        _copy(src, dst)
+
+
+def _install_linux(target):
+    files = target['files']
+    os.makedirs(files, exist_ok=True)
+    _copy(THIS_SCRIPT, target['script'])
+    lines = ["[Desktop Entry]", "Type=Application", f"Name={APP_NAME}", "GenericName=Calculator",
+             "Comment=MATLAB-style matrix calculator",
+             "Exec=" + _desktop_exec([sys.executable or 'python3', target['script']])]
+    icon = os.path.join(os.path.dirname(THIS_SCRIPT), APP_ICON_FILE)
+    if os.path.isfile(icon):
+        _copy(icon, os.path.join(files, APP_ICON_FILE))
+        menu_icon = os.path.join(files, APP_SLUG + '_menu_icon.png')
+        _save_rounded_icon(os.path.join(files, APP_ICON_FILE), menu_icon)
+        lines.append(f"Icon={menu_icon}")
+    lines += ["Terminal=false", "Categories=Utility;Calculator;", f"StartupWMClass={APP_NAME}"]
+    os.makedirs(os.path.dirname(target['launcher']), exist_ok=True)
+    with open(target['launcher'], 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(target['launcher'], 0o755)
+    _make_readable(files)
+    _refresh_menus(os.path.dirname(target['launcher']))
+
+
+def _desktop_exec(args):
+    """Quote arguments for the Exec key of a .desktop file (freedesktop.org rules)."""
+    quoted = []
+    for arg in args:
+        arg = arg.replace('%', '%%')
+        if re.search(r"[\s\"'\\><~|&;$*?#()`]", arg):
+            arg = '"' + re.sub(r'(["`$\\])', r'\\\1', arg) + '"'
+        quoted.append(arg.replace('\\', '\\\\'))  # the file format escapes backslashes once more
+    return ' '.join(quoted)
+
+
+def _refresh_menus(menu_dir):
+    if shutil.which('update-desktop-database'):
+        subprocess.run(['update-desktop-database', '-q', menu_dir],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def _install_mac(target):
+    app, resources = target['launcher'], target['files']
+    macos = os.path.join(app, 'Contents', 'MacOS')
+    os.makedirs(resources, exist_ok=True)
+    os.makedirs(macos, exist_ok=True)
+    _copy(THIS_SCRIPT, target['script'])
+    icon = os.path.join(os.path.dirname(THIS_SCRIPT), APP_ICON_FILE)
+    has_icon = False
+    if os.path.isfile(icon):
+        _copy(icon, os.path.join(resources, APP_ICON_FILE))
+        has_icon = _save_icns(os.path.join(resources, APP_ICON_FILE), os.path.join(resources, 'AppIcon.icns'))
+    executable = os.path.join(macos, APP_NAME)
+    with open(executable, 'w', encoding='utf-8') as f:
+        f.write("#!/bin/sh\n"
+                f"# Starts {APP_NAME} with the Python interpreter that installed it.\n"
+                f'exec {shlex.quote(sys.executable or "python3")} "$(dirname "$0")/../Resources/{APP_SLUG}.py" "$@"\n')
+    os.chmod(executable, 0o755)
+    info = {
+        'CFBundleName': APP_NAME, 'CFBundleDisplayName': APP_NAME, 'CFBundleExecutable': APP_NAME,
+        'CFBundleIdentifier': 'local.' + re.sub(r'[^A-Za-z0-9.-]', '-', APP_NAME.lower()),
+        'CFBundlePackageType': 'APPL', 'CFBundleInfoDictionaryVersion': '6.0',
+        'CFBundleShortVersionString': APP_VERSION, 'CFBundleVersion': APP_VERSION,
+        'LSMinimumSystemVersion': '10.13', 'NSHighResolutionCapable': True,
+    }
+    if has_icon:
+        info['CFBundleIconFile'] = 'AppIcon'
+    with open(os.path.join(app, 'Contents', 'Info.plist'), 'wb') as f:
+        plistlib.dump(info, f)
+    _make_readable(app)
+    os.utime(app)  # lets Finder and Launchpad notice the change
+    lsregister = ('/System/Library/Frameworks/CoreServices.framework/Frameworks/'
+                  'LaunchServices.framework/Support/lsregister')
+    if os.path.exists(lsregister):
+        subprocess.run([lsregister, '-f', app], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def _save_icns(src, dst):
+    """Create the macOS icon file (Pillow, else the macOS tools sips and iconutil). Returns success."""
+    try:
+        from PIL import Image
+        icon = rounded_icon_image(src).resize((1024, 1024), getattr(Image, 'Resampling', Image).LANCZOS)
+        icon.save(dst, format='ICNS')
+        return True
+    except Exception:
+        pass
+    if not (shutil.which('sips') and shutil.which('iconutil')):
+        return False
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            png = os.path.join(tmp, 'icon.png')
+            _save_rounded_icon(src, png)
+            iconset = os.path.join(tmp, 'AppIcon.iconset')
+            os.mkdir(iconset)
+            for size in (16, 32, 128, 256, 512):
+                for scale, suffix in ((1, ''), (2, '@2x')):
+                    out = os.path.join(iconset, f"icon_{size}x{size}{suffix}.png")
+                    subprocess.run(['sips', '-z', str(size * scale), str(size * scale), png, '--out', out],
+                                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(['iconutil', '-c', 'icns', iconset, '-o', dst],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def startup_question(config, platform=None):
+    """What to ask when the program starts: 'install' at the first start, 'update' when an
+    older version is installed and this newer one runs from elsewhere, otherwise None."""
+    platform = platform or sys.platform
+    if install_target(False, platform) is None or running_installed_copy(platform):
+        return None
+    if not config.get('first_start_done'):
+        return 'install'
+    installed = config.get('installed') or {}
+    if (installed and os.path.lexists(installed.get('launcher', ''))
+            and _version_tuple(installed.get('version')) < _version_tuple(APP_VERSION)
+            and config.get('update_declined') != APP_VERSION):
+        return 'update'
+    return None
+
+
+# =============================================================================
 #  GUI
 # =============================================================================
 # Runs in place of the text widget's own command. It is written in Tcl on purpose: an
@@ -1862,10 +2251,59 @@ class ConsoleText(scrolledtext.ScrolledText):
     def clear(self):
         self.tk.call(self._raw, 'delete', '1.0', 'end')
 
+    def delete_raw(self, index1, index2):
+        """Delete text without the read-only check, for the app's own output."""
+        self.tk.call(self._raw, 'delete', index1, index2)
+
     def destroy(self):
         self.tk.call('rename', self._w, '')          # remove the guard
         self.tk.call('rename', self._raw, self._w)   # give the widget its own command back
         super().destroy()
+
+
+class InstallDialog(tk.Toplevel):
+    """Modal question with a row of buttons; show() returns the key of the chosen button."""
+
+    def __init__(self, root, title, message, buttons, note=''):
+        super().__init__(root)
+        self.root, self.choice = root, None
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(root)
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text=message, justify=tk.LEFT, wraplength=460).pack(anchor=tk.W)
+        row = ttk.Frame(frame)
+        row.pack(anchor=tk.E, pady=(16, 0))
+        self.buttons = {}
+        for key, label in buttons:
+            self.buttons[key] = ttk.Button(row, text=label, command=lambda k=key: self._choose(k))
+            self.buttons[key].pack(side=tk.LEFT, padx=(8, 0))
+        if note:
+            ttk.Label(frame, text=note, justify=tk.LEFT, wraplength=460, foreground='gray').pack(
+                anchor=tk.W, pady=(14, 0))
+        default = self.buttons[buttons[0][0]]
+        default.focus_set()
+        self.bind('<Return>', lambda event: default.invoke())
+        self.bind('<Escape>', lambda event: self._choose(None))
+        self.protocol('WM_DELETE_WINDOW', lambda: self._choose(None))
+
+    def _choose(self, key):
+        self.choice = key
+        self.destroy()
+
+    def show(self):
+        self.update_idletasks()  # centre over the main window
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - self.winfo_reqwidth()) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - self.winfo_reqheight()) // 3)
+        self.geometry(f"+{x}+{y}")
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.wait_window()
+        return self.choice
 
 
 class MatlabConsoleApp:
@@ -2007,13 +2445,95 @@ class MatlabConsoleApp:
                 self.write_output(chunk)
         return True
 
+    # ---- installation ------------------------------------------------------------
+    def startup_check(self, platform=None):
+        """At the first start ask whether to install the program; later offer to update it."""
+        platform = platform or sys.platform
+        config = load_config()
+        question = startup_question(config, platform)
+        if question is None:
+            if not config.get('first_start_done'):
+                config['first_start_done'] = True
+                save_config(config)
+            return
+        mac = platform == 'darwin'
+        message = None
+        if question == 'install':
+            home = os.path.expanduser('~')
 
-def main():
+            def place(systemwide):  # folder of the launcher, with the home folder shown as ~
+                folder = os.path.dirname(install_target(systemwide, platform)['launcher'])
+                return '~' + folder[len(home):] if folder.startswith(home + os.sep) else folder
+            choice = InstallDialog(
+                self.root, f"Install {APP_NAME}?",
+                f"Welcome to {APP_NAME} {APP_VERSION}!\n\n"
+                f"Install {APP_NAME} systemwide? It is then listed in "
+                + ("Launchpad and the Applications folder" if mac else "the application menu")
+                + " and starts like any other application, without the terminal.\n\n"
+                f"Install systemwide: for all users of this computer\n    ({place(True)}"
+                + ("" if mac else ", needs administrator rights") + ")\n"
+                f"Only for me: just for your user account\n    ({place(False)})",
+                [('systemwide', "Install systemwide"), ('user', "Only for me"), ('no', "Don't install")],
+                note="This question is asked only once. The commands install and uninstall "
+                     "can do the same later.").show()
+            if choice in ('systemwide', 'user'):
+                message = install_app(choice == 'systemwide', platform)[1]
+            config = load_config()
+            config['first_start_done'] = True
+        else:
+            installed = config['installed']
+            choice = InstallDialog(
+                self.root, f"Update {APP_NAME}?",
+                f"{APP_NAME} {installed.get('version')} is installed on this computer.\n\n"
+                f"Update it to version {APP_VERSION}, the version you are running now?",
+                [('update', "Update"), ('later', "Not now")],
+                note="If you choose Not now, you are not asked again for this version; "
+                     "the command install updates it later.").show()
+            if choice == 'update':
+                message = install_app(bool(installed.get('systemwide')), platform)[1]
+            config = load_config()
+            if choice != 'update':
+                config['update_declined'] = APP_VERSION
+        save_config(config)
+        if message:
+            self.print_message(message)
+
+    def print_message(self, text):
+        """Show text above the prompt, as if a command had printed it; typed input is kept."""
+        typed = self.output_area.get("input_start", "end-1c")
+        self.output_area.delete_raw("input_start linestart", "end")
+        self.write_output(_indent(text))
+        self.show_prompt()
+        self.output_area.insert("input_start", typed)
+        self.output_area.mark_set(tk.INSERT, tk.END)
+
+
+
+def main(argv=None):
+    """Start the program. --install, --install-systemwide and --uninstall work without a window."""
+    import argparse
+    parser = argparse.ArgumentParser(prog=os.path.basename(THIS_SCRIPT),
+                                     description=f"{APP_NAME} {APP_VERSION} - a MATLAB Command Window emulator.")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument('--install', action='store_true',
+                        help="install the application for the current user, then exit")
+    action.add_argument('--install-systemwide', action='store_true',
+                        help="install the application for all users (e.g. with sudo), then exit")
+    action.add_argument('--uninstall', action='store_true', help="remove the installed application, then exit")
+    parser.add_argument('--version', action='version', version=f"{APP_NAME} {APP_VERSION}")
+    args, _ = parser.parse_known_args(argv)  # macOS may add an argument such as -psn_0_123 from Finder
+    if args.install or args.install_systemwide or args.uninstall:
+        ok, message = uninstall_app() if args.uninstall else install_app(args.install_systemwide)
+        print(message)
+        return 0 if ok else 1
     set_macos_app_name(APP_NAME)
     root = tk.Tk(className=APP_NAME)
-    MatlabConsoleApp(root)
+    app = MatlabConsoleApp(root)
+    root.lift()
+    root.after(300, app.startup_check)
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

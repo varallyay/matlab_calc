@@ -2,10 +2,16 @@
 
 The engine tests need only NumPy. The GUI and icon tests need a display (they are
 skipped otherwise); the anti-aliased icon test also needs Pillow.
+The installation tests work in temporary folders: they never touch your home folder,
+/Applications or /opt.
 """
 import importlib.util
+import json
 import os
+import plistlib
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import tkinter as tk
@@ -713,6 +719,152 @@ class TestEventLoop(unittest.TestCase):
             self.fail("'exit' did not close the window")
         except tk.TclError:
             pass  # the application was destroyed, as expected
+
+
+class TestInstallation(unittest.TestCase):
+    """Installing, updating and removing - redirected to a temporary folder."""
+
+    PATCHED = ('CONFIG_FILE', 'MAC_SYSTEM_DIR', 'MAC_USER_DIR', 'LINUX_SYSTEM_DIRS', 'LINUX_USER_DIRS', '_can_write')
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.saved = {name: getattr(mc, name) for name in self.PATCHED}
+        self.saved_xdg = os.environ.pop('XDG_DATA_HOME', None)
+        t = self.tmp
+        mc.CONFIG_FILE = os.path.join(t, 'home', '.matlab_calc.json')
+        mc.MAC_SYSTEM_DIR, mc.MAC_USER_DIR = os.path.join(t, 'Applications'), os.path.join(t, 'home', 'Applications')
+        mc.LINUX_SYSTEM_DIRS = (os.path.join(t, 'opt'), os.path.join(t, 'usr', 'applications'))
+        mc.LINUX_USER_DIRS = (os.path.join(t, 'home', 'share'), os.path.join(t, 'home', 'share', 'applications'))
+        os.makedirs(os.path.join(t, 'home'))
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(mc, name, value)
+        if self.saved_xdg is not None:
+            os.environ['XDG_DATA_HOME'] = self.saved_xdg
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def config(self):
+        with open(mc.CONFIG_FILE, encoding='utf-8') as f:
+            return json.load(f)
+
+    def test_linux_install_update_and_uninstall(self):
+        ok, message = mc.install_app(False, 'linux')
+        self.assertTrue(ok, message)
+        target = mc.install_target(False, 'linux')
+        self.assertTrue(os.path.isfile(target['script']))
+        with open(target['launcher'], encoding='utf-8') as f:
+            entry = f.read()
+        self.assertIn(f'Name={mc.APP_NAME}\n', entry)
+        self.assertIn(mc._desktop_exec([sys.executable, target['script']]), entry)
+        if os.path.isfile(ICON):
+            self.assertRegex(entry, r'\nIcon=/.+\.png\n')
+        if shutil.which('desktop-file-validate'):
+            result = subprocess.run(['desktop-file-validate', target['launcher']], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        installed = self.config()['installed']
+        self.assertEqual((installed['version'], installed['systemwide']), (mc.APP_VERSION, False))
+        self.assertTrue(self.config()['first_start_done'])
+        self.assertTrue(mc.install_app(False, 'linux')[0])                     # installing again updates it
+        ok, message = mc.uninstall_app('linux')
+        self.assertTrue(ok, message)
+        self.assertFalse(os.path.exists(target['launcher']) or os.path.exists(target['files']))
+        self.assertNotIn('installed', self.config())
+        self.assertIn('not installed', mc.uninstall_app('linux')[1])
+
+    def test_systemwide_replaces_personal_copy(self):
+        mc.install_app(False, 'linux')
+        self.assertTrue(mc.install_app(True, 'linux')[0])
+        self.assertTrue(os.path.exists(mc.install_target(True, 'linux')['launcher']))
+        self.assertFalse(os.path.exists(mc.install_target(False, 'linux')['launcher']))  # not listed twice
+        self.assertTrue(self.config()['installed']['systemwide'])
+
+    def test_systemwide_without_rights(self):
+        mc._can_write = lambda path: False
+        ok, message = mc.install_app(True, 'linux')
+        self.assertFalse(ok)
+        self.assertIn('administrator rights', message)
+        self.assertIn('sudo ', message)
+        self.assertIn('--install-systemwide', message)
+
+    def test_mac_app_bundle(self):
+        ok, message = mc.install_app(True, 'darwin')
+        self.assertTrue(ok, message)
+        app = os.path.join(mc.MAC_SYSTEM_DIR, mc.APP_NAME + '.app')
+        with open(os.path.join(app, 'Contents', 'Info.plist'), 'rb') as f:
+            info = plistlib.load(f)
+        self.assertEqual((info['CFBundleExecutable'], info['CFBundlePackageType']), (mc.APP_NAME, 'APPL'))
+        self.assertEqual(info['CFBundleShortVersionString'], mc.APP_VERSION)
+        launcher = os.path.join(app, 'Contents', 'MacOS', mc.APP_NAME)
+        self.assertTrue(os.access(launcher, os.X_OK))
+        with open(launcher, encoding='utf-8') as f:
+            self.assertIn(f'"$(dirname "$0")/../Resources/{mc.APP_SLUG}.py"', f.read())
+        self.assertTrue(os.path.isfile(os.path.join(app, 'Contents', 'Resources', mc.APP_SLUG + '.py')))
+        if HAVE_PIL and os.path.isfile(ICON):
+            self.assertEqual(info['CFBundleIconFile'], 'AppIcon')
+            self.assertTrue(os.path.isfile(os.path.join(app, 'Contents', 'Resources', 'AppIcon.icns')))
+        self.assertTrue(mc.uninstall_app('darwin')[0])
+        self.assertFalse(os.path.exists(app))
+
+    def test_unsupported_system(self):
+        self.assertFalse(mc.install_app(False, 'win32')[0])
+        self.assertIsNone(mc.startup_question({}, 'win32'))
+
+    def test_desktop_exec_quoting(self):
+        self.assertEqual(mc._desktop_exec(['/usr/bin/python3', '/opt/a/b.py']), '/usr/bin/python3 /opt/a/b.py')
+        self.assertEqual(mc._desktop_exec(['/My Drive/x.py']), '"/My Drive/x.py"')
+        self.assertEqual(mc._desktop_exec(['/a$b']), '"/a\\\\$b"')               # \$ then the file-level \\
+        self.assertEqual(mc._desktop_exec(['/50%']), '/50%%')
+
+    def test_startup_question(self):
+        self.assertEqual(mc.startup_question({}, 'linux'), 'install')         # first start
+        self.assertIsNone(mc.startup_question({'first_start_done': True}, 'linux'))
+        mc.install_app(False, 'linux')
+        config = self.config()
+        self.assertIsNone(mc.startup_question(config, 'linux'))               # this version is installed
+        config['installed']['version'] = '0.0.1'
+        self.assertEqual(mc.startup_question(config, 'linux'), 'update')       # an older one is installed
+        config['update_declined'] = mc.APP_VERSION
+        self.assertIsNone(mc.startup_question(config, 'linux'))               # "Not now" was chosen
+        config['update_declined'], config['installed']['version'] = None, '99.0.0'
+        self.assertIsNone(mc.startup_question(config, 'linux'))               # never downgrade
+
+    def test_install_commands(self):
+        eng = mc.MatlabEngine()
+        if mc.install_target(False) is None:
+            self.skipTest('installing is not supported on this system')
+        self.assertIn('is installed for you', ''.join(eng.execute('install')))
+        self.assertIsNone(eng.last_error)
+        self.assertIn('Removed', ''.join(eng.execute('uninstall')))
+        mc._can_write = lambda path: False
+        self.assertIn('administrator rights', ''.join(eng.execute('install systemwide')))
+        self.assertIsNotNone(eng.last_error)
+        self.assertIn('install systemwide', ''.join(eng.execute('help install')))
+
+    def test_first_start_dialog(self):
+        root = make_root(visible=True)
+        try:
+            app = mc.MatlabConsoleApp(root)
+            asked = []
+            original_show = mc.InstallDialog.show
+
+            def answer(dialog, key):
+                asked.append(dialog.title())
+                dialog.after(100, dialog.buttons[key].invoke)
+                return original_show(dialog)
+            mc.InstallDialog.show = lambda dialog: answer(dialog, 'user')
+            try:
+                app.startup_check('linux')                                     # first start: asked, installs
+                self.assertEqual(asked, [f'Install {mc.APP_NAME}?'])
+                self.assertIn('is installed for you', app.output_area.get('1.0', 'end'))
+                self.assertTrue(app.output_area.get('end-1l linestart', 'end-1c').startswith(mc.PROMPT))
+                app.startup_check('linux')                                     # second start: not asked
+                self.assertEqual(len(asked), 1)
+            finally:
+                mc.InstallDialog.show = original_show
+            self.assertTrue(self.config()['first_start_done'])
+        finally:
+            root.destroy()
 
 
 class TestIcon(unittest.TestCase):

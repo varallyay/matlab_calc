@@ -1,6 +1,6 @@
 # Matlab_Calc — MATLAB Command Window Emulator (`matlab_calc.py`)
 
-**Version 0.4.0** — see [Version History](#version-history).
+**Version 0.5.0** — see [Version History](#version-history).
 
 A lightweight, interactive desktop calculator built with Python, Tkinter, and NumPy that emulates the look, feel, and matrix-first syntax of the **MATLAB Command Window**.
 
@@ -21,6 +21,7 @@ A lightweight, interactive desktop calculator built with Python, Tkinter, and Nu
   - Automatically aligns matrix columns and matches the decimal precision across all elements of a vector/matrix to the maximum significant decimals needed by the calculation (capped at 4 digits in `format short` and 15 digits in `format long`).
   - Very small or very large numbers switch to scientific notation (`1e-05`, `1.2346e+11`); `Inf`, `NaN` and complex results (`1 + 2i`) display as in MATLAB.
 - **Workspace Management**: Persistent variables across calculations, automatic `ans` assignment, output suppression with trailing `;`, and built-in workspace commands (`whos`, `clear`, `clc`, `format short`, `format long`).
+- **Installable**: on macOS and Linux it installs itself as a normal application (asked at the first start), so it starts from Launchpad or the application menu.
 - **Built-in Help**: `help` lists every command, operator and function; `help <name>` shows the full help of one of them, as in MATLAB.
 
 ---
@@ -30,18 +31,43 @@ A lightweight, interactive desktop calculator built with Python, Tkinter, and Nu
 - **Python** 3.8+
 - **NumPy** (`pip install numpy`)
 - **Tkinter** (included with standard Python installations)
-- *Optional:* **Pillow** (`pip install pillow`) — smooth, anti-aliased edges for the rounded app icon. Without it the icon is still shrunk and rounded, but its edges are slightly jagged.
+- *Optional:* **Pillow** (`pip install pillow`) — smooth, anti-aliased edges for the rounded app icon. Without it the icon is still shrunk and rounded, but its edges are slightly jagged. On macOS the icon of the installed app is made with Pillow, or with the built-in tools `sips` and `iconutil`.
 - *Optional, macOS:* **PyObjC** (`pip install pyobjc-framework-Cocoa`) — shows `APP_NAME` instead of “Python” in the menu bar.
 
 ---
 
-## Running the Application
+## Installing and Running
+
+Put `icon.png` next to `matlab_calc.py` (it becomes the window, Dock and menu icon) and start the program once from a terminal:
 
 ```bash
 python3 matlab_calc.py
 ```
 
-Place `icon.png` next to `matlab_calc.py` to use it as the window / Dock icon.
+At this first start a window asks whether to install it:
+
+| Button | What happens |
+| :--- | :--- |
+| **Install systemwide** | For all users of the computer. macOS: `/Applications/Matlab_Calc.app`. Linux: program files in `/opt/matlab_calc`, menu entry in `/usr/local/share/applications` (needs administrator rights, see below). |
+| **Only for me** | For your user account only. macOS: `~/Applications/Matlab_Calc.app`. Linux: `~/.local/share/matlab_calc` and `~/.local/share/applications`. |
+| **Don't install** | Nothing is installed; the program keeps working from the terminal. |
+
+The question is asked only once. After installing, start Matlab_Calc like any other application: from **Launchpad**, **Spotlight** or the **Applications** folder on macOS, or from the **application menu** on Linux (search for *Matlab_Calc*); the terminal is no longer needed.
+
+- **How it works:** installing copies `matlab_calc.py` and `icon.png` to the place above and creates a launcher (a `Matlab_Calc.app` bundle on macOS, a `.desktop` menu entry on Linux). The launcher starts the copy with the same Python that did the installation, so NumPy is always found, and it keeps working if you move or delete the folder you installed from.
+- **Updating:** when you start a newer version from your download folder (`python3 matlab_calc.py`), it offers to update the installed copy (**Update** / **Not now**; *Not now* is remembered for that version). Typing `install` updates it at any time.
+- **Later:** the commands `install`, `install systemwide` and `uninstall` do the same from the command window (see `help install`).
+- **From a terminal**, without opening the window:
+
+  ```bash
+  python3 matlab_calc.py --install              # for you
+  python3 matlab_calc.py --install-systemwide   # for all users
+  python3 matlab_calc.py --uninstall            # remove installed copies
+  python3 matlab_calc.py --version
+  ```
+
+  On Linux, installing for all users needs administrator rights: run `sudo python3 matlab_calc.py --install-systemwide` (with the full path of the Python that has NumPy, e.g. `sudo /opt/anaconda3/bin/python3 ...`). If you try it without the rights, the program prints the exact command. On macOS, administrator accounts can install into `/Applications` directly.
+- **Settings file:** `~/.matlab_calc.json` in your home folder records that the question was answered and what was installed. Delete it to be asked again the next time you start the program from your download folder.
 
 ---
 
@@ -52,7 +78,7 @@ All settings are constants at the top of `matlab_calc.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `'Matlab_Calc'` | Window title, Tk class name and macOS menu-bar name |
-| `APP_VERSION` | `'0.4.0'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
+| `APP_VERSION` | `'0.5.0'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
 | `WINDOW_WIDTH`, `WINDOW_HEIGHT` | `750`, `520` | Initial window size in pixels |
 | `APP_ICON_FILE` | `'icon.png'` | Icon image, looked up next to the script |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size (keeps the Dock icon the same size as native macOS icons) |
@@ -62,6 +88,7 @@ All settings are constants at the top of `matlab_calc.py`:
 | `WINDOW_PADDING`, `PROMPT` | `10`, `'>> '` | Space around the console; prompt text |
 | `SHORT_DECIMALS`, `LONG_DECIMALS` | `4`, `15` | Maximum decimals for `format short` / `format long` |
 | `MAX_DISPLAY_ELEMENTS` | `10000` | Larger results are summarised instead of printed (end the statement with `;`) |
+| `CONFIG_FILE` | `'~/.matlab_calc.json'` | Settings file in the home folder: remembers the answer to the installation question and what was installed |
 
 ---
 
@@ -255,6 +282,9 @@ A =
 | `help` | List all commands, operators and functions |
 | `help <name>` | Show the help of a command or function, e.g. `help round`; `help ops` (or `help .*`, `help +`, …) explains the operators |
 | `version` | Show the application name and version number |
+| `install` | Install the program for you (or update the installed copy), so it can be started from Launchpad / the application menu |
+| `install systemwide` | Install it for all users of the computer |
+| `uninstall` | Remove the installed copies |
 | `exit` / `quit` | Close the application |
 
 Typing a variable's name shows its value without changing `ans`.
@@ -313,11 +343,17 @@ More than two subscripts, functions with several outputs (such as `[row, col] = 
 python3 test_matlab_calc.py
 ```
 
-Runs 66 tests covering operators, functions, indexing, assignment, conditions and `find`, the help texts, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available.
+Runs 75 tests covering installation (in temporary folders, so your system is not touched), operators, functions, indexing, assignment, conditions and `find`, the help texts, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available.
 
 ---
 
 ## Version History
+
+### 0.5.0 — 2026-11-02
+- **Installation on macOS and Linux:** at the first start a window asks whether to install the program systemwide, only for the current user, or not at all. Installed, it is listed in Launchpad / the Applications folder (macOS: a `Matlab_Calc.app` bundle with its own icon) or in the application menu (Linux: a `.desktop` entry) and starts without the terminal.
+- **Settings file:** `~/.matlab_calc.json` remembers the answer and the installation, so the question is asked only once.
+- **Updates:** starting a newer version from elsewhere offers to update the installed copy.
+- **New commands:** `install`, `install systemwide` and `uninstall`; the same as the terminal options `--install`, `--install-systemwide` and `--uninstall` (useful with `sudo` on Linux). `--version` prints the version.
 
 ### 0.4.0 — 2026-11-02
 - **Changing elements:** `A(2,3) = 5`, `A(:, 1) = 0`, `A(1:2, end) = [7; 8]` and so on. Matrices grow when assigning beyond their end (new elements are 0), and assigning to a new name creates the variable.
