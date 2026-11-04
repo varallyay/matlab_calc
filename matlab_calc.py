@@ -22,9 +22,10 @@ import tkinter as tk
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
 import tkinter.font as tkfont
 from fractions import Fraction
-from tkinter import scrolledtext, ttk
+from tkinter import filedialog, scrolledtext, ttk
 
 import numpy as np
 
@@ -32,7 +33,8 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
-APP_VERSION = '0.7.0'           # Shown in the welcome banner; see the version history in README.md
+APP_VERSION = '0.8.0'           # Shown in the welcome banner; see the version history in README.md
+APP_CREDITS = "Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, Claude)"
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
 WINDOW_HEIGHT = 520             # Initial window height in pixels
@@ -42,7 +44,8 @@ APP_ICON_MARGIN = 0.1           # Transparent margin on each side, as a fraction
 APP_ICON_ROUNDING = 0.20        # Corner radius, as a fraction of the visible (shrunken) icon size
 
 FONT_FAMILIES = ('Consolas', 'Menlo', 'Monaco', 'DejaVu Sans Mono', 'Courier New')  # first installed one is used
-FONT_SIZE = 11
+FONT_SIZE = 11                  # Default font size of the Command Window (the Settings window changes it)
+FONT_SIZE_LIMITS = (6, 40)      # Smallest and largest font size that can be chosen
 BACKGROUND_COLOR = '#1e1e1e'
 TEXT_COLOR = '#d4d4d4'
 PROMPT_COLOR = '#569cd6'
@@ -56,7 +59,9 @@ MAX_DISPLAY_ELEMENTS = 10000    # Bigger results are summarised instead of print
 
 CONFIG_FILE = '~/.matlab_calc.json'  # Settings file in the home folder: first start, installation
 UPDATE_REPOSITORY = 'varallyay/matlab_calc'  # GitHub project (owner/name) that publishes new versions
+APP_WEBSITE = 'https://github.com/' + UPDATE_REPOSITORY  # Shown in the About window
 UPDATE_CHECK_DAYS = 7           # Look for a new version this often (days); 0 = only with the update command
+SCRIPT_EXTENSION = '.m'         # File type of File > Open and File > Save
 # =============================================================================
 
 __version__ = APP_VERSION
@@ -1882,6 +1887,60 @@ def _text_end(text, i):
         return k + 1
 
 
+# ---- scripts: File > Open runs a .m file, File > Save writes one ---------------
+def script_commands(text):
+    """The commands of a script (.m file) in the order they run, as (line number, command) pairs.
+
+    Each line is one command, run as if it were typed after the prompt. A command goes on
+    in the next lines while a [ ] is open or after '...'. Blank lines and lines with only
+    a comment are skipped.
+    """
+    commands, lines, start = [], [], 0
+    for number, line in enumerate(text.splitlines(), 1):
+        if not lines:
+            if not split_statements(line):  # blank, or only a comment
+                continue
+            start = number
+        lines.append(line.rstrip())
+        if not _continues('\n'.join(lines)):
+            commands.append((start, '\n'.join(lines)))
+            lines = []
+    if lines:  # a [ that is never closed: run it anyway, so its error is shown
+        commands.append((start, '\n'.join(lines)))
+    return commands
+
+
+def _continues(text):
+    """Does a command go on in the next line: is a [ still open, or does it end with '...'?"""
+    stack, i = [], 0
+    while i < len(text):
+        ch, line_end = text[i], text.find('\n', i)
+        line_end = len(text) if line_end < 0 else line_end
+        if ch == '"' or (ch == "'" and _quote_starts_text(text, i, bool(stack) and stack[-1] == '[')):
+            i = _text_end(text[:line_end], i) or line_end  # text never goes on in the next line
+            continue
+        if ch == '%':
+            i = line_end
+            continue
+        if text.startswith('...', i):
+            if line_end == len(text):
+                return True
+            i = line_end + 1
+            continue
+        if ch in '([':
+            stack.append(ch)
+        elif ch in ')]' and stack:
+            stack.pop()
+        i += 1
+    return '[' in stack
+
+
+def session_script(commands, when=None):
+    """Text of the .m file written by File > Save: a comment line, then the commands, one per line."""
+    stamp = time.strftime('%Y-%m-%d %H:%M', time.localtime(when))
+    return f"% {APP_NAME} {APP_VERSION} session, saved {stamp}\n" + ''.join(c.rstrip() + '\n' for c in commands)
+
+
 def _starts_new_element(text, j):
     """Inside [...], does whitespace followed by text[j:] begin a new element?  ([1 -2] vs [1 - 2])"""
     c = text[j]
@@ -2776,6 +2835,9 @@ class MatlabEngine:
         update off  turns off the automatic look every {UPDATE_CHECK_DAYS} days.
         update on   turns it on again.
 
+        The menu item Help > Check for Updates does the same as update, and
+        the Settings window sets how often to look.
+
         Only an installed {APP_NAME} is updated; see install.
 
         See also install, version.
@@ -2786,9 +2848,11 @@ class MatlabEngine:
             save_config(config)
             if args[0] == 'off':
                 return [_indent("Automatic update checks are off. Type update to look for a new version.")]
-            return [_indent(f"Automatic update checks are on: every {UPDATE_CHECK_DAYS} days."
-                            if UPDATE_CHECK_DAYS > 0 else
-                            "Automatic update checks are disabled by UPDATE_CHECK_DAYS = 0 in the program.")]
+            days = update_check_interval(config)
+            return [_indent(f"Automatic update checks are on: {every_days_text(days)}."
+                            if days > 0 else
+                            "Automatic update checks are disabled by UPDATE_CHECK_DAYS = 0 in the program; "
+                            "the Settings window can turn them on.")]
         ok, message = update_installed_app()
         if not ok:
             raise MatlabError(message)
@@ -2976,22 +3040,28 @@ def load_app_icon(root, path, margin=APP_ICON_MARGIN, rounding=APP_ICON_ROUNDING
         return None
 
 
+MAC_APP_NAME_SET = False  # True once set_macos_app_name() has named the application
+
+
 def set_macos_app_name(name):
     """Best effort: show `name` instead of 'Python' in the macOS menu bar.
 
     Needs PyObjC (pip install pyobjc-framework-Cocoa); does nothing without it or on
-    other platforms. Must run before the Tk root window is created.
+    other platforms. Must run before the Tk root window is created. Returns success.
     """
+    global MAC_APP_NAME_SET
     if sys.platform != 'darwin':
-        return
+        return False
     try:
         from Foundation import NSBundle
         bundle = NSBundle.mainBundle()
         info = bundle.localizedInfoDictionary() or bundle.infoDictionary()
         if info is not None:
             info['CFBundleName'] = name
+            MAC_APP_NAME_SET = True
     except Exception:
         pass
+    return MAC_APP_NAME_SET
 
 
 def pick_font_family(root, candidates=FONT_FAMILIES):
@@ -3005,6 +3075,95 @@ def pick_font_family(root, candidates=FONT_FAMILIES):
         if family.lower() in installed:
             return installed[family.lower()]
     return tkfont.Font(root=root, font='TkFixedFont').actual('family')
+
+
+def installed_font_family(root, family):
+    """The installed font family named `family` (any capitalisation), or None."""
+    if not family:
+        return None
+    installed = {f.lower(): f for f in tkfont.families(root)}
+    return installed.get(str(family).lower())
+
+
+_MONOSPACE_HINTS = ('mono', 'code', 'courier', 'consol', 'menlo', 'monaco', 'fixed', 'terminal', 'hack')
+
+
+def monospace_families(root):
+    """Installed monospace fonts, for the font list of the Settings window.
+
+    Only fonts with a typical monospace name are measured: measuring every installed
+    font takes seconds on some systems.
+    """
+    wanted = {f.lower() for f in FONT_FAMILIES}
+    found = set()
+    for family in tkfont.families(root):
+        name = family.lower()
+        if family.startswith('@') or not (name in wanted or any(hint in name for hint in _MONOSPACE_HINTS)):
+            continue
+        try:
+            if tkfont.Font(root=root, family=family, size=FONT_SIZE).metrics('fixed'):
+                found.add(family)
+        except tk.TclError:
+            pass
+    return sorted(found, key=str.lower)
+
+
+# =============================================================================
+#  Settings - chosen in the Settings window and kept in CONFIG_FILE
+# =============================================================================
+SETTING_KEYS = ('font_family', 'font_size', 'number_format', 'check_updates', 'update_check_days')
+
+
+def default_settings():
+    """The settings before anything is changed in the Settings window: the parameters at the top."""
+    return {
+        'font_family': None,           # None: the first installed font of FONT_FAMILIES
+        'font_size': FONT_SIZE,
+        'number_format': 'short',      # format at the start: 'short' or 'long'
+        'check_updates': UPDATE_CHECK_DAYS > 0,
+        'update_check_days': UPDATE_CHECK_DAYS if UPDATE_CHECK_DAYS > 0 else 7,
+    }
+
+
+def clamp_font_size(value, default=FONT_SIZE):
+    """value as a whole font size within FONT_SIZE_LIMITS (default if it is not a number)."""
+    try:
+        size = int(round(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    low, high = FONT_SIZE_LIMITS
+    return min(high, max(low, size))
+
+
+def user_settings(config=None):
+    """The settings in effect: those stored by the Settings window, else the defaults."""
+    config = load_config() if config is None else config
+    settings = default_settings()
+    family = config.get('font_family')
+    if isinstance(family, str) and family.strip():
+        settings['font_family'] = family.strip()
+    settings['font_size'] = clamp_font_size(config.get('font_size'), FONT_SIZE)
+    if config.get('number_format') in ('short', 'long'):
+        settings['number_format'] = config['number_format']
+    settings['check_updates'] = update_check_interval(config) > 0
+    days = update_check_interval(dict(config, check_updates=True))
+    if days > 0:
+        settings['update_check_days'] = days
+    return settings
+
+
+def store_settings(settings):
+    """Keep settings in CONFIG_FILE. A value equal to its default is removed, so the parameter applies."""
+    config = load_config()
+    unchanged = {'font_family': None, 'font_size': FONT_SIZE, 'number_format': 'short',
+                 'check_updates': True, 'update_check_days': UPDATE_CHECK_DAYS}  # as read by the program
+    for key in SETTING_KEYS:
+        if key in settings:
+            if settings[key] == unchanged[key]:
+                config.pop(key, None)
+            else:
+                config[key] = settings[key]
+    return save_config(config)
 
 
 # =============================================================================
@@ -3458,12 +3617,30 @@ def is_newer(version, than):
     return _version_tuple(version) > _version_tuple(than)
 
 
+def update_check_interval(config):
+    """Days between the automatic looks for a new version; 0 if they are turned off.
+
+    UPDATE_CHECK_DAYS, unless the Settings window stored another number of days.
+    """
+    if not config.get('check_updates', True):
+        return 0
+    try:
+        return max(0, int(config.get('update_check_days', UPDATE_CHECK_DAYS)))
+    except (TypeError, ValueError):
+        return max(0, UPDATE_CHECK_DAYS)
+
+
+def every_days_text(days):
+    return "every week" if days == 7 else "every day" if days == 1 else f"every {days} days"
+
+
 def update_check_due(config, now=None):
-    """Is it time for the automatic look for a new version (every UPDATE_CHECK_DAYS days)?"""
-    if UPDATE_CHECK_DAYS <= 0 or not config.get('check_updates', True):
+    """Is it time for the automatic look for a new version (see update_check_interval)?"""
+    days = update_check_interval(config)
+    if days <= 0:
         return False
     now = time.time() if now is None else now
-    return now - float(config.get('last_update_check') or 0) >= UPDATE_CHECK_DAYS * 86400
+    return now - float(config.get('last_update_check') or 0) >= days * 86400
 
 
 def remember_update_check():
@@ -3583,7 +3760,7 @@ class InstallDialog(tk.Toplevel):
 
     def __init__(self, root, title, message, buttons, note='', icon=None, checkbox=None):
         super().__init__(root)
-        self.root, self.choice = root, None
+        self.root, self.choice, self.message = root, None, message
         self.title(title)
         self.resizable(False, False)
         self.transient(root)
@@ -3634,6 +3811,319 @@ class InstallDialog(tk.Toplevel):
         return self.choice
 
 
+def _scaled_font(root, name, factor=1.0, **options):
+    """A copy of the Tk font `name` (e.g. 'TkDefaultFont'), its size multiplied by factor."""
+    base = tkfont.nametofont(name, root=root).actual()
+    size = int(round(base['size'] * factor)) or base['size']  # a negative size is in pixels: keeps its sign
+    return tkfont.Font(root=root, family=base['family'], size=size, **options)
+
+
+def _center_on(window, root):
+    """Place a new window over the middle of the main window."""
+    window.update_idletasks()
+    x = root.winfo_rootx() + max(0, (root.winfo_width() - window.winfo_reqwidth()) // 2)
+    y = root.winfo_rooty() + max(0, (root.winfo_height() - window.winfo_reqheight()) // 3)
+    window.geometry(f"+{x}+{y}")
+
+
+class AboutWindow(tk.Toplevel):
+    """The About window: the icon, name and version, the web site and the credits."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.title(f"About {APP_NAME}")
+        self.resizable(False, False)
+        self.transient(app.root)
+        frame = ttk.Frame(self, padding=(36, 24, 36, 20))
+        frame.pack(fill=tk.BOTH, expand=True)
+        self.icon = make_dialog_icon(app.root, size=128)
+        self.icon_label = None
+        if self.icon is not None:
+            self.icon_label = ttk.Label(frame, image=self.icon)
+            self.icon_label.pack(pady=(0, 12))
+        self.fonts = (_scaled_font(app.root, 'TkDefaultFont', 1.6, weight='bold'),
+                      _scaled_font(app.root, 'TkDefaultFont', underline=True),
+                      _scaled_font(app.root, 'TkDefaultFont', 0.85))
+        title_font, link_font, small_font = self.fonts
+        ttk.Label(frame, text=APP_NAME, font=title_font).pack()
+        ttk.Label(frame, text=f"Version {APP_VERSION}").pack(pady=(2, 0))
+        ttk.Label(frame, text="A MATLAB Command Window emulator").pack(pady=(10, 0))
+        self.link = ttk.Label(frame, text=APP_WEBSITE.split('://', 1)[-1], font=link_font,
+                              foreground='#2a6fdb', cursor='hand2')
+        self.link.pack(pady=(2, 0))
+        self.link.bind('<Button-1>', lambda event: webbrowser.open(APP_WEBSITE))
+        credits = APP_CREDITS.replace(' with ', '\nwith ', 1)  # two lines: author, then the tools
+        self.credits = ttk.Label(frame, text=credits, justify=tk.CENTER, wraplength=420)
+        self.credits.pack(pady=(16, 0))
+        versions = (f"Python {sys.version.split()[0]}  ·  NumPy {np.__version__}  ·  "
+                    f"Tk {app.root.tk.call('info', 'patchlevel')}")
+        ttk.Label(frame, text=versions, font=small_font, foreground='gray').pack(pady=(16, 0))
+        ok = ttk.Button(frame, text="OK", command=self.destroy)
+        ok.pack(pady=(18, 0))
+        ok.focus_set()
+        self.bind('<Return>', lambda event: self.destroy())
+        self.bind('<Escape>', lambda event: self.destroy())
+        _center_on(self, app.root)
+
+    def text(self):
+        """All text shown in the window (for tests)."""
+        texts = []
+
+        def collect(widget):
+            if isinstance(widget, ttk.Label) and widget.cget('text'):
+                texts.append(str(widget.cget('text')))
+            for child in widget.winfo_children():
+                collect(child)
+        collect(self)
+        return '\n'.join(texts)
+
+
+def app_help_text(mac):
+    """Text of the Help window. '## ' starts a heading, '- ' an item, 4 spaces a line of code."""
+    settings = f"{APP_NAME} > Settings" if mac else "File > Settings"
+    key = "Cmd" if mac else "Ctrl"
+    keys = (("Enter", "run the command"), ("Up, Down", "earlier commands"), ("Home", "start of the command"),
+            (f"{key} +, {key} -", f"larger or smaller font ({key} 0: the default size)"),
+            (f"{key} O, {key} S", "open a script, save the session"))
+    keyboard = '\n'.join(f"    {keys_:<18}  {meaning}" for keys_, meaning in keys)
+    return f"""## {APP_NAME} {APP_VERSION}
+{APP_NAME} is a calculator that works like the Command Window of MATLAB. Type a command
+after the >> prompt and press Enter: the result appears below it, and the variables you
+create are kept for the next commands.
+
+    >> r = 2;
+    >> area = pi * r^2
+    >> v = [1 2 3] .^ 2
+
+## Help in the Command Window
+The help command describes everything {APP_NAME} can do, the same way as in MATLAB:
+
+    help          lists all commands, operators and functions
+    help round    the help of one function or command, e.g. round
+    help ops      the operators and special characters
+
+## What it can do
+- Numbers and matrices: every value is a matrix. Write row vectors as [1 2 3], column
+  vectors as [1; 2; 3], matrices as [1 2; 3 4] and ranges as 1:5 or 0:0.1:1.
+- Operators: matrix operators (* / \\ ^ ') and element-wise operators (.* ./ .^),
+  comparisons and logical operators, with MATLAB's order of operations.
+- Variables: x = 5 stores a value, and a result that is not stored goes to ans. A
+  semicolon at the end of a command hides its output; commas or semicolons separate
+  several commands on one line.
+- Indexing: A(2,3), A(end, :) and v(2:end) take elements, rows and columns; A(2,3) = 5
+  changes an element, A(A > 2) selects the elements that meet a condition, and find
+  gives their positions.
+- Functions: elementary math, trigonometric and hyperbolic functions, rounding and
+  remainders, statistics (max, min, mean, median, std), random numbers, and functions
+  that create and reshape matrices. Some give several results: [m, i] = max(v).
+- Text and files: 'text' in quotes, disp and fprintf to show results, and fopen,
+  fprintf, fscanf and fclose to write and read text files.
+- Workspace: format short and format long set the number of decimals shown, whos lists
+  the variables, clear removes them and clc clears the window.
+
+## Menus
+- File > Open runs the commands of a script (.m file) one line at a time, as if they
+  were typed, and shows their results. While it runs, the current folder is the
+  folder of the script, so it finds its data files.
+- File > Save writes the commands of this session to a .m file, one per line, so that
+  File > Open can run them again later.
+- {settings} sets the font of the Command Window, the number format at the start and
+  how often to look for new versions.
+- Help > Check for Updates looks for a new version on GitHub right away.
+
+## Keyboard
+{keyboard}
+
+## More information
+The description, the version history and the source code are on GitHub:
+{APP_WEBSITE}
+"""
+
+
+def help_blocks(text):
+    """Split app_help_text() into ('heading' | 'text' | 'item' | 'code' | 'gap', text) blocks."""
+    blocks = []
+    for line in text.splitlines():
+        if not line.strip():
+            blocks.append(('gap', ''))
+        elif line.startswith('## '):
+            blocks.append(('heading', line[3:]))
+        elif line.startswith('    '):
+            blocks.append(('code', line[4:]))
+        elif line.startswith('- '):
+            blocks.append(('item', line[2:]))
+        elif blocks and (blocks[-1][0] == 'text' or (blocks[-1][0] == 'item' and line.startswith('  '))):
+            blocks[-1] = (blocks[-1][0], blocks[-1][1] + ' ' + line.strip())  # wrapped line of a paragraph
+        else:
+            blocks.append(('text', line))
+    return blocks
+
+
+class HelpWindow(tk.Toplevel):
+    """The Help window (Help > Matlab_Calc Help): what the program does and how to get more help."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.title(f"{APP_NAME} Help")
+        self.geometry("660x560")
+        self.minsize(380, 260)
+        frame = ttk.Frame(self, padding=(12, 12, 12, 10))
+        frame.pack(fill=tk.BOTH, expand=True)
+        self.fonts = (_scaled_font(app.root, 'TkDefaultFont'),
+                      _scaled_font(app.root, 'TkDefaultFont', 1.25, weight='bold'),
+                      tkfont.Font(root=app.root, family=app.console_font.cget('family'),
+                                  size=max(FONT_SIZE_LIMITS[0], FONT_SIZE - 1)))
+        body, heading, code = self.fonts
+        self.text_area = scrolledtext.ScrolledText(frame, wrap=tk.WORD, font=body, padx=14, pady=10,
+                                                   relief=tk.FLAT, borderwidth=0, highlightthickness=0)
+        self.text_area.pack(fill=tk.BOTH, expand=True)
+        indent = body.measure('    ')
+        self.text_area.tag_configure('heading', font=heading, spacing1=6, spacing3=4)
+        self.text_area.tag_configure('code', font=code, lmargin1=indent, lmargin2=indent)
+        self.text_area.tag_configure('item', lmargin1=indent // 2, lmargin2=indent // 2 + body.measure('•  '),
+                                     spacing3=3)
+        for kind, line in help_blocks(app_help_text(app.mac_menus)):
+            if kind == 'gap':
+                self.text_area.insert(tk.END, '\n')
+            elif kind == 'item':
+                self.text_area.insert(tk.END, '•  ' + line + '\n', 'item')
+            else:
+                self.text_area.insert(tk.END, line + '\n', kind if kind != 'text' else ())
+        self.text_area.configure(state=tk.DISABLED)  # read-only, but the text can still be selected
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, pady=(10, 0))
+        self.list_button = ttk.Button(row, text="List Commands and Functions", command=self.list_functions)
+        self.list_button.pack(side=tk.LEFT)
+        ttk.Button(row, text="Close", command=self.destroy).pack(side=tk.RIGHT)
+        self.bind('<Escape>', lambda event: self.destroy())
+        _center_on(self, app.root)
+
+    def list_functions(self):
+        """Run 'help' in the Command Window, which lists every command and function."""
+        self.app.root.lift()
+        self.app.output_area.focus_set()
+        self.app.run_typed('help', keep_input=True)
+
+
+class SettingsDialog(tk.Toplevel):
+    """Settings: the font of the Command Window, the number format and the update checks.
+
+    The choices are kept in CONFIG_FILE and used again at the next start.
+    """
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app, self.saved = app, user_settings()
+        self.title("Settings")
+        self.resizable(False, False)
+        self.transient(app.root)
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Command Window font, with a preview
+        box = ttk.LabelFrame(frame, text="Command Window", padding=(12, 8))
+        box.pack(fill=tk.X)
+        self.family = tk.StringVar(self, value=app.console_font.cget('family'))
+        self.size = tk.StringVar(self, value=str(app.font_size()))
+        families = monospace_families(app.root)
+        if self.family.get() not in families:
+            families = sorted(families + [self.family.get()], key=str.lower)
+        ttk.Label(box, text="Font:").grid(row=0, column=0, sticky=tk.W)
+        self.family_box = ttk.Combobox(box, textvariable=self.family, values=families, state='readonly', width=26)
+        self.family_box.grid(row=0, column=1, sticky=tk.W, padx=(8, 16))
+        ttk.Label(box, text="Size:").grid(row=0, column=2, sticky=tk.W)
+        low, high = FONT_SIZE_LIMITS
+        self.size_box = ttk.Spinbox(box, textvariable=self.size, from_=low, to=high, increment=1, width=4)
+        self.size_box.grid(row=0, column=3, sticky=tk.W, padx=(8, 0))
+        self.preview_font = tkfont.Font(root=app.root, family=self.family.get(), size=app.font_size())
+        self.preview = tk.Label(box, text=f"{PROMPT}A = [1 2; 3 4] / 3\nA =\n    0.3333   0.6667\n    1.0000   1.3333",
+                                font=self.preview_font, bg=BACKGROUND_COLOR, fg=TEXT_COLOR, justify=tk.LEFT,
+                                anchor=tk.NW, padx=10, pady=8, width=36, height=4)
+        self.preview.grid(row=1, column=0, columnspan=4, sticky=tk.EW, pady=(10, 2))
+        ttk.Label(box, text=f"{'Cmd' if app.mac_menus else 'Ctrl'} + and {'Cmd' if app.mac_menus else 'Ctrl'} - "
+                            "change the size in the Command Window too.",
+                  foreground='gray').grid(row=2, column=0, columnspan=4, sticky=tk.W)
+        self.family.trace_add('write', self._update_preview)
+        self.size.trace_add('write', self._update_preview)
+
+        # Number format at the start
+        box = ttk.LabelFrame(frame, text="Numbers", padding=(12, 8))
+        box.pack(fill=tk.X, pady=(12, 0))
+        self.number_format = tk.StringVar(self, value=self.saved['number_format'])
+        ttk.Label(box, text="Format at the start:").grid(row=0, column=0, sticky=tk.W, columnspan=2)
+        for row, (mode, decimals) in enumerate((('short', SHORT_DECIMALS), ('long', LONG_DECIMALS)), 1):
+            ttk.Radiobutton(box, text=f"{mode}: up to {decimals} decimals (format {mode})", value=mode,
+                            variable=self.number_format).grid(row=row, column=0, sticky=tk.W, padx=(12, 0))
+
+        # Updates
+        box = ttk.LabelFrame(frame, text="Updates", padding=(12, 8))
+        box.pack(fill=tk.X, pady=(12, 0))
+        self.check_updates = tk.BooleanVar(self, value=self.saved['check_updates'])
+        self.update_days = tk.StringVar(self, value=str(self.saved['update_check_days']))
+        ttk.Checkbutton(box, text="Look for new versions on GitHub every", variable=self.check_updates,
+                        command=self._update_days_state).grid(row=0, column=0, sticky=tk.W)
+        self.days_box = ttk.Spinbox(box, textvariable=self.update_days, from_=1, to=365, increment=1, width=4)
+        self.days_box.grid(row=0, column=1, padx=(6, 6))
+        ttk.Label(box, text="days").grid(row=0, column=2, sticky=tk.W)
+        last = load_config().get('last_update_check')
+        when = time.strftime('%Y-%m-%d %H:%M', time.localtime(float(last))) if last else "not yet"
+        ttk.Label(box, text=f"Last looked: {when}.  Help > Check for Updates looks now.",
+                  foreground='gray').grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(4, 0))
+        self._update_days_state()
+
+        # Buttons
+        row = ttk.Frame(frame)
+        row.pack(fill=tk.X, pady=(16, 0))
+        ttk.Button(row, text="Restore Defaults", command=self.restore_defaults).pack(side=tk.LEFT)
+        self.ok_button = ttk.Button(row, text="OK", command=self.ok)
+        self.ok_button.pack(side=tk.RIGHT)
+        ttk.Button(row, text="Cancel", command=self.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+        self.bind('<Return>', lambda event: self.ok())
+        self.bind('<Escape>', lambda event: self.destroy())
+        self.ok_button.focus_set()
+        _center_on(self, app.root)
+
+    def chosen(self):
+        """The settings as chosen in the window."""
+        try:
+            days = min(365, max(1, int(float(self.update_days.get()))))
+        except ValueError:
+            days = self.saved['update_check_days']
+        return {'font_family': self.family.get(),
+                'font_size': clamp_font_size(self.size.get(), self.app.font_size()),
+                'number_format': self.number_format.get(),
+                'check_updates': self.check_updates.get(),
+                'update_check_days': days}
+
+    def _update_preview(self, *args):
+        chosen = self.chosen()
+        self.preview_font.configure(family=chosen['font_family'], size=chosen['font_size'])
+
+    def _update_days_state(self):
+        self.days_box.state(['!disabled'] if self.check_updates.get() else ['disabled'])
+
+    def restore_defaults(self):
+        defaults = default_settings()
+        self.family.set(pick_font_family(self.app.root))
+        self.size.set(str(defaults['font_size']))
+        self.number_format.set(defaults['number_format'])
+        self.check_updates.set(defaults['check_updates'])
+        self.update_days.set(str(defaults['update_check_days']))
+        self._update_days_state()
+
+    def ok(self):
+        """Use and keep the chosen settings."""
+        chosen = self.chosen()
+        if chosen['font_family'].lower() == pick_font_family(self.app.root).lower():
+            chosen['font_family'] = None  # the default font: follows FONT_FAMILIES
+        store_settings(chosen)
+        self.app.apply_font(chosen['font_family'], chosen['font_size'])
+        if chosen['number_format'] != self.saved['number_format']:
+            self.app.engine.format_mode = chosen['number_format']  # also for this session
+        self.destroy()
+
+
 class MatlabConsoleApp:
     def __init__(self, root):
         self.root = root
@@ -3650,16 +4140,25 @@ class MatlabConsoleApp:
                 pass
 
         self.engine = MatlabEngine()
-        self.history = []
+        self.history = []      # every command of the session, in order (File > Save writes them)
         self.history_idx = 0
+        self.windows = {}      # the open About, Help and Settings windows
+        self.closed = False    # set when 'exit' (or File > Quit) has closed the window
+        self.script_file = None   # the .m file opened or saved last: the file dialogs start in its folder
+        self.session_file = None  # the file File > Save wrote last: offered again as the file name
+        self._looking_for_update = False
 
-        family = pick_font_family(root)
+        settings = user_settings()  # chosen in the Settings window, else the parameters at the top
+        self.engine.format_mode = settings['number_format']
+        family = installed_font_family(root, settings['font_family']) or pick_font_family(root)
+        self.console_font = tkfont.Font(root=root, family=family, size=settings['font_size'])
+        self.prompt_font = tkfont.Font(root=root, family=family, size=settings['font_size'], weight='bold')
         self.output_area = ConsoleText(
-            root, wrap=tk.WORD, font=(family, FONT_SIZE), bg=BACKGROUND_COLOR, fg=TEXT_COLOR,
+            root, wrap=tk.WORD, font=self.console_font, bg=BACKGROUND_COLOR, fg=TEXT_COLOR,
             insertbackground=CURSOR_COLOR, undo=False
         )
         self.output_area.pack(padx=WINDOW_PADDING, pady=WINDOW_PADDING, fill=tk.BOTH, expand=True)
-        self.output_area.tag_configure("prompt", foreground=PROMPT_COLOR, font=(family, FONT_SIZE, "bold"))
+        self.output_area.tag_configure("prompt", foreground=PROMPT_COLOR, font=self.prompt_font)
 
         self.output_area.bind("<Return>", self.process_command)
         self.output_area.bind("<KP_Enter>", self.process_command)
@@ -3669,6 +4168,10 @@ class MatlabConsoleApp:
         self.output_area.bind("<Home>", self.on_home)
         self.output_area.bind("<Key>", self.on_key)
         self.output_area.bind("<<Paste>>", self.on_paste)
+
+        self.mac_menus = root.tk.call('tk', 'windowingsystem') == 'aqua'
+        self.build_menus()
+        self.bind_shortcuts()
 
         self.write_output(
             f"{APP_NAME} {APP_VERSION} - MATLAB Syntax Calculator\n"
@@ -3725,6 +4228,208 @@ class MatlabConsoleApp:
         if self.output_area.compare(tk.INSERT, "<", "input_start"):
             self.output_area.mark_set(tk.INSERT, tk.END)
 
+
+    # ---- menus -----------------------------------------------------------------
+    def build_menus(self):
+        """The menu bar. On macOS the system makes the application menu (About, Settings, Quit).
+
+        macOS   File: Open, Save   Edit   Window   Help: Matlab_Calc Help, Check for Updates
+        Linux   File: Open, Save, Settings, Quit   Edit   Help: Matlab_Calc Help, Check for Updates, About
+        """
+        mac = self.mac_menus
+        key = "Command-" if mac else "Ctrl+"  # shown next to the items; bind_shortcuts() makes them work
+        menubar = tk.Menu(self.root, tearoff=False)
+        self.menus = {'bar': menubar}
+
+        file_menu = self.menus['file'] = tk.Menu(menubar, tearoff=False)
+        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Open\u2026", accelerator=key + "O", command=self.open_script)
+        file_menu.add_command(label="Save\u2026", accelerator=key + "S", command=self.save_session)
+        if not mac:
+            file_menu.add_separator()
+            file_menu.add_command(label="Settings\u2026", command=self.show_settings)
+            file_menu.add_separator()
+            file_menu.add_command(label="Quit", accelerator=key + "Q", command=self.quit)
+
+        edit_menu = self.menus['edit'] = tk.Menu(menubar, tearoff=False)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+        for label, event, letter in (("Cut", "<<Cut>>", "X"), ("Copy", "<<Copy>>", "C"),
+                                     ("Paste", "<<Paste>>", "V"), ("Select All", "<<SelectAll>>", "A")):
+            edit_menu.add_command(label=label, accelerator=key + letter,
+                                  command=lambda event=event: self._edit(event))
+
+        if mac:  # the system fills the Window menu (Minimize, Zoom, ...)
+            self.menus['window'] = tk.Menu(menubar, name='window', tearoff=False)
+            menubar.add_cascade(label="Window", menu=self.menus['window'])
+
+        help_menu = self.menus['help'] = tk.Menu(menubar, name='help', tearoff=False)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        # On macOS the system puts "<application name> Help" at the top of the Help menu, which
+        # runs ::tk::mac::ShowHelp; it says "Python Help" if the name could not be set.
+        if not mac or not MAC_APP_NAME_SET:
+            help_menu.add_command(label=f"{APP_NAME} Help", accelerator="" if mac else "F1",
+                                  command=self.show_help)
+        help_menu.add_command(label="Check for Updates\u2026", command=self.check_for_update_now)
+        if not mac:
+            help_menu.add_separator()
+            help_menu.add_command(label=f"About {APP_NAME}", command=self.show_about)
+        self.root.configure(menu=menubar)
+
+        if mac:  # items of the application menu and the Help menu that the system makes
+            self.root.createcommand('tkAboutDialog', self.show_about)
+            self.root.createcommand('::tk::mac::ShowPreferences', self.show_settings)
+            self.root.createcommand('::tk::mac::ShowHelp', self.show_help)
+
+    def bind_shortcuts(self):
+        """Keyboard shortcuts of the menu items (Cmd on macOS, Ctrl elsewhere) and of the font size."""
+        modifier = 'Command' if self.mac_menus else 'Control'
+        actions = {'o': self.open_script, 's': self.save_session,
+                   'plus': lambda: self.change_font_size(1), 'equal': lambda: self.change_font_size(1),
+                   'KP_Add': lambda: self.change_font_size(1), 'minus': lambda: self.change_font_size(-1),
+                   'KP_Subtract': lambda: self.change_font_size(-1), '0': lambda: self.change_font_size(0)}
+        if not self.mac_menus:  # on macOS the system handles Cmd+Q and Cmd+A selects all already
+            actions.update(q=self.quit, a=lambda: self._edit('<<SelectAll>>'))
+        for keysym, action in actions.items():
+            keysyms = (keysym, keysym.upper()) if len(keysym) == 1 and keysym.isalpha() else (keysym,)
+            for name in keysyms:  # also with Caps Lock on
+                for widget in (self.output_area, self.root):  # the text widget first: Tk has Ctrl+O there
+                    try:
+                        widget.bind(f'<{modifier}-{name}>', lambda event, action=action: self._shortcut(action))
+                    except tk.TclError:
+                        pass
+        if not self.mac_menus:
+            self.root.bind('<F1>', lambda event: self._shortcut(self.show_help))
+            self.output_area.bind('<F1>', lambda event: self._shortcut(self.show_help))
+
+    def _shortcut(self, action):
+        action()
+        return "break"
+
+    def _edit(self, event):
+        """Edit menu: send <<Copy>>, <<Paste>>, ... to the text that has the keyboard focus."""
+        widget = self.root.focus_get()
+        if not isinstance(widget, (tk.Text, tk.Entry, ttk.Entry)):
+            widget = self.output_area
+        widget.event_generate(event)
+
+    def _show_window(self, name, window_class):
+        """Bring the About, Help or Settings window to the front, opening it if needed."""
+        window = self.windows.get(name)
+        if window is not None and window.winfo_exists():
+            window.deiconify()
+            window.lift()
+            window.focus_set()
+            return window
+        window = self.windows[name] = window_class(self)
+        return window
+
+    def show_about(self):
+        return self._show_window('about', AboutWindow)
+
+    def show_help(self):
+        return self._show_window('help', HelpWindow)
+
+    def show_settings(self):
+        return self._show_window('settings', SettingsDialog)
+
+    def quit(self):
+        """File > Quit (Linux): close the window and end the program."""
+        self.closed = True
+        self.root.destroy()
+
+    # ---- font ------------------------------------------------------------------
+    def font_size(self):
+        return int(self.console_font.cget('size'))
+
+    def apply_font(self, family=None, size=None):
+        """Use another font family and/or size in the Command Window (family None: the default)."""
+        family = installed_font_family(self.root, family) or (
+            pick_font_family(self.root) if family is None else self.console_font.cget('family'))
+        size = clamp_font_size(size, self.font_size()) if size is not None else self.font_size()
+        for font in (self.console_font, self.prompt_font):
+            font.configure(family=family, size=size)
+        self.output_area.see(tk.INSERT)
+
+    def change_font_size(self, step):
+        """Ctrl/Cmd + and -: a larger or smaller font; step 0 goes back to the default size. It is kept."""
+        size = FONT_SIZE if step == 0 else clamp_font_size(self.font_size() + step)
+        self.apply_font(self.console_font.cget('family'), size)
+        settings = user_settings()
+        settings['font_size'] = size
+        store_settings(settings)
+
+    # ---- File > Open and File > Save --------------------------------------------
+    def open_script(self, path=None):
+        """File > Open: run the commands of a .m file line by line, as if they were typed.
+
+        While it runs, the current folder is the folder of the file (as MATLAB's run does);
+        afterwards it is changed back, unless the script itself changed it with cd.
+        Returns False if the script closed the program with exit.
+        """
+        if path is None:
+            path = filedialog.askopenfilename(
+                parent=self.root, title="Open Script", initialdir=self._script_folder(),
+                filetypes=[("MATLAB scripts", "*" + SCRIPT_EXTENSION), ("Text files", "*.txt"), ("All files", "*")])
+            if not path:
+                return True
+        path = os.path.abspath(path)
+        try:
+            with open(path, encoding='utf-8-sig', errors='replace') as f:
+                text = f.read()
+        except OSError as err:
+            self.print_message(f"Error: Cannot open {path}: {err.strerror or err}.")
+            return True
+        self.script_file = path
+        typed = self.output_area.get("input_start", "end-1c")
+        before, folder = os.getcwd(), os.path.dirname(path)
+        try:
+            os.chdir(folder)
+        except OSError:
+            folder = None
+        try:
+            for _, command in script_commands(text):
+                if not self.run_typed(command):
+                    return False  # 'exit' in the script closed the window
+                self.output_area.update_idletasks()
+        finally:
+            if folder is not None and os.getcwd() == folder:
+                try:
+                    os.chdir(before)
+                except OSError:
+                    pass
+        self._replace_current_input(typed)
+        return True
+
+    def save_session(self, path=None):
+        """File > Save: write the commands of this session to a .m file, one per line."""
+        if not self.history:
+            InstallDialog(self.root, "Save Session", "There are no commands to save yet.\n\n"
+                          "File > Save writes the commands typed in this session to a script (.m file), "
+                          "which File > Open can run again.", [('ok', "OK")], icon=self.dialog_icon()).show()
+            return None
+        if path is None:
+            path = filedialog.asksaveasfilename(
+                parent=self.root, title="Save Session", initialdir=self._script_folder(),
+                initialfile=os.path.basename(self.session_file or "session" + SCRIPT_EXTENSION),
+                defaultextension=SCRIPT_EXTENSION,
+                filetypes=[("MATLAB scripts", "*" + SCRIPT_EXTENSION), ("All files", "*")])
+            if not path:
+                return None
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(session_script(self.history))
+        except OSError as err:
+            self.print_message(f"Error: Cannot save {path}: {err.strerror or err}.")
+            return None
+        self.script_file = self.session_file = os.path.abspath(path)
+        count = len(self.history)
+        self.print_message(f"Saved {count} command{'s' if count != 1 else ''} to {path}")
+        return path
+
+    def _script_folder(self):
+        folder = os.path.dirname(self.script_file) if self.script_file else os.getcwd()
+        return folder if os.path.isdir(folder) else os.getcwd()
+
     # ---- history -------------------------------------------------------------
     def _replace_current_input(self, text):
         self.output_area.delete("input_start", "end-1c")
@@ -3749,6 +4454,12 @@ class MatlabConsoleApp:
 
     # ---- execution -------------------------------------------------------------
     def process_command(self, event=None):
+        """Enter: run the command after the prompt."""
+        self._submit()
+        return "break"
+
+    def _submit(self):
+        """Run the text after the prompt. Returns False if it closed the application."""
         raw_cmd = self.output_area.get("input_start", "end-1c").strip()
         self.output_area.mark_set(tk.INSERT, tk.END)
         self.output_area.insert(tk.END, "\n")
@@ -3757,14 +4468,28 @@ class MatlabConsoleApp:
             self.history.append(raw_cmd)
             self.history_idx = len(self.history)
             if not self._execute_command(raw_cmd):
-                return "break"  # the window has been closed by 'exit'
+                return False  # the window has been closed by 'exit'
         self.show_prompt()
-        return "break"
+        return True
+
+    def run_typed(self, command, keep_input=False):
+        """Run command as if it had been typed after the prompt. Returns False if it closed the application.
+
+        keep_input: put back what had been typed at the prompt before.
+        """
+        typed = self.output_area.get("input_start", "end-1c")
+        self._replace_current_input(command)
+        if not self._submit():
+            return False
+        if keep_input:
+            self._replace_current_input(typed)
+        return True
 
     def _execute_command(self, raw_cmd):
         """Show the command's output. Returns False if it closed the application."""
         for chunk in self.engine.execute(raw_cmd):
             if chunk is EXIT_APP:
+                self.closed = True
                 self.root.destroy()  # ends mainloop(), so the program exits
                 return False
             if chunk is CLEAR_SCREEN:
@@ -3842,14 +4567,18 @@ class MatlabConsoleApp:
     def _weekly_checkbox(self, checked):
         """(label, variable) for the 'look for new versions' checkbox, or None if checks are off."""
         self.weekly = None
-        if UPDATE_CHECK_DAYS <= 0:
+        days = update_check_interval(dict(load_config(), check_updates=True))
+        if days <= 0:
             return None
         self.weekly = tk.BooleanVar(self.root, value=checked)
-        period = "every week" if UPDATE_CHECK_DAYS == 7 else f"every {UPDATE_CHECK_DAYS} days"
-        return (f"Look for new versions on GitHub {period}", self.weekly)
+        return (f"Look for new versions on GitHub {every_days_text(days)}", self.weekly)
 
-    def check_for_update(self, platform=None):
-        """Look for a new version on GitHub without blocking the window; offer it if there is one."""
+    def check_for_update(self, platform=None, interactive=False):
+        """Look for a new version on GitHub without blocking the window; offer it if there is one.
+
+        interactive (Help > Check for Updates): also say so when there is no new version or
+        GitHub cannot be reached, and offer a version the user skipped before.
+        """
         result = {}
 
         def look():  # runs in a background thread: no Tk calls here
@@ -3867,18 +4596,63 @@ class MatlabConsoleApp:
         def wait():
             if thread.is_alive():
                 self.root.after(200, wait)
-            elif 'latest' in result:
-                self.offer_update(result['latest'], platform)
+                return
+            if interactive:
+                self._busy(False)
+            if 'latest' in result:
+                (self.report_update if interactive else self.offer_update)(result['latest'], platform)
+            elif interactive:
+                self.update_message(f"Could not look for a new version.\n\n{result['error']}")
         self.root.after(200, wait)
         return thread
 
-    def offer_update(self, latest, platform=None):
-        """Ask whether to install the newer version found on GitHub; install it and offer a restart."""
+    def check_for_update_now(self, platform=None):
+        """Help > Check for Updates: look on GitHub now and say what was found."""
+        if self._looking_for_update:
+            return None
+        self._busy(True)
+        return self.check_for_update(platform, interactive=True)
+
+    def _busy(self, busy):
+        self._looking_for_update = busy
+        try:
+            self.root.configure(cursor='watch' if busy else '')
+            self.output_area.configure(cursor='watch' if busy else 'xterm')
+        except tk.TclError:
+            pass
+
+    def report_update(self, latest, platform=None):
+        """Answer Help > Check for Updates: offer the new version, or say that there is none."""
+        installed = installed_copy(platform)
+        if installed is not None and is_newer(latest['version'], installed['version']):
+            self.offer_update(latest, platform, asked=True)
+            return
+        remember_update_check()
+        if installed is None and is_newer(latest['version'], APP_VERSION):
+            choice = self.update_message(
+                f"{APP_NAME} {latest['version']} is available on GitHub; you are using version {APP_VERSION}.\n\n"
+                f"Only an installed {APP_NAME} updates itself (see help install). You can also download "
+                "the new version from GitHub.", [('github', "Open GitHub Page"), ('ok', "Close")])
+            if choice == 'github':
+                webbrowser.open(APP_WEBSITE)
+            return
+        current = installed['version'] if installed is not None else APP_VERSION
+        self.update_message(f"{APP_NAME} {current} is up to date.\n\n"
+                            f"The newest version on GitHub is {latest['version']}.")
+
+    def update_message(self, message, buttons=(('ok', "OK"),)):
+        return InstallDialog(self.root, "Check for Updates", message, list(buttons), icon=self.dialog_icon()).show()
+
+    def offer_update(self, latest, platform=None, asked=False):
+        """Ask whether to install the newer version found on GitHub; install it and offer a restart.
+
+        asked: the user chose Check for Updates, so a version skipped before is offered too.
+        """
         remember_update_check()
         config = load_config()
         installed = installed_copy(platform)
         if (installed is None or not is_newer(latest['version'], installed['version'])
-                or config.get('skipped_version') == latest['version']):
+                or (not asked and config.get('skipped_version') == latest['version'])):
             return
         icon = self.dialog_icon()
         choice = InstallDialog(
@@ -3915,7 +4689,9 @@ class MatlabConsoleApp:
     def print_message(self, text):
         """Show text above the prompt, as if a command had printed it; typed input is kept."""
         typed = self.output_area.get("input_start", "end-1c")
-        self.output_area.delete_raw("input_start linestart", "end")
+        self.output_area.delete_raw(f"input_start - {len(PROMPT)} chars", "end")  # the prompt line
+        if self.output_area.get("end-2c", "end-1c") not in ("\n", ""):  # after fprintf output without \n
+            self.output_area.insert(tk.END, "\n")
         self.write_output(_indent(text))
         self.show_prompt()
         self.output_area.insert("input_start", typed)

@@ -1138,6 +1138,320 @@ class TestInstallation(InstallationCase):
             root.destroy()
 
 
+class TestScripts(unittest.TestCase):
+    """Reading .m files (File > Open) and writing the session (File > Save), without a window."""
+
+    def test_script_commands(self):
+        text = ("% a comment line\n"
+                "a = 1;   % set a\n"
+                "\n"
+                "B = [1 2\n"
+                "     3 4]\n"
+                "s = 'it''s ... [ not code';\n"
+                "c = [1, 2, ...\n"
+                "     3]\n"
+                "  % indented comment\n"
+                "x = '[', y = 2\r\n"
+                "e = [1 2\n")
+        self.assertEqual(mc.script_commands(text), [
+            (2, 'a = 1;   % set a'), (4, 'B = [1 2\n     3 4]'), (6, "s = 'it''s ... [ not code';"),
+            (7, 'c = [1, 2, ...\n     3]'), (10, "x = '[', y = 2"), (11, 'e = [1 2')])
+        self.assertEqual(mc.script_commands(''), [])
+        eng = mc.MatlabEngine()
+        for _, command in mc.script_commands(text)[:5]:
+            eng.execute(command)
+            self.assertIsNone(eng.last_error, command)
+        self.assertEqual(eng.variables['B'].tolist(), [[1, 2], [3, 4]])
+        self.assertEqual(eng.variables['c'].tolist(), [[1, 2, 3]])
+
+    def test_session_script(self):
+        text = mc.session_script(['a = 1', 'B = [1 2\n3 4]', 'disp(a)  '])
+        lines = text.splitlines()
+        self.assertTrue(lines[0].startswith(f'% {mc.APP_NAME} {mc.APP_VERSION} session, saved '))
+        self.assertEqual(lines[1:], ['a = 1', 'B = [1 2', '3 4]', 'disp(a)'])
+        self.assertEqual([c for _, c in mc.script_commands(text)], ['a = 1', 'B = [1 2\n3 4]', 'disp(a)'])
+
+
+class TestSettings(unittest.TestCase):
+    """The settings of the Settings window, kept in the settings file."""
+
+    def setUp(self):
+        self.saved = mc.CONFIG_FILE, mc.UPDATE_CHECK_DAYS
+        self.tmp = tempfile.mkdtemp()
+        mc.CONFIG_FILE = os.path.join(self.tmp, '.matlab_calc.json')
+
+    def tearDown(self):
+        mc.CONFIG_FILE, mc.UPDATE_CHECK_DAYS = self.saved
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_defaults_and_storing(self):
+        defaults = mc.user_settings()
+        self.assertEqual(defaults, mc.default_settings())
+        self.assertEqual(defaults['font_size'], mc.FONT_SIZE)
+        mc.store_settings(dict(defaults, font_size=15, number_format='long', update_check_days=3))
+        config = mc.load_config()
+        self.assertEqual((config['font_size'], config['number_format'], config['update_check_days']), (15, 'long', 3))
+        self.assertNotIn('check_updates', config)             # unchanged values are not stored
+        self.assertEqual(mc.update_check_interval(config), 3)
+        mc.store_settings(dict(mc.user_settings(), check_updates=False))
+        self.assertEqual(mc.update_check_interval(mc.load_config()), 0)
+        self.assertEqual(mc.user_settings()['update_check_days'], 3)  # remembered while turned off
+        mc.store_settings(mc.default_settings())
+        self.assertEqual(mc.load_config(), {})
+
+    def test_invalid_values_are_ignored(self):
+        mc.save_config({'font_size': 'big', 'number_format': 'huge', 'update_check_days': 'x', 'font_family': ' '})
+        self.assertEqual(mc.user_settings(), mc.default_settings())
+        mc.save_config({'font_size': 1000})
+        self.assertEqual(mc.user_settings()['font_size'], mc.FONT_SIZE_LIMITS[1])
+
+    def test_update_checks_turned_on_when_the_parameter_is_zero(self):
+        mc.UPDATE_CHECK_DAYS = 0
+        self.assertFalse(mc.user_settings()['check_updates'])
+        mc.store_settings(dict(mc.user_settings(), check_updates=True, update_check_days=7))
+        self.assertEqual(mc.update_check_interval(mc.load_config()), 7)
+        self.assertTrue(mc.update_check_due(mc.load_config()))
+
+
+class TestMenusAndWindows(InstallationCase):
+    """Menu bar, About, Help and Settings windows, and File > Open / Save, in a real window."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = make_root(visible=True)
+        self.app = mc.MatlabConsoleApp(self.root)
+        self.root.update()
+        self.text = self.app.output_area
+        self.cwd = os.getcwd()
+        self.folder = os.path.join(self.tmp, 'scripts')
+        os.makedirs(self.folder)
+        self.dialogs = []
+        self.original_show = mc.InstallDialog.show
+        mc.InstallDialog.show = lambda dialog: (self.dialogs.append((dialog.title(), dialog.message)),
+                                                dialog.destroy())[0] and None
+
+    def tearDown(self):
+        mc.InstallDialog.show = self.original_show
+        os.chdir(self.cwd)
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass  # closed by the test
+        gc.collect()
+        super().tearDown()
+
+    def labels(self, menu):
+        return [menu.entrycget(i, 'label') for i in range(menu.index('end') + 1) if menu.type(i) == 'command']
+
+    def invoke(self, menu, label):
+        menu = self.app.menus[menu]
+        menu.invoke(next(i for i in range(menu.index('end') + 1)
+                         if menu.type(i) == 'command' and menu.entrycget(i, 'label') == label))
+
+    def cascades(self):
+        bar = self.app.menus['bar']
+        return [bar.entrycget(i, 'label') for i in range(bar.index('end') + 1) if bar.type(i) == 'cascade']
+
+    def console(self):
+        return self.text.get('1.0', 'end-1c')
+
+    def write_script(self, name, text):
+        path = os.path.join(self.folder, name)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+        return path
+
+    def test_linux_menus(self):
+        if self.app.mac_menus:                          # running on macOS: build the Linux layout
+            self.app.mac_menus = False
+            self.app.build_menus()
+            self.app.bind_shortcuts()
+        menus = self.app.menus
+        self.assertEqual(self.labels(menus['file']), ['Open…', 'Save…', 'Settings…', 'Quit'])
+        self.assertEqual(self.labels(menus['edit']), ['Cut', 'Copy', 'Paste', 'Select All'])
+        self.assertEqual(self.labels(menus['help']),
+                         [f'{mc.APP_NAME} Help', 'Check for Updates…', f'About {mc.APP_NAME}'])
+        self.assertEqual(self.cascades(), ['File', 'Edit', 'Help'])
+        self.assertEqual(menus['file'].entrycget(0, 'accelerator'), 'Ctrl+O')
+        for key in ('<Control-o>', '<Control-s>', '<Control-q>', '<Control-plus>', '<Control-minus>', '<F1>'):
+            self.assertTrue(self.text.bind(key), key)
+
+    def test_mac_menus(self):
+        self.app.mac_menus = True                       # the layout used with macOS (Aqua) Tk
+        self.app.build_menus()
+        menus = self.app.menus
+        self.assertEqual(self.labels(menus['file']), ['Open…', 'Save…'])
+        self.assertEqual(menus['file'].entrycget(0, 'accelerator'), 'Command-O')
+        self.assertIn('Check for Updates…', self.labels(menus['help']))
+        self.assertNotIn(f'About {mc.APP_NAME}', self.labels(menus['help']))
+        self.assertEqual(self.cascades(), ['File', 'Edit', 'Window', 'Help'])
+        # The application menu's About and Settings items, and the system's Help item, call these:
+        self.root.tk.call('tkAboutDialog')
+        self.root.tk.call('::tk::mac::ShowPreferences')
+        self.root.tk.call('::tk::mac::ShowHelp')
+        self.assertEqual(sorted(self.app.windows), ['about', 'help', 'settings'])
+
+    def test_about_window(self):
+        if self.app.mac_menus:
+            self.root.tk.call('tkAboutDialog')            # Matlab_Calc > About Matlab_Calc
+        else:
+            self.invoke('help', f'About {mc.APP_NAME}')
+        about = self.app.windows['about']
+        self.root.update()
+        shown = about.text()
+        for part in (mc.APP_NAME, f'Version {mc.APP_VERSION}', 'github.com/varallyay/matlab_calc',
+                     'Developed by Zoltan Varallyay, PhD', 'with the help of AI technology (Antigravity, Claude)'):
+            self.assertIn(part, shown)
+        self.assertEqual(' '.join(shown.split()).count(' '.join(mc.APP_CREDITS.split())), 1)
+        self.assertEqual(about.title(), f'About {mc.APP_NAME}')
+        if os.path.isfile(ICON):
+            self.assertIsNotNone(about.icon_label)
+        opened = []
+        saved = mc.webbrowser.open
+        mc.webbrowser.open = opened.append
+        try:
+            about.link.event_generate('<Button-1>')
+        finally:
+            mc.webbrowser.open = saved
+        self.assertEqual(opened, [mc.APP_WEBSITE])
+        self.assertIs(self.app.show_about(), about)    # a second click shows the same window
+
+    def test_help_window(self):
+        self.invoke('help', f'{mc.APP_NAME} Help')
+        window = self.app.windows['help']
+        content = window.text_area.get('1.0', 'end')
+        mac = self.app.mac_menus
+        for part in ('help round', 'help ops', 'File > Open', 'File > Save', 'Check for Updates', mc.APP_WEBSITE,
+                     f'{mc.APP_NAME} > Settings' if mac else 'File > Settings', 'Cmd +, Cmd -' if mac else 'Ctrl +, Ctrl -'):
+            self.assertIn(part, content)
+        self.assertIn('Cmd +, Cmd -', mc.app_help_text(mac=True))
+        self.assertIn(f'{mc.APP_NAME} > Settings', mc.app_help_text(mac=True))
+        self.text.insert('input_start', 'half typed')
+        window.list_button.invoke()                       # runs 'help' in the Command Window
+        self.assertIn('>> help\n', self.console())
+        self.assertIn('Console commands', self.console())
+        self.assertEqual(self.text.get('input_start', 'end-1c'), 'half typed')
+        kinds = {kind for kind, _ in mc.help_blocks(mc.app_help_text(False))}
+        self.assertEqual(kinds, {'heading', 'text', 'item', 'code', 'gap'})
+
+    def test_settings_window(self):
+        if self.app.mac_menus:
+            self.root.tk.call('::tk::mac::ShowPreferences')  # Matlab_Calc > Settings
+        else:
+            self.invoke('file', 'Settings…')
+        dialog = self.app.windows['settings']
+        self.assertIn(self.app.console_font.cget('family'), dialog.family_box.cget('values'))
+        dialog.size.set('16')
+        self.assertEqual(int(dialog.preview_font.cget('size')), 16)    # the preview follows
+        dialog.number_format.set('long')
+        dialog.check_updates.set(False)
+        dialog.ok()
+        self.assertEqual(self.app.font_size(), 16)
+        self.assertEqual(int(self.app.prompt_font.cget('size')), 16)
+        self.assertEqual(self.app.engine.format_mode, 'long')
+        config = self.config()
+        self.assertEqual((config['font_size'], config['number_format'], config['check_updates']), (16, 'long', False))
+        self.assertFalse(mc.update_check_due(config))
+        root2 = make_root()                               # the next start uses the settings
+        try:
+            app2 = mc.MatlabConsoleApp(root2)
+            self.assertEqual((app2.font_size(), app2.engine.format_mode), (16, 'long'))
+        finally:
+            root2.destroy()
+        dialog = self.app.show_settings()
+        dialog.size.set('20')
+        dialog.destroy()                                  # Cancel changes nothing
+        self.assertEqual(self.app.font_size(), 16)
+        dialog = self.app.show_settings()
+        dialog.restore_defaults()
+        dialog.ok()
+        self.assertEqual(self.app.font_size(), mc.FONT_SIZE)
+        self.assertEqual(self.app.console_font.cget('family'), mc.pick_font_family(self.root))
+        self.assertFalse(any(key in self.config() for key in mc.SETTING_KEYS))
+
+    def test_font_size_shortcuts(self):
+        self.app.change_font_size(1)
+        self.assertEqual(self.app.font_size(), mc.FONT_SIZE + 1)
+        self.assertEqual(self.config()['font_size'], mc.FONT_SIZE + 1)
+        self.app.change_font_size(-3)
+        self.assertEqual(self.app.font_size(), mc.FONT_SIZE - 2)
+        self.app.change_font_size(0)
+        self.assertEqual(self.app.font_size(), mc.FONT_SIZE)
+        self.assertNotIn('font_size', self.config())
+        for _ in range(100):
+            self.app.change_font_size(1)
+        self.assertEqual(self.app.font_size(), mc.FONT_SIZE_LIMITS[1])
+
+    def test_open_script(self):
+        with open(os.path.join(self.folder, 'data.txt'), 'w', encoding='utf-8') as f:
+            f.write('4 5 6\n')
+        path = self.write_script('demo.m', "% Demo script\n"
+                                           "a = 2 + 3\n"
+                                           "B = [1 2\n"
+                                           "     3 4];\n"
+                                           "\n"
+                                           "undefined_name + 1\n"
+                                           "fid = fopen('data.txt'); d = fscanf(fid, '%d')', fclose(fid);\n"
+                                           "fprintf('sum %d\\n', sum_of_d)   % an error: not defined\n"
+                                           "disp(a * 2)\n")
+        self.text.insert('input_start', 'typed')
+        self.assertTrue(self.app.open_script(path))
+        content = self.console()
+        self.assertIn('>> a = 2 + 3\na =\n    5\n', content)
+        self.assertIn('>> B = [1 2\n     3 4];\n>> undefined_name + 1\n', content)
+        self.assertIn("Unrecognized function or variable 'undefined_name'", content)
+        self.assertIn('d =\n    4   5   6\n', content)              # found next to the script
+        self.assertIn('>> disp(a * 2)\n    10\n', content)         # runs on after an error
+        self.assertNotIn('Demo script', content)                   # comment lines are not shown
+        self.assertEqual(self.text.get('input_start', 'end-1c'), 'typed')
+        self.assertEqual(os.getcwd(), self.cwd)                     # the current folder is back
+        self.assertEqual(self.app.engine.variables['B'].tolist(), [[1, 2], [3, 4]])
+        self.assertEqual(self.app.history[0], 'a = 2 + 3')
+        self.assertEqual(len(self.app.history), 6)
+
+    def test_script_that_changes_folder(self):
+        path = self.write_script('go.m', 'cd ..\n')
+        self.app.open_script(path)
+        self.assertEqual(os.path.realpath(os.getcwd()), os.path.realpath(self.tmp))  # kept, as in MATLAB
+
+    def test_open_missing_file(self):
+        self.app.open_script(os.path.join(self.folder, 'missing.m'))
+        self.assertIn('Error: Cannot open', self.console())
+        self.assertTrue(self.console().endswith(mc.PROMPT))
+
+    def test_save_session(self):
+        self.app.save_session(os.path.join(self.folder, 'empty.m'))   # nothing typed yet
+        self.assertEqual(self.dialogs[0][0], 'Save Session')
+        self.assertFalse(os.path.exists(os.path.join(self.folder, 'empty.m')))
+        for command in ('x = 3;', 'y = x ^ 2', 'z = [1 2', "fprintf('%d\\n', y)"):
+            self.app.run_typed(command)
+        path = os.path.join(self.folder, 'session.m')
+        self.assertEqual(self.app.save_session(path), path)
+        with open(path, encoding='utf-8') as f:
+            lines = f.read().splitlines()
+        self.assertTrue(lines[0].startswith(f'% {mc.APP_NAME} {mc.APP_VERSION} session'))
+        self.assertEqual(lines[1:], ['x = 3;', 'y = x ^ 2', 'z = [1 2', "fprintf('%d\\n', y)"])
+        self.assertIn(f'Saved 4 commands to {path}', self.console())
+        root2 = make_root()                                         # File > Open runs it again
+        try:
+            app2 = mc.MatlabConsoleApp(root2)
+            app2.open_script(path)
+            self.assertEqual(app2.engine.variables['y'].item(), 9)
+        finally:
+            root2.destroy()
+
+    def test_exit_in_a_script(self):
+        path = self.write_script('bye.m', 'a = 1\nexit\nb = 2\n')
+        self.assertFalse(self.app.open_script(path))
+        self.assertTrue(self.app.closed)
+        self.assertNotIn('b', self.app.engine.variables)
+
+    def test_message_after_output_without_newline(self):
+        self.app.run_typed("fprintf('no newline')")
+        self.app.print_message('Hello')
+        self.assertTrue(self.console().endswith('no newline\n  Hello\n\n' + mc.PROMPT), self.console())
+
+
 class FakeGitHub:
     """A local web server answering like api.github.com and raw.githubusercontent.com.
 
@@ -1344,6 +1658,50 @@ class TestUpdates(InstallationCase):
         finally:
             if original:
                 mc.InstallDialog.show = original
+            root.destroy()
+            gc.collect()
+
+    def test_check_for_updates_menu(self):
+        root = make_root(visible=True)
+        original = mc.InstallDialog.show
+        seen = []
+
+        def show(dialog):
+            seen.append((dialog.title(), dialog.message))
+            dialog.after(50, dialog.buttons['later' if 'later' in dialog.buttons else 'ok'].invoke)
+            return original(dialog)
+        mc.InstallDialog.show = show
+        try:
+            app = mc.MatlabConsoleApp(root)
+
+            def check():
+                thread = app.check_for_update_now('linux')
+                self.assertIsNone(app.check_for_update_now('linux'))   # one look at a time
+                deadline, count = time.time() + 20, len(seen)
+                while len(seen) == count and time.time() < deadline:
+                    root.update()
+                    time.sleep(0.02)
+                thread.join()
+                self.assertFalse(app._looking_for_update)
+                return seen[-1]
+
+            self.github.publish(mc.APP_VERSION)
+            title, message = check()
+            self.assertEqual(title, 'Check for Updates')
+            self.assertIn(f'{mc.APP_VERSION} is up to date', message)
+            self.github.publish('9.9.9')
+            self.assertIn('9.9.9 is available on GitHub', check()[1])  # not installed: no update offered
+            mc.install_app(False, 'linux')
+            config = self.config()
+            config['skipped_version'] = '9.9.9'
+            mc.save_config(config)
+            self.assertEqual(check()[0], f'Update {mc.APP_NAME}?')   # offered although skipped before
+            self.assertEqual(self.installed_version(), mc.APP_VERSION)
+            mc.GITHUB_API = mc.GITHUB_RAW = 'http://127.0.0.1:9'
+            self.assertIn('Could not look for a new version', check()[1])
+            self.assertEqual(app.check_for_update_now.__doc__.split(':')[0], 'Help > Check for Updates')
+        finally:
+            mc.InstallDialog.show = original
             root.destroy()
             gc.collect()
 

@@ -1,6 +1,6 @@
 # Matlab_Calc — MATLAB Command Window Emulator (`matlab_calc.py`)
 
-**Version 0.7.0** — see [Version History](#version-history).
+**Version 0.8.0** — see [Version History](#version-history).
 
 A lightweight, interactive desktop calculator built with Python, Tkinter, and NumPy that emulates the look, feel, and matrix-first syntax of the **MATLAB Command Window**.
 
@@ -26,7 +26,8 @@ A lightweight, interactive desktop calculator built with Python, Tkinter, and Nu
 - **Workspace Management**: Persistent variables across calculations, automatic `ans` assignment, output suppression with trailing `;`, and built-in workspace commands (`whos`, `clear`, `clc`, `format short`, `format long`).
 - **Installable**: on macOS and Linux it installs itself as a normal application (asked at the first start), so it starts from Launchpad or the application menu.
 - **Automatic Updates**: once a week the installed program looks for a new version on [GitHub](https://github.com/varallyay/matlab_calc) and, if you agree, downloads and installs it.
-- **Built-in Help**: `help` lists every command, operator and function; `help <name>` shows the full help of one of them, as in MATLAB.
+- **Built-in Help**: `help` lists every command, operator and function; `help <name>` shows the full help of one of them, as in MATLAB. *Help > Matlab_Calc Help* describes the program.
+- **Menus**: *File > Open* runs a script (`.m` file) line by line, *File > Save* saves the commands of the session as a script, *Settings* chooses the font, the number format and the update checks, and *About* shows the version and the credits.
 
 ---
 
@@ -83,11 +84,47 @@ Once a week (`UPDATE_CHECK_DAYS`), when the installed program starts, it looks i
 | **Not now** | Nothing changes; you are asked again at the next weekly check. |
 | **Skip this version** | You are not asked about this version again; a later version is offered as usual. |
 
-The checkbox *Look for new versions on GitHub every week* in this window (and in the installation question) turns the weekly check off or on. In the command window, `update` looks for a new version right away and installs it, and `update off` / `update on` switch the weekly check. Only an installed program is updated; a program started from your download folder is never changed.
+The checkbox *Look for new versions on GitHub every week* in this window (and in the installation question) turns the weekly check off or on; the Settings window also sets how many days to wait between checks. **Help > Check for Updates…** looks right away and says what it found: it offers a newer version (even one you skipped before), or tells you that the program is up to date or that GitHub could not be reached. In the command window, `update` looks for a new version right away and installs it, and `update off` / `update on` switch the weekly check. Only an installed program is updated; a program started from your download folder is never changed (Check for Updates then offers to open the GitHub page).
 
 **Publishing a new version** (for the maintainer): put `matlab_calc.py`, and `icon.png` if it changed, in the top folder of the repository and increase `APP_VERSION`. If the project has GitHub *releases*, the newest release is used, so a version is offered only once it is released; without releases, the newest version on the main branch is used as soon as it is pushed. An update is offered only when its `APP_VERSION` is higher than the installed one, so an older version is never installed by accident. The downloaded file is checked to be a valid program before it replaces the installed copy.
 
 If Python from the python.org installer on macOS cannot verify GitHub's security certificate, the `update` command says so; running *Install Certificates.command* in that Python's folder in Applications fixes it (Anaconda's Python does not need this).
+
+---
+
+## Menus and Settings
+
+| macOS | Linux | What it does |
+| :--- | :--- | :--- |
+| **Matlab_Calc > About Matlab_Calc** | **Help > About Matlab_Calc** | The program icon, name and version, the GitHub page and the credits |
+| **Matlab_Calc > Settings…** (⌘,) | **File > Settings…** | Font, number format and update checks, see below |
+| **File > Open…** (⌘O) | **File > Open…** (Ctrl+O) | Runs the commands of a script (`.m` file) |
+| **File > Save…** (⌘S) | **File > Save…** (Ctrl+S) | Saves the commands of this session as a script |
+| **Edit** | **Edit** | Cut, Copy, Paste, Select All |
+| **Help > Matlab_Calc Help** | **Help > Matlab_Calc Help** (F1) | What the program can do, and how to get more help with the `help` command |
+| **Help > Check for Updates…** | **Help > Check for Updates…** | Looks for a new version on GitHub right away |
+| **Matlab_Calc > Quit Matlab_Calc** (⌘Q) | **File > Quit** (Ctrl+Q) | Closes the program, like `exit` |
+
+On macOS the *Matlab_Calc* menu (with About, Settings and Quit) and the *Window* menu are the standard ones of the system; the program name appears there when PyObjC is installed (see Requirements). Older Tk versions call the Settings item *Preferences…*.
+
+### Running and saving scripts
+**File > Open…** runs a MATLAB script (`.m` file) one line at a time, exactly as if the lines were typed after the prompt: each command and its result appear in the command window, and the commands are added to the command history (↑/↓).
+
+- Blank lines and comment lines (`% ...`) are skipped. A command continues on the next lines while a `[` is open (`A = [1 2` / `3 4]`) or after `...`.
+- An error is shown and the script goes on with the next line, as when typing.
+- While the script runs, the current folder is the folder of the script (as with MATLAB's `run`), so `fopen('data.txt')` finds the data files next to it. Afterwards the previous folder is restored, unless the script changed it with `cd`.
+
+**File > Save…** writes every command of the session (typed or run from a script) to a `.m` file, one per line, below a comment line with the date. *File > Open* runs it again later and gives the same variables. The same file name is offered the next time.
+
+### Settings
+The Settings window keeps its choices in the settings file `~/.matlab_calc.json`, so they apply at every start; **Restore Defaults** goes back to the parameters at the top of `matlab_calc.py`.
+
+| Setting | Default | Meaning |
+| :--- | :--- | :--- |
+| Font | first installed font of `FONT_FAMILIES` | Font of the command window; only monospace fonts are listed, so matrix columns stay aligned. A preview shows the choice. |
+| Size | `FONT_SIZE` (11) | Font size, from 6 to 40 (`FONT_SIZE_LIMITS`). **Ctrl/⌘ +** and **Ctrl/⌘ −** change it in the command window directly, **Ctrl/⌘ 0** restores the default. |
+| Format at the start | `short` | Number format when the program starts: `format short` (up to 4 decimals) or `format long` (up to 15). The `format` command still changes it during a session. |
+| Look for new versions on GitHub every … days | on, 7 days (`UPDATE_CHECK_DAYS`) | The automatic look for a new version; the same as `update on` / `update off`. |
 
 ---
 
@@ -98,19 +135,23 @@ All settings are constants at the top of `matlab_calc.py`:
 | Parameter | Default | Meaning |
 | :--- | :--- | :--- |
 | `APP_NAME` | `'Matlab_Calc'` | Window title, Tk class name and macOS menu-bar name |
-| `APP_VERSION` | `'0.7.0'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
+| `APP_CREDITS` | `'Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, Claude)'` | Shown in the About window |
+| `APP_VERSION` | `'0.8.0'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
 | `WINDOW_WIDTH`, `WINDOW_HEIGHT` | `750`, `520` | Initial window size in pixels |
 | `APP_ICON_FILE` | `'icon.png'` | Icon image, looked up next to the script |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size (keeps the Dock icon the same size as native macOS icons) |
 | `APP_ICON_ROUNDING` | `0.20` | Corner radius, as a fraction of the visible icon size (`0` = square corners, `0.5` = circle) |
-| `FONT_FAMILIES`, `FONT_SIZE` | `('Consolas', 'Menlo', …)`, `11` | The first installed monospace font is used, so matrix columns stay aligned on every OS |
+| `FONT_FAMILIES`, `FONT_SIZE` | `('Consolas', 'Menlo', …)`, `11` | Default font: the first installed monospace font is used, so matrix columns stay aligned on every OS. The Settings window can choose another font and size. |
+| `FONT_SIZE_LIMITS` | `(6, 40)` | Smallest and largest font size in the Settings window and with Ctrl/⌘ + and − |
 | `BACKGROUND_COLOR`, `TEXT_COLOR`, `PROMPT_COLOR`, `CURSOR_COLOR` | dark theme | Console colors |
 | `WINDOW_PADDING`, `PROMPT` | `10`, `'>> '` | Space around the console; prompt text |
 | `SHORT_DECIMALS`, `LONG_DECIMALS` | `4`, `15` | Maximum decimals for `format short` / `format long` |
 | `MAX_DISPLAY_ELEMENTS` | `10000` | Larger results are summarised instead of printed (end the statement with `;`) |
-| `CONFIG_FILE` | `'~/.matlab_calc.json'` | Settings file in the home folder: remembers the answer to the installation question, what was installed and the update checks |
+| `CONFIG_FILE` | `'~/.matlab_calc.json'` | Settings file in the home folder: remembers the answer to the installation question, what was installed, the update checks and the choices of the Settings window |
 | `UPDATE_REPOSITORY` | `'varallyay/matlab_calc'` | GitHub project (owner/name) where new versions are published |
-| `UPDATE_CHECK_DAYS` | `7` | Look for a new version this often, in days; `0` = only with the `update` command |
+| `APP_WEBSITE` | `'https://github.com/' + UPDATE_REPOSITORY` | Web page shown in the About window and the Help window |
+| `UPDATE_CHECK_DAYS` | `7` | Look for a new version this often, in days; `0` = only with the `update` command (the Settings window can still turn the checks on) |
+| `SCRIPT_EXTENSION` | `'.m'` | File type of *File > Open* and *File > Save* |
 
 ---
 
@@ -478,6 +519,10 @@ More than two subscripts and N-dimensional arrays, cell arrays, structures, the 
 - **`Home`**: Move the cursor to the start of the current input (right after `>> `).
 - **`Ctrl+C` / `Cmd+C`**: Copy selected text from anywhere in the console history.
 - **`Ctrl+V` / `Cmd+V`**: Paste into the active command line.
+- **`Ctrl+A` / `Cmd+A`**: Select all text.
+- **`Ctrl+O` / `Cmd+O`**, **`Ctrl+S` / `Cmd+S`**: Open (run) a script, save the session.
+- **`Ctrl +` / `Cmd +`**, **`Ctrl −` / `Cmd −`**, **`Ctrl 0` / `Cmd 0`**: Larger, smaller or default font size (remembered).
+- **`F1`** (Linux) / **`Cmd+?`** (macOS): Matlab_Calc Help. **`Cmd+,`** (macOS): Settings. **`Ctrl+Q` / `Cmd+Q`**: Quit.
 
 ---
 
@@ -487,11 +532,26 @@ More than two subscripts and N-dimensional arrays, cell arrays, structures, the 
 python3 test_matlab_calc.py
 ```
 
-Runs 107 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files (in a temporary folder), the statistics and random-number functions, the help texts, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available.
+Runs 125 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files (in a temporary folder), the statistics and random-number functions, the help texts, the menus, the About, Help and Settings windows, running and saving scripts, the update check of the Help menu, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available.
+
+---
+
+## Credits
+
+Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, Claude).
 
 ---
 
 ## Version History
+
+### 0.8.0 — 2026-11-04
+- **Menus:** a File menu with **Open…** (runs a `.m` script line by line, as if typed) and **Save…** (saves the commands of the session as a `.m` script), an Edit menu, and a Help menu with **Matlab_Calc Help** and **Check for Updates…**. On Linux, File also has Settings and Quit, and Help has About.
+- **About window:** the program icon, name, version, the GitHub page (clickable) and the credits, instead of the empty standard panel of macOS.
+- **Settings window** (macOS: *Matlab_Calc > Settings…*, which was greyed out before; Linux: *File > Settings…*): font and font size of the command window with a preview, the number format at the start, and the automatic update check with its interval. The choices are kept in `~/.matlab_calc.json`.
+- **Font size from the keyboard:** Ctrl/⌘ +, Ctrl/⌘ − and Ctrl/⌘ 0.
+- **Help window:** describes what the program can do and how the `help` command gives more help; a button lists every command and function in the command window.
+- **Check for Updates…** looks for a new version right away and reports the result.
+- **Parameters:** `APP_CREDITS`, `APP_WEBSITE`, `FONT_SIZE_LIMITS` and `SCRIPT_EXTENSION`.
 
 ### 0.7.0 — 2026-11-02
 - **Several outputs:** `[a, b] = f(...)` assigns each output of a function to its own variable, and `~` skips one. `max`, `min`, `size`, `find` (`[row, col, v]`), `fopen` (`[fid, msg]`) and `fscanf` (`[A, count]`) have several outputs.
