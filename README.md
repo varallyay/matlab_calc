@@ -1,6 +1,6 @@
 # Matlab_Calc — MATLAB Command Window Emulator (`matlab_calc.py`)
 
-**Version 0.9.0** — see [Version History](#version-history).
+**Version 0.10.1** — see [Version History](#version-history).
 
 A lightweight, interactive desktop calculator built with Python, Tkinter, and NumPy that emulates the look, feel, and matrix-first syntax of the **MATLAB Command Window**.
 
@@ -18,6 +18,7 @@ A lightweight, interactive desktop calculator built with Python, Tkinter, and Nu
   - Raises MATLAB-style errors when operands have incompatible dimensions.
 - **Several Outputs**: functions such as `max`, `min`, `size`, `find`, `fopen` and `fscanf` return more than one result: `[m, i] = max(A)`, `[rows, cols] = size(A)`; `~` skips an output (`[~, i] = min(v)`).
 - **Text and Files**: text in quotes (`'Hello'`), `disp`, `fprintf`, `sprintf` and `num2str` for formatted output, and `fopen` / `fprintf` / `fscanf` / `fclose` with file identifiers to write and read text files.
+- **Files and Folders**: `ls`, `mkdir`, `rmdir`, `isfile`, `isfolder`, `copyfile`, `movefile` and `delete`, with `*` wildcards and MATLAB's command syntax (`mkdir results`, `delete *.txt`).
 - **Plots**: `plot`, `figure`, `hold`, `xlabel`, `ylabel`, `title`, `legend`, `grid`, `axis`, `set` and `get` draw line plots in figure windows that look like MATLAB's, with a toolbar to zoom, pan and save (made with matplotlib).
 - **Data Analysis and Random Numbers**: `max`, `min`, `mean`, `median`, `std`, `rand`, `randn` and more, working down the columns of a matrix as in MATLAB.
 - **Multiple Statements and Comments**: `a = 1; b = 2, c = a + b` runs three statements (a trailing `;` suppresses output); `%` starts a comment and `...` continues a line. Multi-line pastes run line by line.
@@ -138,7 +139,7 @@ All settings are constants at the top of `matlab_calc.py`:
 | :--- | :--- | :--- |
 | `APP_NAME` | `'Matlab_Calc'` | Window title, Tk class name and macOS menu-bar name |
 | `APP_CREDITS` | `'Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, Claude)'` | Shown in the About window |
-| `APP_VERSION` | `'0.9.0'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
+| `APP_VERSION` | `'0.10.0'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
 | `WINDOW_WIDTH`, `WINDOW_HEIGHT` | `750`, `520` | Initial window size in pixels |
 | `APP_ICON_FILE` | `'icon.png'` | Icon image, looked up next to the script |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size (keeps the Dock icon the same size as native macOS icons) |
@@ -149,6 +150,7 @@ All settings are constants at the top of `matlab_calc.py`:
 | `WINDOW_PADDING`, `PROMPT` | `10`, `'>> '` | Space around the console; prompt text |
 | `SHORT_DECIMALS`, `LONG_DECIMALS` | `4`, `15` | Maximum decimals for `format short` / `format long` |
 | `MAX_DISPLAY_ELEMENTS` | `10000` | Larger results are summarised instead of printed (end the statement with `;`) |
+| `LS_WIDTH` | `78` | `ls` lists the names in columns that fit in this many characters |
 | `FIGURE_WIDTH`, `FIGURE_HEIGHT` | `560`, `420` | Size of the plot area of a new figure window in pixels (MATLAB's default) |
 | `FIGURE_COLOR` | `'#f0f0f0'` | Background of the figure windows (MATLAB's light gray; the plot area is white) |
 | `PLOT_LINE_WIDTH` | `1.5` | Default width of plotted lines in points (matplotlib's default; MATLAB uses 0.5) |
@@ -414,6 +416,36 @@ M =
 
 File names are relative to the current folder, shown by `pwd` and changed with `cd`. When the program is started from Launchpad or the application menu, the current folder is your home folder.
 
+#### Files and folders
+These functions list, make, copy, move and delete files and folders. As in MATLAB, they can be typed with command syntax — the words after the name are file names, and a name with spaces goes in quotes — and `*` in a name stands for any characters:
+
+```matlab
+>> mkdir results
+>> copyfile *.txt results
+>> ls results
+  data.txt  log.txt
+
+>> isfile('results/data.txt')
+ans =
+  logical
+    1
+
+>> movefile results 'Old Results'
+>> rmdir('Old Results', 's')
+```
+
+| Function | What it does |
+| :--- | :--- |
+| `ls`, `ls folder`, `ls *.txt` | Lists the files and folders in the current folder, in `folder`, or those that match; `list = ls(...)` gives the names as text, one per row. Hidden names (starting with a dot) are not listed |
+| `mkdir folder`, `mkdir(parent, folder)` | Makes a folder (and any missing folders on the way, as in `mkdir a/b/c`). An existing folder gives a warning |
+| `rmdir folder`, `rmdir(folder, 's')` | Removes an empty folder; with `'s'`, the folder and everything in it |
+| `isfile(name)`, `isfolder(name)` | `true` if `name` is an existing file / folder |
+| `copyfile(source, destination)` | Copies a file to a new name or into a folder. A pattern such as `*.txt` copies the matching files into the folder `destination` (made if needed); a folder source copies its contents with all subfolders. Without `destination`, copies into the current folder; `copyfile(..., 'f')` also replaces read-only files |
+| `movefile(source, destination)` | Renames a file or folder, or moves it (or the files matching a pattern) into a folder |
+| `delete name`, `delete *.txt` | Deletes files, without asking; a name that is not found gives a warning. Folders are removed with `rmdir`. `delete(h)` deletes graphics objects: figures, axes, lines and legends |
+
+`mkdir`, `rmdir`, `copyfile` and `movefile` stop with an error when they fail. Asking for their status gives `true` / `false` and the reason instead: `[status, msg] = copyfile('a.txt', 'b.txt')`.
+
 ### 7. Plots
 `plot` draws lines in a **figure window**, which opens beside the command window. As in MATLAB, the window has a light gray background, a white plot area with a box and inward tick marks, a bold title, and a toolbar at the top to zoom, pan, go back to the original view and save the plot as an image (PNG, PDF, SVG, …). The plots are drawn with matplotlib, and the line colors and color order are matplotlib's.
 
@@ -483,6 +515,7 @@ grid on
   - `resize(A, sz)` — pad with zeros or cut to size `sz` (`resize([1 2 3], 5)` is `1 2 3 0 0`); options `'FillValue', v` and `'Side', 'trailing' | 'leading' | 'both'`
   - `reshape(A, r, c)` — the same elements arranged in `r` rows and `c` columns (one size may be `[]`)
 - **Text and Files**: `disp`, `fprintf`, `sprintf`, `num2str`, `fopen`, `fclose`, `fscanf` (see sections 5 and 6)
+- **Files and Folders**: `ls`, `mkdir`, `rmdir`, `isfile`, `isfolder`, `copyfile`, `movefile`, `delete` (see section 6)
 - **Graphics**: `plot`, `figure`, `hold`, `ishold`, `xlabel`, `ylabel`, `title`, `legend`, `grid`, `box`, `axis`, `xlim`, `ylim`, `gca`, `gcf`, `set`, `get`, `close`, `clf`, `cla`, `drawnow` (see section 7)
 - **Logical Values & Searching**:
   - `find(X)`, `find(X, N)` — positions of the nonzero (true) elements, e.g. `find(A >= 2)`; `[row, col] = find(X)` or `[row, col, v] = find(X)` give rows, columns and values
@@ -500,6 +533,7 @@ grid on
 | `clc` | Clear the command window screen |
 | `pwd` | Show the current folder, where `fopen` looks for files |
 | `cd <folder>` | Change the current folder (`cd ..`, `cd ~/Documents`); `cd` alone shows it |
+| `ls` | List the files and folders in the current folder (see section 6 for `mkdir`, `copyfile`, `delete`, …) |
 | `help` | List all commands, operators and functions |
 | `help <name>` | Show the help of a command or function, e.g. `help round`; `help ops` (or `help .*`, `help +`, …) explains the operators |
 | `version` | Show the application name and version number |
@@ -546,7 +580,7 @@ def fn_cube(x):
 Arguments arrive as 2-D NumPy arrays (scalars are 1×1) and the function must return one (`to_matrix` converts any result). The number of inputs comes from the Python signature; parameters with a default value (`n=None`) are optional. For several outputs, give `outputs=2` (or more) to `@builtin`, add a keyword-only parameter `nargout` and return a tuple with that many values; `keep_types=True` passes logical and text arguments unchanged instead of converting them to numbers, and `command_syntax=True` allows calls such as `hold on`. Console commands work the same way with the `@console_command` decorator on a `MatlabEngine` method. The tests check that every command and function has a help text whose first line has the form `name - Summary.`
 
 ### 12. Not Supported
-More than two subscripts and N-dimensional arrays, cell arrays, structures, the separate `string` class (`"text"` gives ordinary `char` text), user functions/scripts, and control flow (`if`, `for`, …). `asin`/`acos` return `NaN` outside [-1, 1], and `acosh` below 1 and `atanh` outside [-1, 1] likewise. Files are read and written as text (UTF-8); `fread`, `fwrite`, `fgetl` and `textscan` are not available. Graphics: one axes per figure (no `subplot` yet), no `pcolor`, `surf`, `bar` or other plot types, no dot syntax (`h.LineWidth = 2`; use `set`), and `get` takes one handle at a time. Non-integer matrix powers use an eigendecomposition, so they require a diagonalisable matrix.
+More than two subscripts and N-dimensional arrays, cell arrays, structures, the separate `string` class (`"text"` gives ordinary `char` text), user functions/scripts, and control flow (`if`, `for`, …). `asin`/`acos` return `NaN` outside [-1, 1], and `acosh` below 1 and `atanh` outside [-1, 1] likewise. Files are read and written as text (UTF-8); `fread`, `fwrite`, `fgetl` and `textscan` are not available, nor are `dir` and `exist` (use `ls`, `isfile` and `isfolder`); `*` is the only wildcard. Graphics: one axes per figure (no `subplot` yet), no `pcolor`, `surf`, `bar` or other plot types, no dot syntax (`h.LineWidth = 2`; use `set`), and `get` takes one handle at a time. Non-integer matrix powers use an eigendecomposition, so they require a diagonalisable matrix.
 
 ---
 
@@ -571,7 +605,7 @@ More than two subscripts and N-dimensional arrays, cell arrays, structures, the 
 python3 test_matlab_calc.py
 ```
 
-Runs 139 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files (in a temporary folder), the statistics and random-number functions, the help texts, the menus, the About, Help and Settings windows, running and saving scripts, the update check of the Help menu, plotting (off-screen) and figure windows, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available, and the plot tests when matplotlib is not installed.
+Runs 150 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files, the file and folder functions (in temporary folders), the statistics and random-number functions, the help texts, the menus, the About, Help and Settings windows, running and saving scripts, the update check of the Help menu, plotting (off-screen) and figure windows, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available, and the plot tests when matplotlib is not installed.
 
 ---
 
@@ -582,6 +616,16 @@ Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, 
 ---
 
 ## Version History
+
+### 0.10.1 — 2026-11-05
+- **Figure windows** open directly at their place beside the command window, instead of appearing elsewhere for a moment and then jumping there.
+
+### 0.10.0 — 2026-11-05
+- **Files and folders:** `ls`, `mkdir`, `rmdir`, `isfile`, `isfolder`, `copyfile`, `movefile` and `delete`, with `*` wildcards (`delete *.txt`, `copyfile *.m backup`). `mkdir`, `rmdir`, `copyfile` and `movefile` give `[status, msg]` instead of an error when asked for them.
+- **Command syntax with file names:** these functions take file and folder names as words, in quotes if they contain spaces: `mkdir 'My Data'`, `copyfile a.txt b.txt`.
+- **`delete(h)`** also deletes graphics objects: figures, axes, lines and legends.
+- **Help:** a new topic, *Files and folders*.
+- **Parameter:** `LS_WIDTH`, the width of the columns that `ls` lists the names in.
 
 ### 0.9.0 — 2026-11-04
 - **Plots:** `plot` with all its usual forms (vectors, matrices, several x/y pairs, LineSpecs such as `'r--o'`, line properties), drawn with matplotlib in figure windows that look like MATLAB's, with a toolbar to zoom, pan and save.

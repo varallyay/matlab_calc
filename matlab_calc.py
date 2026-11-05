@@ -6,6 +6,7 @@ Run with:  python3 matlab_calc.py
 
 import functools
 import gc
+import glob
 import inspect
 import json
 import math
@@ -14,6 +15,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,7 +36,7 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
-APP_VERSION = '0.9.0'           # Shown in the welcome banner; see the version history in README.md
+APP_VERSION = '0.10.1'          # Shown in the welcome banner; see the version history in README.md
 APP_CREDITS = "Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, Claude)"
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
@@ -57,6 +59,7 @@ PROMPT = '>> '
 SHORT_DECIMALS = 4              # Maximum decimals shown by 'format short' (the default)
 LONG_DECIMALS = 15              # Maximum decimals shown by 'format long'
 MAX_DISPLAY_ELEMENTS = 10000    # Bigger results are summarised instead of printed in full
+LS_WIDTH = 78                   # ls lists the names in columns that fit in this many characters
 
 FIGURE_WIDTH = 560              # Size of the plot area of a new figure window in pixels (as in MATLAB)
 FIGURE_HEIGHT = 420
@@ -345,9 +348,10 @@ CAT_LOGICAL = 'Logical values and searching'
 CAT_RANDOM = 'Random numbers'
 CAT_MATRIX = 'Matrices and arrays'
 CAT_TEXT = 'Text and files'
+CAT_FILES = 'Files and folders'
 CAT_GRAPHICS = 'Graphics'
 HELP_CATEGORIES = (CAT_COMMANDS, CAT_CONSTANTS, CAT_MATH, CAT_ELEMENTWISE, CAT_TRIG, CAT_HYPERBOLIC, CAT_ROUNDING,
-                   CAT_STATS, CAT_LOGICAL, CAT_RANDOM, CAT_MATRIX, CAT_TEXT, CAT_GRAPHICS)
+                   CAT_STATS, CAT_LOGICAL, CAT_RANDOM, CAT_MATRIX, CAT_TEXT, CAT_FILES, CAT_GRAPHICS)
 
 FUNCTIONS = {}  # MATLAB name -> (Python function, minimum inputs, maximum inputs)
 
@@ -361,7 +365,9 @@ def builtin(*names, category, outputs=1, keep_types=False, command_syntax=False)
     function has the keyword-only parameter nargout, it learns how many results are wanted
     (0 for a statement such as disp(x), where it may return None for "no result"); a
     keyword-only parameter engine receives the MatlabEngine, e.g. to print text.
-    command_syntax allows MATLAB's command syntax with words, e.g. 'hold on' for hold('on').
+    command_syntax allows MATLAB's command syntax with words, e.g. 'hold on' for hold('on');
+    command_syntax='files' allows any words, such as file names and patterns, and quoted
+    words with spaces: 'delete *.txt', "mkdir 'My Data'".
     """
     def register(func):
         params = list(inspect.signature(func).parameters.values())
@@ -1722,6 +1728,363 @@ def fn_fscanf(fid, fmt, size=None, *, nargout=1, engine):
 
 
 # =============================================================================
+#  Files and folders: ls, mkdir, rmdir, isfile, isfolder, copyfile, movefile, delete
+#
+#  Names are relative to the current folder (see pwd, cd), and ~ is the home folder.
+#  As in MATLAB, * in a name is a wildcard ('delete *.txt'), and these functions
+#  allow command syntax with file names: mkdir results, copyfile a.txt 'My Data'.
+#  mkdir, rmdir, copyfile and movefile stop with an error when they fail, unless
+#  their status is asked for: [status, msg] = mkdir(...) gives false and the reason.
+# =============================================================================
+class _FileProblem(Exception):
+    """Why mkdir, rmdir, copyfile or movefile failed (an error, or status false and this message)."""
+
+
+def _path_argument(value, function, what='The name'):
+    """The file or folder name in a text argument; an error if it is empty or not text."""
+    name = text_argument(value, function, what)
+    if not name:
+        raise MatlabError(f"Error using {function}\n{what} must not be empty.")
+    return name
+
+
+def _matching(name):
+    """The existing files and folders called name, in which * is a wildcard (the only one, as in MATLAB)."""
+    path = os.path.expanduser(name)
+    if '*' not in path:
+        return [path] if os.path.lexists(path) else []
+    return sorted(glob.glob(glob.escape(path).replace('[*]', '*')), key=str.lower)  # * skips hidden names
+
+
+def _folder_contents(path, function):
+    """The names in a folder, without the hidden ones (starting with a dot), as ls lists them."""
+    try:
+        return sorted((n for n in os.listdir(path) if not n.startswith('.')), key=str.lower)
+    except OSError as err:
+        raise MatlabError(f"Error using {function}\n{_os_message(err)}") from None
+
+
+def _os_message(err):
+    reason = err.strerror or str(err)
+    return f"{reason}: {err.filename}" if getattr(err, 'filename', None) else reason
+
+
+def _inside(path, folder):
+    """Is path the folder itself or something in it?"""
+    path, folder = os.path.realpath(path), os.path.realpath(folder)
+    return path == folder or path.startswith(folder.rstrip(os.sep) + os.sep)
+
+
+def _file_status(function, nargout, operation, engine):
+    """Run operation() and give the results of mkdir, rmdir, copyfile or movefile.
+
+    operation returns None or a warning (e.g. 'Directory already exists.'), or raises
+    _FileProblem or OSError. Without outputs a failure is an error and a warning is shown;
+    with outputs they give status (true or false) and the message.
+    """
+    try:
+        message, ok = operation() or '', True
+    except _FileProblem as problem:
+        message, ok = str(problem), False
+    except OSError as err:
+        message, ok = _os_message(err), False
+    if nargout == 0:
+        if not ok:
+            raise MatlabError(f"Error using {function}\n{message}")
+        if message:
+            engine.write(f"Warning: {message}\n")
+        return None
+    status = to_matrix(ok)
+    return (status, text_to_chars(message)) if nargout >= 2 else status
+
+
+def _char_rows(texts):
+    """Texts as a char matrix, one per row, padded with spaces."""
+    rows = [text_to_chars(t).ravel() for t in texts]
+    out = np.full((len(rows), max(len(r) for r in rows)), ord(' '), dtype=CHAR)
+    for i, row in enumerate(rows):
+        out[i, :len(row)] = row
+    return out
+
+
+def _columns(names, width=LS_WIDTH):
+    """The names in columns, down each column first, as ls in a terminal lists them."""
+    column = max(len(n) for n in names) + 2
+    rows = math.ceil(len(names) / max(1, width // column))
+    return "\n".join(''.join(n.ljust(column) for n in names[r::rows]).rstrip() for r in range(rows))
+
+
+@builtin('ls', category=CAT_FILES, keep_types=True, command_syntax='files')
+def fn_ls(name=None, *, nargout=1, engine):
+    """ls - List the files and folders.
+
+    ls              lists the files and folders in the current folder.
+    ls folder       lists those in folder, e.g. ls .. or ls ~/Documents.
+    ls *.txt        lists the names that match; * stands for any characters.
+    list = ls(...)  gives the names as text, one name per row.
+    Hidden names, which start with a dot, are not listed.
+
+    See also pwd, cd, isfile, isfolder.
+    """
+    if name is None:
+        names = _folder_contents('.', 'ls')
+    else:
+        text = _path_argument(name, 'ls')
+        path = os.path.expanduser(text)
+        if '*' not in path and os.path.isdir(path):
+            names = _folder_contents(path, 'ls')
+        else:
+            names = _matching(text)
+            if not names:
+                raise MatlabError(f"Error using ls\n'{text}' not found.")
+    if nargout == 0:
+        if names:
+            engine.show(_indent(_columns(names)))
+        return None
+    return _char_rows(names) if names else text_to_chars('')
+
+
+@builtin('mkdir', category=CAT_FILES, outputs=2, keep_types=True, command_syntax='files')
+def fn_mkdir(parent, folder=None, *, nargout=1, engine):
+    """mkdir - Make a new folder.
+
+    mkdir folder         makes the folder, e.g. mkdir results or
+                         mkdir 'My Data'.
+    mkdir parent folder  (or mkdir(parent, folder)) makes it in the folder
+                         parent. Missing folders on the way are made too:
+                         mkdir a/b/c also makes a and a/b.
+    status = mkdir(...)  gives true if the folder was made or already
+                         exists and false if it cannot be made, instead of
+                         an error; [status, msg] = mkdir(...) also gives
+                         the reason.
+
+    See also rmdir, isfolder, ls, cd.
+    """
+    name = _path_argument(parent, 'mkdir', 'The folder name')
+    if folder is not None:
+        name = os.path.join(name, _path_argument(folder, 'mkdir', 'The folder name'))
+    path = os.path.expanduser(name)
+
+    def make():
+        if os.path.isdir(path):
+            return 'Directory already exists.'
+        if os.path.lexists(path):
+            raise _FileProblem(f"Cannot make the folder '{name}': a file of that name exists.")
+        os.makedirs(path)
+    return _file_status('mkdir', nargout, make, engine)
+
+
+@builtin('rmdir', category=CAT_FILES, outputs=2, keep_types=True, command_syntax='files')
+def fn_rmdir(folder, option=None, *, nargout=1, engine):
+    """rmdir - Remove a folder.
+
+    rmdir folder        removes the folder, which must be empty.
+    rmdir folder s      (or rmdir(folder, 's')) removes the folder with
+                        everything in it - all its files and folders,
+                        without asking. This cannot be undone.
+    status = rmdir(...) gives true or false instead of an error;
+                        [status, msg] = rmdir(...) also gives the reason.
+
+    See also mkdir, delete, isfolder.
+    """
+    name = _path_argument(folder, 'rmdir', 'The folder name')
+    if option is not None and text_argument(option, 'rmdir', 'The option') != 's':
+        raise MatlabError("Error using rmdir\nThe option must be 's', which removes the folder with its contents.")
+    path = os.path.expanduser(name)
+
+    def remove():
+        if os.path.islink(path) or not os.path.isdir(path):
+            raise _FileProblem(f"'{name}' is not a folder." if os.path.lexists(path)
+                               else f"Folder '{name}' not found.")
+        if _inside(os.getcwd(), path):
+            raise _FileProblem(f"Cannot remove '{name}': it is (or contains) the current folder. "
+                               "Use cd to go to another folder first.")
+        if option is None:
+            if os.listdir(path):
+                raise _FileProblem(f"The folder '{name}' is not empty. rmdir('{name}', 's') removes it "
+                                   "with its contents.")
+            os.rmdir(path)
+        else:
+            shutil.rmtree(path)
+    return _file_status('rmdir', nargout, remove, engine)
+
+
+@builtin('isfile', category=CAT_FILES, keep_types=True, command_syntax='files')
+def fn_isfile(name):
+    """isfile - Check whether a file exists.
+
+    isfile(name) is true (1) if name is an existing file, and false (0) if
+    nothing of that name exists or it is a folder, e.g.
+        isfile('data.txt')
+        isfile('~/Documents/notes.txt')
+
+    See also isfolder, ls, delete.
+    """
+    return to_matrix(os.path.isfile(os.path.expanduser(text_argument(name, 'isfile', 'The file name'))))
+
+
+@builtin('isfolder', category=CAT_FILES, keep_types=True, command_syntax='files')
+def fn_isfolder(name):
+    """isfolder - Check whether a folder exists.
+
+    isfolder(name) is true (1) if name is an existing folder, and false (0)
+    if nothing of that name exists or it is a file, e.g.
+        isfolder('results')
+        isfolder('..')
+
+    See also isfile, mkdir, cd.
+    """
+    return to_matrix(os.path.isdir(os.path.expanduser(text_argument(name, 'isfolder', 'The folder name'))))
+
+
+def _copy_file(source, target, force):
+    if force and os.path.isfile(target) and not os.access(target, os.W_OK):
+        os.chmod(target, os.stat(target).st_mode | stat.S_IWUSR)  # 'f': replace read-only files too
+    shutil.copy2(source, target)
+
+
+def _transfer(function, source, destination, option, nargout, engine):
+    """copyfile or movefile: copy or move source (where * is a wildcard) to destination."""
+    pattern = _path_argument(source, function, 'The source')
+    target_name = '.' if destination is None else _path_argument(destination, function, 'The destination')
+    target = os.path.expanduser(target_name)
+    if option is not None and text_argument(option, function, 'The option').lower() != 'f':
+        raise MatlabError(f"Error using {function}\nThe option must be 'f', which also replaces read-only files.")
+    force, copying = option is not None, function == 'copyfile'
+
+    def run():
+        sources = _matching(pattern)
+        if not sources:
+            raise _FileProblem("No matching files were found.")
+        several = '*' in pattern
+        if several and not os.path.isdir(target):
+            if os.path.lexists(target):
+                raise _FileProblem(f"The destination '{target_name}' must be a folder when * names "
+                                   "several files.")
+            os.makedirs(target)
+        for src in sources:
+            # a file (or a folder that is moved, or one of several) goes into a destination folder;
+            # copyfile folder destination copies the contents of the folder, as in MATLAB
+            into = os.path.isdir(target) and (several or not copying or not os.path.isdir(src))
+            dst = os.path.join(target, os.path.basename(os.path.normpath(src))) if into else target
+            if os.path.isdir(src) and not os.path.islink(src) and _inside(dst, src):
+                raise _FileProblem("Cannot copy or move a folder into itself.")
+            if os.path.lexists(dst) and os.path.samefile(src, dst):
+                raise _FileProblem("Cannot copy or move a file or folder onto itself.")
+            if copying:
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst, dirs_exist_ok=True,
+                                    copy_function=lambda s, d: _copy_file(s, d, force))
+                else:
+                    _copy_file(src, dst, force)
+            elif os.path.isdir(dst) and not os.path.islink(dst):
+                raise _FileProblem(f"Cannot move '{src}': the folder '{dst}' exists already.")
+            elif os.path.lexists(dst):
+                os.replace(src, dst)  # a file of the same name is replaced, as in MATLAB
+            else:
+                shutil.move(src, dst)
+    return _file_status(function, nargout, run, engine)
+
+
+@builtin('copyfile', category=CAT_FILES, outputs=2, keep_types=True, command_syntax='files')
+def fn_copyfile(source, destination=None, option=None, *, nargout=1, engine):
+    """copyfile - Copy files and folders.
+
+    copyfile source destination  copies the file source to destination: a
+                                 new name, or a folder to copy it into.
+                                 A file of the same name is replaced.
+    copyfile *.txt backup        copies the files that match into the
+                                 folder backup, which is made if needed.
+    copyfile folder destination  copies the contents of folder, with all
+                                 its subfolders, into destination.
+    copyfile source              copies source into the current folder.
+    copyfile(..., 'f')           also replaces read-only files.
+    status = copyfile(...)       gives true or false instead of an error;
+                                 [status, msg] = copyfile(...) also gives
+                                 the reason.
+
+    See also movefile, delete, mkdir.
+    """
+    return _transfer('copyfile', source, destination, option, nargout, engine)
+
+
+@builtin('movefile', category=CAT_FILES, outputs=2, keep_types=True, command_syntax='files')
+def fn_movefile(source, destination=None, option=None, *, nargout=1, engine):
+    """movefile - Move or rename files and folders.
+
+    movefile source destination  renames the file or folder source to
+                                 destination, or moves it into destination
+                                 if that is a folder. A file of the same
+                                 name is replaced.
+    movefile *.txt backup        moves the files that match into the folder
+                                 backup, which is made if needed.
+    movefile source              moves source into the current folder.
+    status = movefile(...)       gives true or false instead of an error;
+                                 [status, msg] = movefile(...) also gives
+                                 the reason.
+
+    See also copyfile, delete, mkdir.
+    """
+    return _transfer('movefile', source, destination, option, nargout, engine)
+
+
+@builtin('delete', category=CAT_FILES, outputs=0, keep_types=True, command_syntax='files')
+def fn_delete(*names, engine):
+    """delete - Delete files or graphics objects.
+
+    delete name       deletes the file name, without asking - it cannot be
+                      undone. delete a.txt b.txt deletes both.
+    delete *.txt      deletes the files that match; * stands for any
+                      characters.
+    delete(h)         deletes graphics objects: figures (as close does),
+                      axes, lines and legends, e.g. h = plot(x, y); delete(h)
+    A file that is not found gives a warning. Folders are removed with rmdir.
+
+    See also rmdir, movefile, close, cla.
+    """
+    if not names:
+        raise MatlabError("Error using delete\nNot enough input arguments.")
+    for value in names:
+        if not is_text(value):
+            _delete_graphics(value, engine)
+            continue
+        name = text_argument(value, 'delete', 'The file name')
+        matches = _matching(name) if name else []
+        if not matches:
+            engine.write(f"Warning: File '{name}' not found.\n")
+        for path in matches:
+            if os.path.isdir(path) and not os.path.islink(path):
+                if '*' not in name:  # folders that match a * are skipped
+                    engine.write(f"Warning: '{name}' is a folder; rmdir removes folders.\n")
+                continue
+            try:
+                os.remove(path)
+            except OSError as err:
+                raise MatlabError(f"Error using delete\n{_os_message(err)}") from None
+    return None
+
+
+def _delete_graphics(value, engine):
+    """delete(h): close figures, clear axes, remove lines and legends."""
+    graphics = _graphics(engine)
+    for obj in graphics.handles(value, 'delete'):
+        if graphics.objects.get(obj.handle) is not obj:
+            continue  # deleted already, e.g. with its figure
+        if isinstance(obj, GFigure):
+            graphics.close(obj)
+        elif isinstance(obj, GAxes):
+            obj.parent.clear()
+        elif isinstance(obj, GLine):
+            obj.parent.remove_line(obj)
+        elif isinstance(obj, GLegend):
+            obj.parent.remove_legend()
+            obj.parent.changed()
+        else:
+            raise MatlabError("Error using delete\nThe title and the axis labels cannot be deleted; "
+                              "title('') or xlabel('') removes their text.")
+
+
+# =============================================================================
 #  Graphics: figure, plot, labels, legend, set and get - drawn with matplotlib
 #
 #  The engine keeps every figure as a matplotlib Figure. The GUI shows each one in
@@ -2066,6 +2429,13 @@ class GAxes(GraphicsObject):
         self.lines = []
         self.remove_legend()
         self.ax.set_prop_cycle(None)
+        self.changed()
+
+    def remove_line(self, line):
+        """delete(h) of a line; the legend follows when it is drawn again."""
+        line.artist.remove()
+        self.lines.remove(line)
+        self.graphics.objects.pop(line.handle, None)
         self.changed()
 
     def remove_legend(self):
@@ -4098,6 +4468,34 @@ EXIT_APP = object()      # returned by MatlabEngine.execute() for 'exit' / 'quit
 
 COMMANDS = {}  # command name -> (unbound MatlabEngine method, maximum number of arguments or None, argument regex)
 
+# Command syntax: a name, then words. For the file functions ('ls *.m') the words are an
+# expression instead if they start with '=' or '(' or with an operator and a space ('isfile + 1').
+_COMMAND_SYNTAX_RE = re.compile(r"([A-Za-z][A-Za-z0-9_]*)\s+(\S.*)", re.S)
+_EXPRESSION_RE = re.compile(r"[=(]|(?:==|~=|<=|>=|&&|\|\||\.[*/\\^]|[-+*/\\^<>&|:])\s")
+
+
+def _command_words(text):
+    """The words of command syntax, separated by spaces; in quotes ('My Data') they may contain
+    spaces. None if a quote is not closed."""
+    words, i = [], 0
+    while i < len(text):
+        if text[i].isspace():
+            i += 1
+            continue
+        word = []
+        while i < len(text) and not text[i].isspace():
+            if text[i] in '\'"':
+                end = _text_end(text, i)
+                if end is None:
+                    return None
+                word.append(text[i + 1:end - 1].replace(text[i] * 2, text[i]))
+                i = end
+            else:
+                word.append(text[i])
+                i += 1
+        words.append(''.join(word))
+    return words
+
 
 def console_command(*names, max_args=0, arg_pattern=r"\S+"):
     """Register a MatlabEngine method as the console command(s) `names`."""
@@ -4216,15 +4614,22 @@ class MatlabEngine:
 
     def _command_syntax(self, text):
         """'hold on', 'axis equal tight': a function that allows command syntax, with words as text inputs.
+        The file functions also take file names: 'delete *.txt', "mkdir 'My Data'".
 
         Returns the call as a parse tree, or None if text is not such a command.
         """
-        words = text.split()
-        entry = FUNCTIONS.get(words[0]) if len(words) > 1 else None
-        if (entry is None or words[0] in self.variables or not entry[0].command_syntax
-                or not all(_IDENT_RE.fullmatch(w) for w in words[1:])):
+        match = _COMMAND_SYNTAX_RE.fullmatch(text)
+        entry = FUNCTIONS.get(match.group(1)) if match else None
+        if entry is None or match.group(1) in self.variables or not entry[0].command_syntax:
             return None
-        return ('name', words[0], [('str', w) for w in words[1:]])
+        name, rest = match.groups()
+        if entry[0].command_syntax == 'files':
+            words = None if _EXPRESSION_RE.match(rest) else _command_words(rest)
+        else:
+            words = rest.split()
+            if not all(_IDENT_RE.fullmatch(w) for w in words):
+                words = None
+        return None if words is None else ('name', name, [('str', w) for w in words])
 
     def _is_function_call(self, node):
         return node[0] == 'name' and node[1] not in self.variables and node[1] in FUNCTIONS
@@ -4249,6 +4654,10 @@ class MatlabEngine:
     def write(self, text):
         """Print text exactly as given (disp, fprintf to the screen)."""
         self._output.append(RawText(text))
+
+    def show(self, text):
+        """Show text as the output of a command, like that of pwd (a blank line follows it)."""
+        self._output.append(text)
 
     def file(self, fid, function):
         """The open file with identifier fid; an error if there is none."""
@@ -4415,7 +4824,7 @@ class MatlabEngine:
         At the start it is the folder the program was started from (your
         home folder when started from Launchpad or the application menu).
 
-        See also cd, fopen.
+        See also cd, ls, fopen.
         """
         return [_indent(os.getcwd())]
 
@@ -4428,7 +4837,7 @@ class MatlabEngine:
                       Put a name with spaces in quotes: cd 'My Data'.
         cd            shows the current folder, like pwd.
 
-        See also pwd, fopen.
+        See also pwd, ls, mkdir, fopen.
         """
         if not args:
             return [_indent(os.getcwd())]
@@ -5535,6 +5944,9 @@ The help command describes everything {APP_NAME} can do, the same way as in MATL
   that create and reshape matrices. Some give several results: [m, i] = max(v).
 - Text and files: 'text' in quotes, disp and fprintf to show results, and fopen,
   fprintf, fscanf and fclose to write and read text files.
+- Files and folders: pwd and cd show and change the current folder; ls lists it,
+  mkdir and rmdir make and remove folders, copyfile, movefile and delete copy, move
+  and delete files, and isfile and isfolder check that they exist.
 - Workspace: format short and format long set the number of decimals shown, whos lists
   the variables, clear removes them and clc clears the window.
 - Plots: plot(x, y) draws lines in a figure window (made with matplotlib), and figure
@@ -5751,6 +6163,7 @@ class FigureWindow(tk.Toplevel):
     def __init__(self, app, figure):
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
         super().__init__(app.root, background=FIGURE_COLOR)
+        self.withdraw()  # hidden until built and placed: it would appear elsewhere, then jump
         self.app, self.gfig, self.closed = app, figure, False
         self.canvas = FigureCanvasTkAgg(figure.figure, master=self)
         self.toolbar = NavigationToolbar2Tk(self.canvas, self, pack_toolbar=False)
@@ -5764,6 +6177,7 @@ class FigureWindow(tk.Toplevel):
             self.bind(f'<{modifier}-{key}>', lambda event: self.close())
         self.refresh()
         self._place()
+        self.deiconify()  # shown at its final place
 
     def _place(self):
         """Beside the main window (to the right), each further figure a little lower."""
@@ -6091,7 +6505,8 @@ class MatlabConsoleApp:
                     return False  # 'exit' in the script closed the window
                 self.output_area.update_idletasks()
         finally:
-            if folder is not None and os.getcwd() == folder:
+            # realpath: on macOS os.getcwd() gives /private/var/... for a script in /var/...
+            if folder is not None and os.path.realpath(os.getcwd()) == os.path.realpath(folder):
                 try:
                     os.chdir(before)
                 except OSError:

@@ -729,6 +729,198 @@ class TestTextOutputAndFiles(EngineCase):
         self.assertError('cd nowhere', 'Unable to change current folder')
 
 
+class TestFilesAndFolders(EngineCase):
+    """ls, mkdir, rmdir, isfile, isfolder, copyfile, movefile and delete, in a temporary folder."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder = os.getcwd()
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
+        os.chdir(self.tmp)
+
+    def tearDown(self):
+        os.chdir(self.folder)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def make(self, *names):
+        for name in names:
+            path = os.path.join(self.tmp, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w') as f:
+                f.write(name)
+
+    def here(self, name=''):
+        return os.path.join(self.tmp, name)
+
+    def test_mkdir_and_isfolder(self):
+        self.assertEqual(self.out('mkdir results'), '')
+        self.assertTrue(os.path.isdir(self.here('results')))
+        self.out("mkdir 'My Data'")                                  # quotes keep the spaces
+        self.assertTrue(os.path.isdir(self.here('My Data')))
+        self.out("mkdir('results', 'run1'); mkdir a/b/c")            # parent folder; missing folders are made
+        self.assertTrue(os.path.isdir(self.here('results/run1')) and os.path.isdir(self.here('a/b/c')))
+        self.assertIn('Warning: Directory already exists.', self.out('mkdir results'))
+        self.assertIsNone(self.eng.last_error)
+        self.assertValue("[s, msg] = mkdir('results');", True, var='s')
+        self.assertEqual(text_of(self.eng.variables['msg']), 'Directory already exists.')
+        self.make('f.txt')
+        self.assertError('mkdir f.txt', 'a file of that name exists')
+        self.assertValue("s = mkdir('f.txt');", False, var='s')
+        self.assertEqual(self.eng.variables['s'].dtype, bool)
+        for line, value in (("isfolder('results')", True), ('isfolder results', True), ("isfolder('f.txt')", False),
+                            ("isfolder('none')", False), ("isfolder('..')", True)):
+            self.assertValue(line, value)
+        self.assertError('isfolder(3)', 'must be text')
+
+    def test_isfile(self):
+        self.make('data.txt', 'sub/x.m')
+        for line, value in (("isfile('data.txt')", True), ('isfile data.txt', True), ("isfile('sub/x.m')", True),
+                            ("isfile('sub')", False), ("isfile('none.txt')", False), ("isfile('')", False)):
+            self.assertValue(line, value)
+        self.assertEqual(self.ans("isfile('data.txt')").dtype, bool)
+
+    def test_ls(self):
+        self.make('b.txt', 'a.txt', 'Notes.m', '.hidden', 'sub/inner.txt')
+        self.assertEqual(self.out('ls'), '  a.txt    b.txt    Notes.m  sub\n')   # sorted, hidden names left out
+        self.assertEqual(self.out('ls sub'), '  inner.txt\n')
+        self.assertEqual(self.out('ls *.txt'), '  a.txt  b.txt\n')
+        self.assertEqual(self.out("ls('sub/*.txt')"), '  sub/inner.txt\n')
+        self.assertEqual(text_of(self.ans("x = ls('*.txt');", var='x')), 'a.txtb.txt')
+        self.assertEqual(self.eng.variables['x'].shape, (2, 5))           # one name per row
+        self.assertEqual(self.ans("y = ls('*.txt');", var='y').dtype, mc.CHAR)
+        self.assertError('ls missing*', 'not found')
+        os.mkdir(self.here('empty'))
+        self.assertEqual(self.out('ls empty'), '')
+        self.assertEqual(self.ans("z = ls('empty');", var='z').size, 0)
+        names = [f'file{k:02d}.txt' for k in range(12)]
+        self.make(*[os.path.join('many', n) for n in names])
+        rows = self.out('ls many').splitlines()                            # columns that fit in LS_WIDTH
+        self.assertGreater(len(rows), 1)
+        self.assertTrue(all(len(r) <= mc.LS_WIDTH + 2 for r in rows))
+        self.assertEqual(rows[0].split()[:2], ['file00.txt', f'file{len(rows):02d}.txt'])   # down the columns
+
+    def test_ls_is_a_variable_first(self):
+        self.out('ls = 3')
+        self.assertEqual(self.out('ls'), 'ls =\n    3\n')                    # the variable, not the function
+        self.assertValue('ls + 1', 4)
+
+    def test_rmdir(self):
+        self.make('full/a.txt', 'full/sub/b.txt')
+        os.mkdir(self.here('empty'))
+        self.out('rmdir empty')
+        self.assertFalse(os.path.exists(self.here('empty')))
+        self.assertError('rmdir full', 'is not empty')
+        self.assertTrue(os.path.isdir(self.here('full')))
+        self.assertValue("[s, m] = rmdir('full');", False, var='s')
+        self.assertIn('not empty', text_of(self.eng.variables['m']))
+        self.assertError("rmdir('full', 'x')", "must be 's'")
+        self.out('rmdir full s')                                          # with everything in it
+        self.assertFalse(os.path.exists(self.here('full')))
+        self.assertError('rmdir nowhere', 'not found')
+        self.make('f.txt')
+        self.assertError('rmdir f.txt', 'is not a folder')
+        os.mkdir(self.here('cur'))
+        self.out('cd cur')
+        self.assertError("rmdir('../cur')", 'current folder')
+        self.out('cd ..')
+        self.assertValue("s = rmdir('cur')", True, var='s')
+
+    def test_copyfile(self):
+        self.make('a.txt', 'b.txt', 'c.m', 'src/x.txt', 'src/deep/y.txt')
+        self.out('copyfile a.txt new.txt')
+        with open(self.here('new.txt')) as f:
+            self.assertEqual(f.read(), 'a.txt')
+        self.assertTrue(os.path.isfile(self.here('a.txt')))
+        os.mkdir(self.here('dest'))
+        self.out("copyfile('a.txt', 'dest')")                             # into an existing folder
+        self.assertTrue(os.path.isfile(self.here('dest/a.txt')))
+        self.out('copyfile *.txt backup')                                 # several files: the folder is made
+        self.assertEqual(sorted(os.listdir(self.here('backup'))), ['a.txt', 'b.txt', 'new.txt'])
+        self.out('copyfile src copy')                                     # a folder: its contents, with subfolders
+        self.assertTrue(os.path.isfile(self.here('copy/x.txt')) and os.path.isfile(self.here('copy/deep/y.txt')))
+        self.out('copyfile b.txt a.txt')                                  # an existing file is replaced
+        with open(self.here('a.txt')) as f:
+            self.assertEqual(f.read(), 'b.txt')
+        os.chdir(self.here('dest'))
+        self.out("copyfile('../c.m')")                                    # into the current folder
+        os.chdir(self.tmp)
+        self.assertTrue(os.path.isfile(self.here('dest/c.m')))
+        self.assertError('copyfile none.txt x.txt', 'No matching files were found')
+        self.assertValue("[s, m] = copyfile('none.txt', 'x.txt');", False, var='s')
+        self.assertEqual(text_of(self.eng.variables['m']), 'No matching files were found.')
+        self.assertError('copyfile a.txt a.txt', 'onto itself')
+        self.assertError('copyfile src src/inside', 'into itself')
+        self.assertError('copyfile *.m a.txt', 'must be a folder')
+        self.assertValue("s = copyfile('b.txt', 'd.txt')", True, var='s')
+
+    def test_copyfile_f_replaces_read_only_files(self):
+        self.make('a.txt', 'ro.txt')
+        os.chmod(self.here('ro.txt'), 0o444)
+        if os.access(self.here('ro.txt'), os.W_OK):
+            self.skipTest('read-only files can be written (running as root?)')
+        self.assertError('copyfile a.txt ro.txt', 'Permission denied')
+        self.out("copyfile('a.txt', 'ro.txt', 'f')")
+        with open(self.here('ro.txt')) as f:
+            self.assertEqual(f.read(), 'a.txt')
+        self.assertError("copyfile('a.txt', 'ro.txt', 'q')", "must be 'f'")
+
+    def test_movefile(self):
+        self.make('a.txt', 'b.txt', 'c.txt', 'old/x.txt')
+        self.out('movefile a.txt renamed.txt')
+        self.assertFalse(os.path.exists(self.here('a.txt')))
+        self.assertTrue(os.path.isfile(self.here('renamed.txt')))
+        self.out('movefile old new')                                      # a folder is renamed
+        self.assertTrue(os.path.isfile(self.here('new/x.txt')) and not os.path.exists(self.here('old')))
+        os.mkdir(self.here('box'))
+        self.out("movefile('new', 'box')")                                # into an existing folder
+        self.assertTrue(os.path.isfile(self.here('box/new/x.txt')))
+        self.out("movefile b.txt 'My Files'")                             # a new name, with a space
+        self.assertTrue(os.path.isfile(self.here('My Files')))
+        self.out('movefile c.txt renamed.txt')                            # an existing file is replaced
+        with open(self.here('renamed.txt')) as f:
+            self.assertEqual(f.read(), 'c.txt')
+        self.make('p.txt', 'q.txt')
+        self.out('movefile *.txt moved')
+        self.assertEqual(sorted(os.listdir(self.here('moved'))), ['p.txt', 'q.txt', 'renamed.txt'])
+        self.assertError('movefile none.txt x', 'No matching files were found')
+        self.assertError('movefile box box/inside', 'into itself')
+        os.mkdir(self.here('other'))
+        os.mkdir(self.here('box/other'))
+        self.assertError('movefile other box', 'exists already')
+        self.assertValue("[s, m] = movefile('none', 'x');", False, var='s')
+
+    def test_delete(self):
+        self.make('a.txt', 'b.txt', 'c.dat', 'd.dat', 'keep.m', 'sub/e.txt')
+        self.out('delete a.txt')
+        self.assertFalse(os.path.exists(self.here('a.txt')))
+        self.out("delete('c.dat', 'd.dat')")
+        self.assertFalse(os.path.exists(self.here('c.dat')) or os.path.exists(self.here('d.dat')))
+        self.out('delete *.txt')                                          # the folder sub does not match *.txt
+        self.assertFalse(os.path.exists(self.here('b.txt')))
+        self.assertTrue(os.path.isfile(self.here('sub/e.txt')) and os.path.isfile(self.here('keep.m')))
+        self.assertEqual(self.out("delete('none.txt')"), "Warning: File 'none.txt' not found.\n")
+        self.assertIsNone(self.eng.last_error)
+        self.assertIn('rmdir', self.out('delete sub'))                     # folders are not deleted
+        self.assertTrue(os.path.isdir(self.here('sub')))
+        self.out('delete *')                                              # files only
+        self.assertEqual(os.listdir(self.here()), ['sub'])
+        self.assertError('delete', 'Not enough input arguments')
+
+    def test_command_syntax_with_file_names(self):
+        self.make('data.txt')
+        self.out("copyfile data.txt 'it''s here.txt'")                    # '' is a quote inside quotes
+        self.assertTrue(os.path.isfile(self.here("it's here.txt")))
+        self.out('copyfile "data.txt" "two words.txt"')
+        self.assertTrue(os.path.isfile(self.here('two words.txt')))
+        self.out('mkdir tilde_test; isfolder tilde_test')                 # ; ends the command, as usual
+        self.assertValue('isfolder tilde_test', True)
+        self.assertError('isfile + 1', 'Not enough input arguments')       # an expression, not command syntax
+        self.assertError("mkdir 'unclosed", '')
+        self.assertFalse(os.path.exists(self.here("'unclosed")) or os.path.exists(self.here('unclosed')))
+        home = os.path.expanduser('~')
+        self.assertValue('isfolder ~', os.path.isdir(home))
+
+
 HAVE_MATPLOTLIB = importlib.util.find_spec('matplotlib') is not None
 
 
@@ -888,6 +1080,22 @@ class TestSetAndGet(GraphicsCase):
         self.assertIn("LineStyle: ':'", listing)
         self.assertIn('MarkerSize', self.out(f'set({h})'))
         self.assertError('s = get(gca)', 'only lists the properties')
+
+    def test_delete_graphics_objects(self):
+        h = self.ans("h = plot([1 2; 3 4]); legend('a', 'b');", var='h').ravel().tolist()
+        self.out('delete(h(1))')
+        self.assertEqual([line.handle for line in self.lines()], [h[1]])
+        self.assertEqual(self.ans("get(gca, 'Children')").ravel().tolist(), [h[1]])
+        self.assertError('delete(h(1))', 'Invalid or deleted graphics object')
+        self.render()                                                     # the legend follows the lines
+        self.out('delete(legend)')
+        self.assertIsNone(self.axes().legend)
+        self.assertError("delete(get(gca, 'Title'))", 'cannot be deleted')
+        self.out('delete(gca)')
+        self.assertIsNone(self.eng.graphics.current.axes)
+        self.out('plot(1:3); delete([gcf gca])')                          # the axes goes with its figure
+        self.assertIsNone(self.eng.last_error)
+        self.assertEqual(self.eng.graphics.figures, {})
 
     def test_axes_properties(self):
         self.out('plot(1:10, (1:10).^2)')
