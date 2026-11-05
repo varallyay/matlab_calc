@@ -4,6 +4,7 @@ Matlab_Calc - a MATLAB Command Window emulator built with Tkinter and NumPy.
 Run with:  python3 matlab_calc.py
 """
 
+import functools
 import gc
 import inspect
 import json
@@ -33,7 +34,7 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
-APP_VERSION = '0.8.0'           # Shown in the welcome banner; see the version history in README.md
+APP_VERSION = '0.9.0'           # Shown in the welcome banner; see the version history in README.md
 APP_CREDITS = "Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, Claude)"
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
@@ -56,6 +57,11 @@ PROMPT = '>> '
 SHORT_DECIMALS = 4              # Maximum decimals shown by 'format short' (the default)
 LONG_DECIMALS = 15              # Maximum decimals shown by 'format long'
 MAX_DISPLAY_ELEMENTS = 10000    # Bigger results are summarised instead of printed in full
+
+FIGURE_WIDTH = 560              # Size of the plot area of a new figure window in pixels (as in MATLAB)
+FIGURE_HEIGHT = 420
+FIGURE_COLOR = '#f0f0f0'        # Background of figure windows (MATLAB's light gray)
+PLOT_LINE_WIDTH = 1.5           # Default width of plotted lines in points (matplotlib's; MATLAB uses 0.5)
 
 CONFIG_FILE = '~/.matlab_calc.json'  # Settings file in the home folder: first start, installation
 UPDATE_REPOSITORY = 'varallyay/matlab_calc'  # GitHub project (owner/name) that publishes new versions
@@ -339,13 +345,14 @@ CAT_LOGICAL = 'Logical values and searching'
 CAT_RANDOM = 'Random numbers'
 CAT_MATRIX = 'Matrices and arrays'
 CAT_TEXT = 'Text and files'
+CAT_GRAPHICS = 'Graphics'
 HELP_CATEGORIES = (CAT_COMMANDS, CAT_CONSTANTS, CAT_MATH, CAT_ELEMENTWISE, CAT_TRIG, CAT_HYPERBOLIC, CAT_ROUNDING,
-                   CAT_STATS, CAT_LOGICAL, CAT_RANDOM, CAT_MATRIX, CAT_TEXT)
+                   CAT_STATS, CAT_LOGICAL, CAT_RANDOM, CAT_MATRIX, CAT_TEXT, CAT_GRAPHICS)
 
 FUNCTIONS = {}  # MATLAB name -> (Python function, minimum inputs, maximum inputs)
 
 
-def builtin(*names, category, outputs=1, keep_types=False):
+def builtin(*names, category, outputs=1, keep_types=False, command_syntax=False):
     """Register the decorated Python function as the MATLAB function(s) `names`.
 
     outputs is the largest number of results it returns ([a, b] = f(...) asks for 2; a
@@ -354,6 +361,7 @@ def builtin(*names, category, outputs=1, keep_types=False):
     function has the keyword-only parameter nargout, it learns how many results are wanted
     (0 for a statement such as disp(x), where it may return None for "no result"); a
     keyword-only parameter engine receives the MatlabEngine, e.g. to print text.
+    command_syntax allows MATLAB's command syntax with words, e.g. 'hold on' for hold('on').
     """
     def register(func):
         params = list(inspect.signature(func).parameters.values())
@@ -364,7 +372,7 @@ def builtin(*names, category, outputs=1, keep_types=False):
         for name in names:
             FUNCTIONS[name] = (func, min_args, None if variadic else len(positional))
         func.matlab_names, func.help_category = names, category
-        func.max_outputs, func.keep_types = outputs, keep_types
+        func.max_outputs, func.keep_types, func.command_syntax = outputs, keep_types, command_syntax
         func.wants_nargout, func.wants_engine = 'nargout' in keywords, 'engine' in keywords
         return func
     return register
@@ -1713,6 +1721,1589 @@ def fn_fscanf(fid, fmt, size=None, *, nargout=1, engine):
     return (result, to_matrix(count)) if nargout >= 2 else result
 
 
+# =============================================================================
+#  Graphics: figure, plot, labels, legend, set and get - drawn with matplotlib
+#
+#  The engine keeps every figure as a matplotlib Figure. The GUI shows each one in
+#  its own window (FigureWindow); without a window (e.g. in the tests) the figures
+#  are only kept in memory. As in MATLAB before R2014b, graphics objects are named
+#  by handles that are plain numbers: figures by their number (1, 2, ...), axes,
+#  lines and texts by numbers such as 1.5, 2.5, ... that can never be a figure.
+#  Colors and the color order are matplotlib's; the rest looks like MATLAB.
+# =============================================================================
+_MPL = {}
+
+# matplotlib settings that give figures MATLAB's look (colors and color order stay matplotlib's)
+FIGURE_STYLE = {
+    'figure.facecolor': FIGURE_COLOR, 'axes.facecolor': 'white', 'savefig.facecolor': 'white',
+    'axes.autolimit_mode': 'round_numbers', 'axes.xmargin': 0, 'axes.ymargin': 0,  # limits at tick values
+    'xtick.direction': 'in', 'ytick.direction': 'in', 'xtick.top': True, 'ytick.right': True,
+    'axes.linewidth': 0.6, 'xtick.major.width': 0.6, 'ytick.major.width': 0.6,
+    'axes.titlesize': 11, 'axes.titleweight': 'bold', 'axes.labelsize': 11,
+    'xtick.labelsize': 10, 'ytick.labelsize': 10, 'legend.fontsize': 9,
+    'grid.color': '0.15', 'grid.alpha': 0.15, 'grid.linewidth': 0.5, 'grid.linestyle': '-',
+    'legend.fancybox': False, 'legend.edgecolor': '0.15', 'legend.framealpha': 1, 'legend.loc': 'upper right',
+    'lines.linewidth': PLOT_LINE_WIDTH,
+}
+AXES_POSITION = (0.13, 0.11, 0.775, 0.815)  # MATLAB's default axes position in the figure
+LABEL_SIZE_FACTOR = 1.1                     # labels and title are 10 % larger than the tick labels
+
+
+def _mpl():
+    """matplotlib, imported at the first graphics command (it takes a moment)."""
+    if not _MPL:
+        try:
+            import matplotlib
+            import matplotlib.colors
+            from matplotlib.figure import Figure
+            from matplotlib.mathtext import MathTextParser
+        except ImportError:
+            raise MatlabError("Error: Plots need the Python package matplotlib. Install it with\n"
+                              "pip install matplotlib (or conda install matplotlib), then restart "
+                              f"{APP_NAME}.") from None
+        matplotlib.rcParams.update(FIGURE_STYLE)
+        _MPL.update(colors=matplotlib.colors, Figure=Figure, mathtext=MathTextParser('path'))
+    return _MPL
+
+
+class _BadValue(Exception):
+    """A property value of the wrong kind; the message says what is expected."""
+
+
+def _as_text(value):
+    """Text of a char array; the rows of a char matrix become lines."""
+    return '\n'.join(chars_to_text(row) for row in value) if value.size else ''
+
+
+def _is_text_value(value):
+    return isinstance(value, np.ndarray) and is_text(value)
+
+
+def _on_off(value):
+    if _is_text_value(value) and _as_text(value).lower() in ('on', 'off'):
+        return _as_text(value).lower() == 'on'
+    if isinstance(value, np.ndarray) and value.size == 1 and not is_text(value) and np.real(value).item() in (0, 1):
+        return bool(np.real(value).item())
+    raise _BadValue("it must be 'on' or 'off'.")
+
+
+def _choice(value, choices):
+    word = _as_text(value).lower() if _is_text_value(value) else None
+    if word not in choices:
+        raise _BadValue("it must be " + ', '.join(f"'{c}'" for c in choices[:-1]) + f" or '{choices[-1]}'.")
+    return word
+
+
+def _number(value, positive=False):
+    if not isinstance(value, np.ndarray) or is_text(value) or value.size != 1 or np.iscomplexobj(value):
+        raise _BadValue("it must be a number" + (" greater than 0." if positive else "."))
+    number = float(value.item())
+    if positive and not number > 0:
+        raise _BadValue("it must be a number greater than 0.")
+    return number
+
+
+def _numbers(value):
+    if not isinstance(value, np.ndarray) or is_text(value) or np.iscomplexobj(value):
+        raise _BadValue("it must be a vector of numbers.")
+    return to_double(value).ravel(order='F').astype(float)
+
+
+def _limits(value):
+    """[min max] for XLim and YLim; -Inf or Inf keeps that end automatic (None)."""
+    pair = _numbers(value)
+    if pair.size != 2 or np.isnan(pair).any() or not pair[0] < pair[1]:
+        raise _BadValue("it must be [min max], two numbers with min < max.")
+    return [None if math.isinf(v) else float(v) for v in pair]
+
+
+def _color(value, allow=()):
+    """A matplotlib color: 'r', 'red', '#ff8000' or an RGB triplet [1 0.5 0] (allow: e.g. 'none')."""
+    colors = _mpl()['colors']
+    if _is_text_value(value):
+        text = _as_text(value).strip()
+        if text.lower() in allow:
+            return text.lower()
+        if colors.is_color_like(text):
+            return text
+    elif isinstance(value, np.ndarray) and value.size == 3 and not np.iscomplexobj(value):
+        rgb = tuple(float(v) for v in to_double(value).ravel())
+        if all(0 <= v <= 1 for v in rgb):
+            return rgb
+    raise _BadValue("it must be a color such as 'r', 'red', '#ff8000' or [1 0.5 0]"
+                    + "".join(f" or '{a}'" for a in allow) + ".")
+
+
+def _rgb(color):
+    """A matplotlib color as an RGB row, or the text 'none'."""
+    if isinstance(color, str) and color.lower() == 'none':
+        return 'none'
+    rgba = _mpl()['colors'].to_rgba(color)
+    return 'none' if rgba[3] == 0 else [round(v, 4) for v in rgba[:3]]
+
+
+def _to_matlab(value):
+    """A property value as a MATLAB value: text, 'on'/'off', a number or a row of numbers."""
+    if isinstance(value, bool):
+        return text_to_chars('on' if value else 'off')
+    if isinstance(value, str):
+        return text_to_chars(value)
+    if value is None:
+        return np.zeros((0, 0))
+    if isinstance(value, np.ndarray):
+        return value if value.ndim == 2 else to_matrix(value.reshape(1, -1))
+    if isinstance(value, (list, tuple)):
+        return to_matrix(np.array(value, dtype=float).reshape(1, -1)) if len(value) else np.zeros((1, 0))
+    return to_matrix(float(value))
+
+
+@functools.lru_cache(maxsize=1024)
+def _mathtext_ok(text):
+    """Can matplotlib draw text with $...$ math in it?"""
+    try:
+        _mpl()['mathtext'].parse(text)
+        return True
+    except Exception:
+        return False
+
+
+_TEX_MARKUP = re.compile(r"\\([A-Za-z]+)|([_^])(\{[^{}]*\}|\\[A-Za-z]+|[^\s{}\\])")
+
+
+def tex_to_mathtext(text):
+    """MATLAB's TeX markup - x_1, x^2, x_{10}, \\alpha - as matplotlib math text.
+
+    Returns (text, has_math). Markup that matplotlib cannot draw stays as it is.
+    """
+    parts, last = [], 0
+    for m in _TEX_MARKUP.finditer(text):
+        if m.group(1):
+            piece = '$\\' + m.group(1) + '$'
+        else:
+            argument = m.group(3)[1:-1] if m.group(3).startswith('{') else m.group(3)
+            piece = '${}' + m.group(2) + '{' + argument.replace(' ', '\\ ') + '}$'
+        if _mathtext_ok(piece):
+            parts += [text[last:m.start()].replace('$', '\\$'), piece]
+            last = m.end()
+    if not parts:
+        return text, False
+    parts.append(text[last:].replace('$', '\\$'))
+    result = ''.join(parts)
+    return (result, True) if _mathtext_ok(result) else (text, False)
+
+
+def show_text(artist, text, interpreter):
+    """Put text on a matplotlib Text, interpreted as MATLAB does: 'tex', 'latex' or 'none'."""
+    if interpreter == 'tex':
+        text, math = tex_to_mathtext(text)
+    else:
+        math = interpreter == 'latex' and '$' in text and _mathtext_ok(text)
+    artist.set_text(text)
+    if hasattr(artist, 'set_parse_math'):  # matplotlib 3.5 and later
+        artist.set_parse_math(math)
+
+
+class GraphicsObject:
+    """A figure, axes, line, text or legend, with MATLAB's properties (see set and get).
+
+    Property P is read by the method get_p and changed by set_p (none: read-only).
+    """
+    TYPE = 'Object'
+    PROPERTIES = ('Parent', 'Type')
+
+    def __init__(self, graphics, parent=None, handle=None):
+        self.graphics, self.parent = graphics, parent
+        self.handle = graphics.new_handle() if handle is None else handle
+
+    @classmethod
+    def property_name(cls, name, function):
+        """The full name of a property: any capitalisation, or an unambiguous start ('linew')."""
+        key = name.lower()
+        matches = ([p for p in cls.PROPERTIES if p.lower() == key]
+                   or [p for p in cls.PROPERTIES if p.lower().startswith(key)])
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise MatlabError(f"Error using {function}\nUnrecognized property {name} for class {cls.TYPE}.")
+        raise MatlabError(f"Error using {function}\nAmbiguous property name {name} for class {cls.TYPE}: "
+                          f"{', '.join(matches)}.")
+
+    def get(self, name, function='get'):
+        return _to_matlab(getattr(self, 'get_' + self.property_name(name, function).lower())())
+
+    def set(self, name, value, function='set'):
+        prop = self.property_name(name, function)
+        setter = getattr(self, 'set_' + prop.lower(), None)
+        if setter is None:
+            raise MatlabError(f"Error using {function}\nThe {prop} property of a {self.TYPE} cannot be changed.")
+        try:
+            setter(value)
+        except _BadValue as err:
+            raise MatlabError(f"Error using {function}\nInvalid value for {prop} property: {err}") from None
+        self.changed()
+
+    def settable(self):
+        return [p for p in self.PROPERTIES if hasattr(self, 'set_' + p.lower())]
+
+    def owner(self):
+        """The GFigure this object is in."""
+        obj = self
+        while obj.parent is not None:
+            obj = obj.parent
+        return obj
+
+    def changed(self):
+        self.graphics.dirty.add(self.owner().number)
+
+    def get_type(self):
+        return self.TYPE.lower()
+
+    def get_parent(self):
+        return None if self.parent is None else self.parent.handle
+
+
+class GFigure(GraphicsObject):
+    TYPE = 'Figure'
+    PROPERTIES = ('Children', 'Color', 'CurrentAxes', 'Name', 'Number', 'NumberTitle', 'Parent', 'Position', 'Type')
+
+    def __init__(self, graphics, number):
+        super().__init__(graphics, handle=float(number))
+        self.number, self.name, self.number_title = number, '', True
+        self.figure = _mpl()['Figure'](figsize=(FIGURE_WIDTH / 100, FIGURE_HEIGHT / 100), dpi=100)
+        self.axes = None        # phase 1: one axes per figure, made by the first plot
+        self.position = [100 + 30 * (number - 1), 300 - 30 * (number - 1), FIGURE_WIDTH, FIGURE_HEIGHT]
+
+    def title(self):
+        """Title of the figure window, e.g. 'Figure 1: Results'."""
+        if not self.number_title:
+            return self.name or ' '
+        return f"Figure {self.number}" + (f": {self.name}" if self.name else "")
+
+    def clear(self):
+        """clf: delete the axes and everything in them."""
+        if self.axes is not None:
+            self.axes.forget()
+            self.axes = None
+        self.figure.clear()
+        self.changed()
+
+    def get_children(self):
+        return None if self.axes is None else [self.axes.handle]
+
+    def get_currentaxes(self):
+        return self.get_children()
+
+    def get_number(self):
+        return self.number
+
+    def get_name(self):
+        return self.name
+
+    def set_name(self, value):
+        if not _is_text_value(value):
+            raise _BadValue("it must be text, e.g. 'Results'.")
+        self.name = _as_text(value)
+
+    def get_numbertitle(self):
+        return self.number_title
+
+    def set_numbertitle(self, value):
+        self.number_title = _on_off(value)
+
+    def get_color(self):
+        return _rgb(self.figure.get_facecolor())
+
+    def set_color(self, value):
+        self.figure.set_facecolor(_color(value))
+
+    def get_position(self):
+        host = self.graphics.host
+        return (host.figure_position(self) if host else None) or self.position
+
+    def set_position(self, value):
+        position = _numbers(value)
+        if position.size != 4 or not (position[2] > 0 and position[3] > 0):
+            raise _BadValue("it must be [left bottom width height] in pixels.")
+        self.position = [float(v) for v in position]
+        if self.graphics.host:
+            self.graphics.host.set_figure_position(self, self.position)
+
+
+class GAxes(GraphicsObject):
+    TYPE = 'Axes'
+    PROPERTIES = ('Box', 'Children', 'Color', 'FontSize', 'Legend', 'LineWidth', 'NextPlot', 'Parent', 'TickDir',
+                  'Title', 'Type', 'XDir', 'XGrid', 'XLabel', 'XLim', 'XLimMode', 'XMinorGrid', 'XScale', 'XTick',
+                  'YDir', 'YGrid', 'YLabel', 'YLim', 'YLimMode', 'YMinorGrid', 'YScale', 'YTick')
+
+    def __init__(self, graphics, figure):
+        super().__init__(graphics, figure)
+        self.ax = figure.figure.add_axes(AXES_POSITION)
+        self.hold, self.lines, self.legend = False, [], None
+        self.labels = {key: GText(graphics, self, key) for key in ('title', 'xlabel', 'ylabel')}
+        for obj in [self] + list(self.labels.values()):
+            graphics.objects[obj.handle] = obj
+        self._defaults()
+
+    def _defaults(self):
+        self.box, self.grid = True, {'x': False, 'y': False, 'xminor': False, 'yminor': False}
+        self.font_size = FIGURE_STYLE['xtick.labelsize']
+        self.line_width, self.tick_dir = FIGURE_STYLE['axes.linewidth'], 'in'
+        for label in self.labels.values():
+            label.reset()
+
+    def reset(self):
+        """What plot does without hold on: delete the lines and legend, reset the axes (title, limits, ...)."""
+        self.clear_children()
+        self.ax.cla()
+        self._defaults()
+        self.changed()
+
+    def clear_children(self):
+        """cla: delete the lines and the legend; the color order starts again."""
+        for line in self.lines:
+            line.artist.remove()
+            self.graphics.objects.pop(line.handle, None)
+        self.lines = []
+        self.remove_legend()
+        self.ax.set_prop_cycle(None)
+        self.changed()
+
+    def remove_legend(self):
+        if self.legend is not None:
+            self.legend.remove_artist()
+            self.graphics.objects.pop(self.legend.handle, None)
+            self.legend = None
+
+    def forget(self):
+        self.clear_children()
+        for obj in [self] + list(self.labels.values()):
+            self.graphics.objects.pop(obj.handle, None)
+
+    def add_line(self, x, y, spec):
+        options = {}
+        if spec:
+            if 'color' in spec:
+                options['color'] = spec['color']
+            options['linestyle'] = spec.get('linestyle', 'None' if 'marker' in spec else '-')
+            options['marker'] = _MARKERS[spec['marker']] if 'marker' in spec else 'None'
+        (artist,) = self.ax.plot(x, y, **options)
+        line = GLine(self.graphics, self, artist)
+        self.lines.append(line)
+        self.graphics.objects[line.handle] = line
+        self.changed()
+        return line
+
+    def update_legend(self):
+        """Draw the legend again: its entries follow the lines (names, colors, new lines)."""
+        if self.legend is not None:
+            self.legend.draw()
+
+    # ---- properties ----
+    def get_box(self):
+        return self.box
+
+    def set_box(self, value):
+        self.box = _on_off(value)
+        for side in ('top', 'right'):
+            self.ax.spines[side].set_visible(self.box)
+        self.ax.tick_params(top=self.box, right=self.box)
+
+    def get_children(self):
+        return np.array([line.handle for line in reversed(self.lines)], dtype=float).reshape(-1, 1)
+
+    def get_color(self):
+        return _rgb(self.ax.get_facecolor())
+
+    def set_color(self, value):
+        self.ax.set_facecolor(_color(value, allow=('none',)))
+
+    def get_fontsize(self):
+        return self.font_size
+
+    def set_fontsize(self, value):
+        self.font_size = _number(value, positive=True)
+        self.ax.tick_params(labelsize=self.font_size)
+        for label in self.labels.values():
+            label.artist().set_fontsize(self.font_size * LABEL_SIZE_FACTOR)
+
+    def get_legend(self):
+        return None if self.legend is None else self.legend.handle
+
+    def get_linewidth(self):
+        return self.line_width
+
+    def set_linewidth(self, value):
+        self.line_width = _number(value, positive=True)
+        for spine in self.ax.spines.values():
+            spine.set_linewidth(self.line_width)
+        self.ax.tick_params(width=self.line_width)
+
+    def get_nextplot(self):
+        return 'add' if self.hold else 'replace'
+
+    def set_nextplot(self, value):
+        self.hold = _choice(value, ('add', 'replace', 'replacechildren')) == 'add'
+
+    def get_tickdir(self):
+        return self.tick_dir
+
+    def set_tickdir(self, value):
+        self.tick_dir = _choice(value, ('in', 'out', 'both'))
+        self.ax.tick_params(which='both', direction='inout' if self.tick_dir == 'both' else self.tick_dir)
+
+    def get_title(self):
+        return self.labels['title'].handle
+
+    def get_xlabel(self):
+        return self.labels['xlabel'].handle
+
+    def get_ylabel(self):
+        return self.labels['ylabel'].handle
+
+    def _axis(self, letter):
+        return self.ax.xaxis if letter == 'x' else self.ax.yaxis
+
+    def limits(self, letter):
+        low, high = (self.ax.get_xlim if letter == 'x' else self.ax.get_ylim)()
+        return [min(low, high), max(low, high)]
+
+    def set_limits(self, letter, limits):
+        low, high = limits
+        if self._axis(letter).get_inverted():
+            low, high = high, low
+        (self.ax.set_xlim if letter == 'x' else self.ax.set_ylim)(low, high)
+        self.changed()
+
+    def limit_mode(self, letter, mode):
+        if mode == 'auto':
+            (self.ax.set_autoscalex_on if letter == 'x' else self.ax.set_autoscaley_on)(True)
+            self.ax.autoscale_view(scalex=letter == 'x', scaley=letter == 'y')
+        else:
+            self.set_limits(letter, self.limits(letter))  # keeps the present limits
+        self.changed()
+
+    def show_grid(self, letter, on, minor=False):
+        self.grid[letter + ('minor' if minor else '')] = on
+        if minor:
+            if on:
+                self.ax.minorticks_on()
+            self.ax.grid(on, which='minor', axis=letter, linestyle=':', alpha=0.25)
+        else:
+            self.ax.grid(on, which='major', axis=letter)
+        self.changed()
+
+    def _direction(self, letter, value):
+        reverse = _choice(value, ('normal', 'reverse')) == 'reverse'
+        if reverse != self._axis(letter).get_inverted():
+            self._axis(letter).set_inverted(reverse)
+
+    def _ticks(self, letter):
+        low, high = self.limits(letter)
+        ticks = self._axis(letter).get_ticklocs()
+        span = (high - low) * 1e-9
+        return [float(t) for t in ticks if low - span <= t <= high + span]
+
+    def get_xdir(self):
+        return 'reverse' if self.ax.xaxis.get_inverted() else 'normal'
+
+    def set_xdir(self, value):
+        self._direction('x', value)
+
+    def get_ydir(self):
+        return 'reverse' if self.ax.yaxis.get_inverted() else 'normal'
+
+    def set_ydir(self, value):
+        self._direction('y', value)
+
+    def get_xgrid(self):
+        return self.grid['x']
+
+    def set_xgrid(self, value):
+        self.show_grid('x', _on_off(value))
+
+    def get_ygrid(self):
+        return self.grid['y']
+
+    def set_ygrid(self, value):
+        self.show_grid('y', _on_off(value))
+
+    def get_xminorgrid(self):
+        return self.grid['xminor']
+
+    def set_xminorgrid(self, value):
+        self.show_grid('x', _on_off(value), minor=True)
+
+    def get_yminorgrid(self):
+        return self.grid['yminor']
+
+    def set_yminorgrid(self, value):
+        self.show_grid('y', _on_off(value), minor=True)
+
+    def get_xlim(self):
+        return self.limits('x')
+
+    def set_xlim(self, value):
+        self.set_limits('x', _limits(value))
+
+    def get_ylim(self):
+        return self.limits('y')
+
+    def set_ylim(self, value):
+        self.set_limits('y', _limits(value))
+
+    def get_xlimmode(self):
+        return 'auto' if self.ax.get_autoscalex_on() else 'manual'
+
+    def set_xlimmode(self, value):
+        self.limit_mode('x', _choice(value, ('auto', 'manual')))
+
+    def get_ylimmode(self):
+        return 'auto' if self.ax.get_autoscaley_on() else 'manual'
+
+    def set_ylimmode(self, value):
+        self.limit_mode('y', _choice(value, ('auto', 'manual')))
+
+    def get_xscale(self):
+        return self.ax.get_xscale()
+
+    def set_xscale(self, value):
+        self.ax.set_xscale(_choice(value, ('linear', 'log')))
+
+    def get_yscale(self):
+        return self.ax.get_yscale()
+
+    def set_yscale(self, value):
+        self.ax.set_yscale(_choice(value, ('linear', 'log')))
+
+    def get_xtick(self):
+        return self._ticks('x')
+
+    def set_xtick(self, value):
+        self.ax.set_xticks(sorted(_numbers(value)))
+
+    def get_ytick(self):
+        return self._ticks('y')
+
+    def set_ytick(self, value):
+        self.ax.set_yticks(sorted(_numbers(value)))
+
+
+_LINE_STYLES = ('--', '-.', '-', ':')
+_MARKERS = {'o': 'o', '+': '+', '*': '*', '.': '.', 'x': 'x', 's': 's', 'd': 'D', '^': '^', 'v': 'v',
+            '<': '<', '>': '>', 'p': 'p', 'h': 'h', '_': '_', '|': '|'}
+_MARKER_NAMES = {'square': 's', 'diamond': 'd', 'pentagram': 'p', 'hexagram': 'h', 'none': 'none'}
+_COLOR_LETTERS = 'rgbcmykw'
+
+
+def parse_linespec(spec):
+    """'r--o' -> {'color': 'r', 'linestyle': '--', 'marker': 'o'}; None if spec is not a LineSpec."""
+    result, rest = {}, spec.strip()
+    if not rest:
+        return None
+    for style in _LINE_STYLES:
+        if style in rest:
+            result['linestyle'], rest = style, rest.replace(style, '', 1)
+            break
+    for ch in rest:
+        if ch in _COLOR_LETTERS and 'color' not in result:
+            result['color'] = ch
+        elif ch in _MARKERS and 'marker' not in result:
+            result['marker'] = ch
+        else:
+            return None
+    return result
+
+
+class GLine(GraphicsObject):
+    TYPE = 'Line'
+    PROPERTIES = ('Color', 'DisplayName', 'LineStyle', 'LineWidth', 'Marker', 'MarkerEdgeColor',
+                  'MarkerFaceColor', 'MarkerSize', 'Parent', 'Type', 'Visible', 'XData', 'YData')
+
+    def __init__(self, graphics, axes, artist):
+        super().__init__(graphics, axes)
+        self.artist, self.display_name, self.in_legend = artist, '', True
+
+    def get_color(self):
+        return _rgb(self.artist.get_color())
+
+    def set_color(self, value):
+        self.artist.set_color(_color(value))
+
+    def get_displayname(self):
+        return self.display_name
+
+    def set_displayname(self, value):
+        if not _is_text_value(value):
+            raise _BadValue("it must be text, e.g. 'measured'.")
+        self.display_name = _as_text(value)
+
+    def get_linestyle(self):
+        style = self.artist.get_linestyle()
+        return style if style in _LINE_STYLES else 'none'
+
+    def set_linestyle(self, value):
+        style = _choice(value, _LINE_STYLES + ('none',))
+        self.artist.set_linestyle('None' if style == 'none' else style)
+
+    def get_linewidth(self):
+        return self.artist.get_linewidth()
+
+    def set_linewidth(self, value):
+        self.artist.set_linewidth(_number(value, positive=True))
+
+    def get_marker(self):
+        marker = self.artist.get_marker()
+        return next((k for k, v in _MARKERS.items() if v == marker), 'none')
+
+    def set_marker(self, value):
+        word = _as_text(value).strip().lower() if _is_text_value(value) else None
+        word = _MARKER_NAMES.get(word, word)
+        if word not in _MARKERS and word != 'none':
+            raise _BadValue("it must be one of " + ' '.join(_MARKERS) + " or 'none'.")
+        self.artist.set_marker('None' if word == 'none' else _MARKERS[word])
+
+    def get_markeredgecolor(self):
+        return _rgb(self.artist.get_markeredgecolor())
+
+    def set_markeredgecolor(self, value):
+        self.artist.set_markeredgecolor(_color(value, allow=('none', 'auto')))
+
+    def get_markerfacecolor(self):
+        return _rgb(self.artist.get_markerfacecolor())
+
+    def set_markerfacecolor(self, value):
+        self.artist.set_markerfacecolor(_color(value, allow=('none', 'auto')))
+
+    def get_markersize(self):
+        return self.artist.get_markersize()
+
+    def set_markersize(self, value):
+        self.artist.set_markersize(_number(value, positive=True))
+
+    def get_visible(self):
+        return self.artist.get_visible()
+
+    def set_visible(self, value):
+        self.artist.set_visible(_on_off(value))
+
+    def get_xdata(self):
+        return np.asarray(self.artist.get_xdata(), dtype=float).reshape(1, -1)
+
+    def set_xdata(self, value):
+        self.artist.set_xdata(_numbers(value))
+        self._rescale()
+
+    def get_ydata(self):
+        return np.asarray(self.artist.get_ydata(), dtype=float).reshape(1, -1)
+
+    def set_ydata(self, value):
+        self.artist.set_ydata(_numbers(value))
+        self._rescale()
+
+    def _rescale(self):
+        self.parent.ax.relim()
+        self.parent.ax.autoscale_view()
+
+
+class GText(GraphicsObject):
+    """The title or an axis label of an axes."""
+    TYPE = 'Text'
+    PROPERTIES = ('Color', 'FontAngle', 'FontSize', 'FontWeight', 'Interpreter', 'Parent', 'String', 'Type',
+                  'Visible')
+
+    def __init__(self, graphics, axes, kind):
+        super().__init__(graphics, axes)
+        self.kind = kind
+        self.reset()
+
+    def reset(self):
+        self.string, self.interpreter = '', 'tex'
+
+    def artist(self):
+        ax = self.parent.ax
+        return {'title': ax.title, 'xlabel': ax.xaxis.label, 'ylabel': ax.yaxis.label}[self.kind]
+
+    def get_string(self):
+        return self.string
+
+    def set_string(self, value):
+        if not _is_text_value(value) and not (isinstance(value, np.ndarray) and value.size == 0):
+            raise _BadValue("it must be text, e.g. 'Time (s)'.")
+        self.string = _as_text(value)
+        show_text(self.artist(), self.string, self.interpreter)
+
+    def get_interpreter(self):
+        return self.interpreter
+
+    def set_interpreter(self, value):
+        self.interpreter = _choice(value, ('tex', 'latex', 'none'))
+        show_text(self.artist(), self.string, self.interpreter)
+
+    def get_color(self):
+        return _rgb(self.artist().get_color())
+
+    def set_color(self, value):
+        self.artist().set_color(_color(value))
+
+    def get_fontangle(self):
+        return 'italic' if self.artist().get_style() == 'italic' else 'normal'
+
+    def set_fontangle(self, value):
+        self.artist().set_style(_choice(value, ('normal', 'italic')))
+
+    def get_fontsize(self):
+        return self.artist().get_fontsize()
+
+    def set_fontsize(self, value):
+        self.artist().set_fontsize(_number(value, positive=True))
+
+    def get_fontweight(self):
+        weight = self.artist().get_fontweight()
+        return 'bold' if weight == 'bold' or (isinstance(weight, (int, float)) and weight >= 600) else 'normal'
+
+    def set_fontweight(self, value):
+        self.artist().set_fontweight(_choice(value, ('normal', 'bold')))
+
+    def get_visible(self):
+        return self.artist().get_visible()
+
+    def set_visible(self, value):
+        self.artist().set_visible(_on_off(value))
+
+
+_LEGEND_LOCATIONS = {'northeast': 'upper right', 'northwest': 'upper left', 'southeast': 'lower right',
+                     'southwest': 'lower left', 'north': 'upper center', 'south': 'lower center',
+                     'east': 'center right', 'west': 'center left', 'best': 'best'}
+
+
+class GLegend(GraphicsObject):
+    TYPE = 'Legend'
+    PROPERTIES = ('Box', 'FontSize', 'Location', 'Orientation', 'Parent', 'Type', 'Visible')
+
+    def __init__(self, graphics, axes):
+        super().__init__(graphics, axes)
+        self.location, self.orientation, self.box, self.visible = 'northeast', 'vertical', True, True
+        self.font_size = FIGURE_STYLE['legend.fontsize']
+        self.mpl_legend = None
+
+    def entries(self):
+        """(line, label) of every line in the legend; unnamed lines are data1, data2, ... as in MATLAB."""
+        return [(line, line.display_name or f"data{k}")
+                for k, line in enumerate(self.parent.lines, 1) if line.in_legend]
+
+    def draw(self):
+        self.remove_artist()
+        entries = self.entries()
+        if not entries:
+            return
+        self.mpl_legend = self.parent.ax.legend(
+            [line.artist for line, _ in entries], [label for _, label in entries],
+            loc=_LEGEND_LOCATIONS[self.location], fontsize=self.font_size, frameon=self.box,
+            ncol=len(entries) if self.orientation == 'horizontal' else 1)
+        for text, (_, label) in zip(self.mpl_legend.get_texts(), entries):
+            show_text(text, label, 'tex')
+        self.mpl_legend.set_visible(self.visible)
+
+    def remove_artist(self):
+        if self.mpl_legend is not None:
+            try:
+                self.mpl_legend.remove()
+            except (ValueError, AttributeError, NotImplementedError):
+                pass
+            self.mpl_legend = None
+
+    def get_box(self):
+        return self.box
+
+    def set_box(self, value):
+        self.box = _on_off(value)
+
+    def get_fontsize(self):
+        return self.font_size
+
+    def set_fontsize(self, value):
+        self.font_size = _number(value, positive=True)
+
+    def get_location(self):
+        return self.location
+
+    def set_location(self, value):
+        self.location = _choice(value, tuple(_LEGEND_LOCATIONS))
+
+    def get_orientation(self):
+        return self.orientation
+
+    def set_orientation(self, value):
+        self.orientation = _choice(value, ('vertical', 'horizontal'))
+
+    def get_parent(self):
+        return self.parent.owner().handle
+
+    def get_visible(self):
+        return self.visible
+
+    def set_visible(self, value):
+        self.visible = _on_off(value)
+
+
+class Graphics:
+    """The figures of one MatlabEngine, and the handles of their graphics objects.
+
+    host is the GUI that shows the figures in windows (None: they are only kept in memory).
+    It is told when a figure opens, changes or closes.
+    """
+
+    def __init__(self, host=None):
+        self.host = host
+        self.figures = {}       # figure number -> GFigure
+        self.objects = {}       # handle -> graphics object (figures too)
+        self.order = []         # figure numbers, the current (last active) one last
+        self.dirty = set()      # numbers of the figures to draw again
+        self._next_handle = 0
+
+    def new_handle(self):
+        self._next_handle += 1
+        return self._next_handle + 0.5
+
+    def find(self, handle, function):
+        obj = self.objects.get(float(handle))
+        if obj is None:
+            raise MatlabError(f"Error using {function}\nInvalid or deleted graphics object (handle {handle:g}).")
+        return obj
+
+    def handles(self, value, function):
+        """The objects whose handles are in the array value."""
+        if not isinstance(value, np.ndarray) or is_text(value) or np.iscomplexobj(value):
+            raise MatlabError(f"Error using {function}\nThe first input must be graphics handles, "
+                              "such as gca, gcf or the result of plot.")
+        return [self.find(h, function) for h in to_double(value).ravel(order='F')]
+
+    @property
+    def current(self):
+        return self.figures[self.order[-1]] if self.order else None
+
+    def make_current(self, figure):
+        if figure.number in self.figures:
+            if figure.number in self.order:
+                self.order.remove(figure.number)
+            self.order.append(figure.number)
+
+    def figure(self, number=None):
+        """figure / figure(n): open figure n (the lowest free number if None) or bring it forward."""
+        if number is None:
+            number = next(n for n in range(1, len(self.figures) + 2) if n not in self.figures)
+        figure = self.figures.get(number)
+        if figure is None:
+            figure = self.figures[number] = GFigure(self, number)
+            self.objects[figure.handle] = figure
+            self.make_current(figure)
+            if self.host:
+                self.host.figure_opened(figure)
+        else:
+            self.make_current(figure)
+            if self.host:
+                self.host.figure_raised(figure)
+        figure.changed()
+        return figure
+
+    def current_figure(self):
+        return self.current or self.figure()
+
+    def current_axes(self):
+        figure = self.current_figure()
+        if figure.axes is None:
+            figure.axes = GAxes(self, figure)
+        return figure.axes
+
+    def close(self, figure):
+        if self.figures.pop(figure.number, None) is None:
+            return
+        if figure.axes is not None:
+            figure.axes.forget()
+        self.objects.pop(figure.handle, None)
+        self.order.remove(figure.number)
+        self.dirty.discard(figure.number)
+        if self.host:
+            self.host.figure_closed(figure)
+
+    def flush(self):
+        """After a command line: draw the legends and windows of the figures that changed."""
+        for number in sorted(self.dirty):
+            figure = self.figures.get(number)
+            if figure is None:
+                continue
+            if figure.axes is not None:
+                figure.axes.update_legend()
+            if self.host:
+                self.host.figure_changed(figure)
+        self.dirty.clear()
+
+
+def _graphics(engine):
+    _mpl()  # an error now if matplotlib is missing
+    return engine.graphics
+
+
+def _option_words(args, function, allowed):
+    """The words of command syntax such as 'hold on' or axis('equal', 'tight'), in lower case."""
+    words = []
+    for arg in args:
+        word = _as_text(arg).lower() if _is_text_value(arg) else None
+        if word not in allowed:
+            raise MatlabError(f"Error using {function}\nUnknown option" + (f" '{_as_text(arg)}'" if word else "")
+                              + ". Use " + ', '.join(allowed[:-1]) + f" or {allowed[-1]}.")
+        words.append(word)
+    return words
+
+
+def _name_value_pairs(args, function):
+    """[(name, value), ...] from name-value inputs such as 'LineWidth', 2."""
+    if len(args) % 2:
+        raise MatlabError(f"Error using {function}\nProperty names and values must come in pairs, "
+                          "e.g. 'LineWidth', 2.")
+    pairs = []
+    for name, value in zip(args[::2], args[1::2]):
+        if not _is_text_value(name):
+            raise MatlabError(f"Error using {function}\nA property name must be text, e.g. 'LineWidth'.")
+        pairs.append((_as_text(name), value))
+    return pairs
+
+
+def _set_all(obj, pairs, function):
+    for name, value in pairs:
+        obj.set(name, value, function)
+
+
+def _is_vector(a):
+    return a.size > 0 and min(a.shape) == 1
+
+
+def _plot_series(x, y, engine):
+    """The (x, y) data of each line that plot(x, y) or plot(y) draws."""
+    y = to_double(y)
+    if x is None:
+        if np.iscomplexobj(y):
+            x, y = y.real, y.imag
+        elif _is_vector(y):
+            x = np.arange(1, y.size + 1, dtype=float).reshape(y.shape)
+        else:
+            x = np.arange(1, y.shape[0] + 1, dtype=float).reshape(-1, 1)
+    else:
+        x = to_double(x)
+        if np.iscomplexobj(x) or np.iscomplexobj(y):
+            engine.write("Warning: Imaginary parts of complex X and/or Y arguments ignored.\n")
+            x, y = x.real, y.real
+    if x.size == 0 and y.size == 0:
+        return []
+    mismatch = MatlabError("Error using plot\nVectors must be the same length.")
+    if x.size == 1 and y.size > 1:  # separate points, as in MATLAB
+        return [(x.ravel(), y_k.reshape(1)) for y_k in y.ravel(order='F')]
+    if y.size == 1 and x.size > 1:
+        return [(x_k.reshape(1), y.ravel()) for x_k in x.ravel(order='F')]
+    if _is_vector(x) and _is_vector(y):
+        if x.size != y.size:
+            raise mismatch
+        return [(x.ravel(), y.ravel())]
+    if _is_vector(x):  # one line for each column (or row) of y
+        if y.shape[0] == x.size:
+            return [(x.ravel(), y[:, k]) for k in range(y.shape[1])]
+        if y.shape[1] == x.size:
+            return [(x.ravel(), y[k, :]) for k in range(y.shape[0])]
+        raise mismatch
+    if _is_vector(y):
+        if x.shape[0] == y.size:
+            return [(x[:, k], y.ravel()) for k in range(x.shape[1])]
+        if x.shape[1] == y.size:
+            return [(x[k, :], y.ravel()) for k in range(x.shape[0])]
+        raise mismatch
+    if x.shape != y.shape:
+        raise mismatch
+    return [(x[:, k], y[:, k]) for k in range(x.shape[1])]
+
+
+# ---- graphics functions -------------------------------------------------------
+@builtin('figure', category=CAT_GRAPHICS, keep_types=True, command_syntax=True)
+def fn_figure(*args, nargout=1, engine):
+    """figure - Open a figure window.
+
+    figure           opens a new figure window and makes it the current
+                     figure: the next plot is drawn there.
+    figure(n)        makes figure n the current figure (and brings its
+                     window to the front), opening it if needed.
+    f = figure(...)  returns the figure number, its handle.
+    figure('Name', 'Results') also sets figure properties (see help set).
+
+    Each figure window has a toolbar to zoom, pan and save the plot as
+    an image (PNG, PDF, SVG, ...). Closing the window closes the figure.
+    The drawing is made with the Python package matplotlib.
+
+    See also plot, close, clf, gcf, set.
+    """
+    graphics = _graphics(engine)
+    number = None
+    if args and not _is_text_value(args[0]):
+        value = args[0]
+        if value.size != 1 or np.iscomplexobj(value) or not float(value.item()).is_integer() or value.item() < 1:
+            raise MatlabError("Error using figure\nThe figure number must be a whole number of 1 or more.")
+        number, args = int(value.item()), args[1:]
+    pairs = _name_value_pairs(args, 'figure')
+    for name, _ in pairs:
+        GFigure.property_name(name, 'figure')
+    figure = graphics.figure(number)
+    _set_all(figure, pairs, 'figure')
+    return None if nargout == 0 else to_matrix(figure.number)
+
+
+@builtin('plot', category=CAT_GRAPHICS, keep_types=True)
+def fn_plot(*args, nargout=1, engine):
+    """plot - Plot lines.
+
+    plot(Y)               plots the elements of Y against 1, 2, 3, ...; each
+                          column of a matrix Y is a separate line.
+    plot(X, Y)            plots Y against X: vectors of the same length, or
+                          one line for each column of a matrix.
+    plot(X, Y, LineSpec)  sets the line style, marker and color, e.g. 'r--o'.
+    plot(X1, Y1, X2, Y2, ...) draws several lines (each with a LineSpec).
+    plot(..., 'LineWidth', 2) sets line properties (see help set).
+    h = plot(...)         returns the handles of the lines.
+
+    A LineSpec combines up to one of each (in any order):
+      line style   -  solid   --  dashed   :  dotted   -.  dash-dot
+      marker       o  +  *  .  x  s  d  ^  v  <  >  p  h
+      color        r  g  b  c  m  y  k (black)  w
+    With a marker but no line style, only the markers are drawn.
+
+    The lines go into the current figure (see figure), replacing what was
+    there unless hold is on. Colors are matplotlib's: without a color, each
+    line takes the next one of matplotlib's color order.
+
+    See also figure, hold, xlabel, ylabel, title, legend, axis, set.
+    """
+    groups, i = [], 0
+    while i < len(args) and not _is_text_value(args[i]):
+        if i + 1 < len(args) and not _is_text_value(args[i + 1]):
+            x, y, i = args[i], args[i + 1], i + 2
+        else:
+            x, y, i = None, args[i], i + 1
+        spec = parse_linespec(_as_text(args[i])) if i < len(args) and _is_text_value(args[i]) else None
+        if spec is not None:
+            i += 1
+        groups.append((x, y, spec))
+    if not groups:
+        raise MatlabError("Error using plot\nNot enough input arguments: plot needs data, e.g. plot(x, y).")
+    if len(groups) > 1 and any(x is None for x, _, _ in groups):
+        raise MatlabError("Error using plot\nData must be a single matrix Y or a list of pairs X,Y.")
+    rest = args[i:]
+    if len(rest) % 2 and _is_text_value(rest[0]) and not any(
+            p.lower().startswith(_as_text(rest[0]).lower()) for p in GLine.PROPERTIES):
+        raise MatlabError(f"Error using plot\nInvalid LineSpec '{_as_text(rest[0])}'. It combines up to one line "
+                          "style (- -- : -.),\nmarker (o + * . x s d ^ v < > p h) and color (r g b c m y k w).")
+    pairs = _name_value_pairs(rest, 'plot')
+    for name, _ in pairs:
+        GLine.property_name(name, 'plot')
+    series = [(xy, spec) for x, y, spec in groups for xy in _plot_series(x, y, engine)]
+    axes = _graphics(engine).current_axes()
+    if not axes.hold:
+        axes.reset()
+    handles = []
+    for (x, y), spec in series:
+        line = axes.add_line(x, y, spec)
+        _set_all(line, pairs, 'plot')
+        handles.append(line.handle)
+    return None if nargout == 0 else np.array(handles, dtype=float).reshape(-1, 1)
+
+
+def _label(kind, args, nargout, engine):
+    if not args or not (_is_text_value(args[0]) or args[0].size == 0):
+        raise MatlabError(f"Error using {kind}\nThe first input must be the text, e.g. {kind}('Time (s)').")
+    pairs = _name_value_pairs(args[1:], kind)
+    for name, _ in pairs:
+        GText.property_name(name, kind)
+    label = _graphics(engine).current_axes().labels[kind]
+    for name, value in pairs:  # e.g. 'Interpreter' before the text is shown
+        label.set(name, value, kind)
+    label.set('String', args[0], kind)
+    return None if nargout == 0 else to_matrix(label.handle)
+
+
+@builtin('xlabel', category=CAT_GRAPHICS, keep_types=True)
+def fn_xlabel(*args, nargout=1, engine):
+    r"""xlabel - Label the x-axis.
+
+    xlabel(txt) puts the text txt below the x-axis of the current axes.
+    xlabel(txt, 'FontSize', 12) also sets text properties (see help set).
+    h = xlabel(...) returns the handle of the label.
+
+    As in MATLAB, x_1 and x^2 are shown with a subscript and a superscript
+    (use braces for more characters: x_{max}, 10^{-3}), and \alpha, \beta,
+    \pi, \circ, ... as symbols. 'Interpreter', 'none' shows the text as
+    it is; 'latex' uses matplotlib's math text between $ signs.
+
+    See also ylabel, title, plot.
+    """
+    return _label('xlabel', args, nargout, engine)
+
+
+@builtin('ylabel', category=CAT_GRAPHICS, keep_types=True)
+def fn_ylabel(*args, nargout=1, engine):
+    r"""ylabel - Label the y-axis.
+
+    ylabel(txt) puts the text txt beside the y-axis of the current axes.
+    ylabel(txt, 'FontSize', 12) also sets text properties (see help set).
+    h = ylabel(...) returns the handle of the label.
+
+    x_1, x^2, x_{max} and \alpha are shown as subscript, superscript and
+    symbol, as described in help xlabel.
+
+    See also xlabel, title, plot.
+    """
+    return _label('ylabel', args, nargout, engine)
+
+
+@builtin('title', category=CAT_GRAPHICS, keep_types=True)
+def fn_title(*args, nargout=1, engine):
+    r"""title - Add a title to the plot.
+
+    title(txt) puts the text txt above the current axes, in bold.
+    title(txt, 'FontSize', 14) also sets text properties (see help set).
+    h = title(...) returns the handle of the title.
+
+    x_1, x^2, x_{max} and \alpha are shown as subscript, superscript and
+    symbol, as described in help xlabel. A plot without hold on removes
+    the title, so call title after plot.
+
+    See also xlabel, ylabel, plot.
+    """
+    return _label('title', args, nargout, engine)
+
+
+@builtin('hold', category=CAT_GRAPHICS, outputs=0, keep_types=True, command_syntax=True)
+def fn_hold(*args, engine):
+    """hold - Keep the plot when adding new plots.
+
+    hold on    keeps what is plotted: the next plots are added to it,
+               continuing the color order.
+    hold off   the next plot replaces everything (the default).
+    hold       switches between the two.
+
+    See also ishold, plot, figure.
+    """
+    axes = _graphics(engine).current_axes()
+    words = _option_words(args, 'hold', ('on', 'off', 'all'))
+    axes.hold = (not axes.hold) if not words else words[-1] != 'off'
+    return None
+
+
+@builtin('ishold', category=CAT_GRAPHICS)
+def fn_ishold(*, engine):
+    """ishold - True if hold is on.
+
+    ishold is 1 (true) if hold is on for the current axes, so that new
+    plots are added, and 0 (false) if they replace the plot.
+
+    See also hold.
+    """
+    graphics = _graphics(engine)
+    figure = graphics.current
+    return to_matrix(bool(figure is not None and figure.axes is not None and figure.axes.hold))
+
+
+@builtin('grid', category=CAT_GRAPHICS, outputs=0, keep_types=True, command_syntax=True)
+def fn_grid(*args, engine):
+    """grid - Show or hide grid lines.
+
+    grid on      shows grid lines at the tick marks of both axes.
+    grid off     hides them (also the minor grid lines).
+    grid minor   switches the finer grid lines between the ticks.
+    grid         switches the grid lines on or off.
+
+    set(gca, 'XGrid', 'on') shows the grid of one axis only.
+
+    See also axis, box, plot.
+    """
+    axes = _graphics(engine).current_axes()
+    words = _option_words(args, 'grid', ('on', 'off', 'minor'))
+    word = words[-1] if words else ('off' if axes.grid['x'] or axes.grid['y'] else 'on')
+    if word == 'minor':
+        on = not (axes.grid['xminor'] or axes.grid['yminor'])
+        for letter in 'xy':
+            axes.show_grid(letter, on, minor=True)
+        return None
+    for letter in 'xy':
+        axes.show_grid(letter, word == 'on')
+        if word == 'off' and axes.grid[letter + 'minor']:
+            axes.show_grid(letter, False, minor=True)
+    return None
+
+
+@builtin('box', category=CAT_GRAPHICS, outputs=0, keep_types=True, command_syntax=True)
+def fn_box(*args, engine):
+    """box - Show or hide the box around the axes.
+
+    box on    draws all four sides of the axes, with tick marks (default).
+    box off   draws only the x-axis and the y-axis.
+    box       switches between the two.
+
+    See also grid, axis.
+    """
+    axes = _graphics(engine).current_axes()
+    words = _option_words(args, 'box', ('on', 'off'))
+    axes.set('Box', text_to_chars(words[-1] if words else ('off' if axes.box else 'on')), 'box')
+    return None
+
+
+_AXIS_WORDS = ('auto', 'tight', 'equal', 'image', 'square', 'normal', 'ij', 'xy', 'on', 'off')
+
+
+@builtin('axis', category=CAT_GRAPHICS, keep_types=True, command_syntax=True)
+def fn_axis(*args, nargout=1, engine):
+    """axis - Set the axis limits and appearance.
+
+    axis([xmin xmax ymin ymax])  sets the limits of both axes.
+    axis tight     limits that just fit the data.
+    axis auto      automatic limits at round numbers (the default).
+    axis equal     the same length for one unit on both axes.
+    axis image     equal and tight together.
+    axis square    a square plot area.
+    axis normal    undoes equal, image and square.
+    axis ij        the y-axis runs downwards; axis xy upwards (default).
+    axis off       hides the axes (ticks, labels, box); axis on shows them.
+    lim = axis     returns the limits [xmin xmax ymin ymax].
+
+    Several options can be combined: axis equal tight.
+
+    See also xlim, ylim, grid.
+    """
+    axes = _graphics(engine).current_axes()
+    if not args:
+        return to_matrix(np.array([axes.limits('x') + axes.limits('y')]))
+    if not _is_text_value(args[0]):
+        try:
+            limits = _numbers(args[0])
+        except _BadValue:
+            limits = np.zeros(0)
+        if limits.size != 4:
+            raise MatlabError("Error using axis\nThe limits must be [xmin xmax ymin ymax].")
+        axes.set('XLim', to_matrix(limits[:2].reshape(1, 2)), 'axis')
+        axes.set('YLim', to_matrix(limits[2:].reshape(1, 2)), 'axis')
+        return None if nargout == 0 else to_matrix(np.array([axes.limits('x') + axes.limits('y')]))
+    ax = axes.ax
+    for word in _option_words(args, 'axis', _AXIS_WORDS):
+        if word in ('tight', 'image'):
+            ax.autoscale(enable=True, axis='both', tight=True)
+        if word == 'auto':
+            ax.autoscale(enable=True, axis='both', tight=False)
+        if word in ('equal', 'image'):
+            ax.set_aspect('equal', adjustable='box')
+        if word == 'square':
+            ax.set_box_aspect(1)
+        if word == 'normal':
+            ax.set_aspect('auto')
+            ax.set_box_aspect(None)
+        if word in ('ij', 'xy'):
+            axes.set('YDir', text_to_chars('reverse' if word == 'ij' else 'normal'), 'axis')
+        if word in ('on', 'off'):
+            ax.set_axis_on() if word == 'on' else ax.set_axis_off()
+    axes.changed()
+    return None if nargout == 0 else to_matrix(np.array([axes.limits('x') + axes.limits('y')]))
+
+
+def _axis_limits(letter, args, nargout, engine):
+    function = letter + 'lim'
+    axes = _graphics(engine).current_axes()
+    if not args:
+        return to_matrix(np.array([axes.limits(letter)]))
+    if _is_text_value(args[0]):
+        mode = _option_words(args, function, ('auto', 'manual', 'mode'))[0]
+        if mode == 'mode':
+            return axes.get(letter.upper() + 'LimMode')
+        axes.set(letter.upper() + 'LimMode', text_to_chars(mode), function)
+    else:
+        axes.set(letter.upper() + 'Lim', args[0], function)
+    return None if nargout == 0 else to_matrix(np.array([axes.limits(letter)]))
+
+
+@builtin('xlim', category=CAT_GRAPHICS, keep_types=True, command_syntax=True)
+def fn_xlim(*args, nargout=1, engine):
+    """xlim - Set or query the x-axis limits.
+
+    xlim([xmin xmax])  sets the limits of the x-axis (-Inf or Inf keeps
+                       that end automatic).
+    xlim auto          automatic limits again; xlim manual keeps them.
+    lim = xlim         returns the limits [xmin xmax].
+
+    See also ylim, axis.
+    """
+    return _axis_limits('x', args, nargout, engine)
+
+
+@builtin('ylim', category=CAT_GRAPHICS, keep_types=True, command_syntax=True)
+def fn_ylim(*args, nargout=1, engine):
+    """ylim - Set or query the y-axis limits.
+
+    ylim([ymin ymax])  sets the limits of the y-axis (-Inf or Inf keeps
+                       that end automatic).
+    ylim auto          automatic limits again; ylim manual keeps them.
+    lim = ylim         returns the limits [ymin ymax].
+
+    See also xlim, axis.
+    """
+    return _axis_limits('y', args, nargout, engine)
+
+
+_LEGEND_WORDS = ('off', 'show', 'hide', 'toggle', 'boxon', 'boxoff')
+
+
+@builtin('legend', category=CAT_GRAPHICS, keep_types=True, command_syntax=True)
+def fn_legend(*args, nargout=1, engine):
+    """legend - Add a legend to the plot.
+
+    legend('label1', 'label2', ...) names the lines in the order they were
+                     plotted; a line's DisplayName is used otherwise.
+    legend           shows a legend of all lines (data1, data2, ... for
+                     lines without a name).
+    legend(h, 'label1', ...) names the lines with handles h.
+    legend(..., 'Location', 'southwest') places it: north, south, east,
+                     west, northeast (default), northwest, southeast,
+                     southwest or best. Also 'Orientation', 'horizontal'.
+    legend off       removes it; legend hide / show hides or shows it;
+                     legend boxoff / boxon hides or shows its frame.
+    h = legend(...)  returns the handle of the legend.
+
+    Lines plotted later with hold on are added to the legend.
+
+    See also plot, title.
+    """
+    axes = _graphics(engine).current_axes()
+    if len(args) == 1 and _is_text_value(args[0]) and _as_text(args[0]).lower() in _LEGEND_WORDS:
+        word = _as_text(args[0]).lower()
+        if word == 'off':
+            axes.remove_legend()
+            axes.changed()
+            return None if nargout == 0 else np.zeros((0, 0))
+        if axes.legend is None and word == 'hide':
+            return None if nargout == 0 else np.zeros((0, 0))
+        new = axes.legend is None
+        if new:
+            axes.legend = GLegend(engine.graphics, axes)
+            engine.graphics.objects[axes.legend.handle] = axes.legend
+        legend = axes.legend
+        if word in ('show', 'hide') or (word == 'toggle' and not new):
+            legend.visible = word == 'show' or (word == 'toggle' and not legend.visible)
+        elif word in ('boxon', 'boxoff'):
+            legend.box = word == 'boxon'
+        legend.changed()
+        return None if nargout == 0 else to_matrix(legend.handle)
+    args = list(args)
+    lines = axes.lines
+    if args and not _is_text_value(args[0]):
+        chosen = engine.graphics.handles(args.pop(0), 'legend')
+        if not all(isinstance(obj, GLine) and obj.parent is axes for obj in chosen):
+            raise MatlabError("Error using legend\nThe handles must be lines of the current axes.")
+        lines = chosen
+    labels = []
+    while args and _is_text_value(args[0]) and not (
+            len(args) > 1 and _as_text(args[0]).lower() in [p.lower() for p in GLegend.PROPERTIES]):
+        labels.append(_as_text(args.pop(0)))
+    pairs = _name_value_pairs(args, 'legend')
+    for name, _ in pairs:
+        GLegend.property_name(name, 'legend')
+    if len(labels) > len(lines):
+        engine.write("Warning: Ignoring extra legend entries.\n")
+    if labels or lines is not axes.lines:
+        named = lines[:len(labels)] if labels else lines
+        for line in axes.lines:
+            line.in_legend = line in named
+        for line, label in zip(named, labels):
+            line.display_name = label
+    else:
+        for line in axes.lines:
+            line.in_legend = True
+    if axes.legend is None:
+        axes.legend = GLegend(engine.graphics, axes)
+        engine.graphics.objects[axes.legend.handle] = axes.legend
+    axes.legend.visible = True
+    _set_all(axes.legend, pairs, 'legend')
+    axes.changed()
+    return None if nargout == 0 else to_matrix(axes.legend.handle)
+
+
+@builtin('gcf', category=CAT_GRAPHICS)
+def fn_gcf(*, engine):
+    """gcf - Current figure.
+
+    f = gcf returns the handle (the number) of the current figure, the one
+    the next plot goes to. A new figure is opened if there is none.
+
+    See also gca, figure, set, get.
+    """
+    return to_matrix(_graphics(engine).current_figure().handle)
+
+
+@builtin('gca', category=CAT_GRAPHICS)
+def fn_gca(*, engine):
+    """gca - Current axes.
+
+    ax = gca returns the handle of the axes of the current figure, e.g.
+    for set(gca, 'FontSize', 12). A figure and axes are made if needed.
+
+    See also gcf, set, get, axis.
+    """
+    return to_matrix(_graphics(engine).current_axes().handle)
+
+
+@builtin('close', category=CAT_GRAPHICS, keep_types=True, command_syntax=True)
+def fn_close(*args, nargout=1, engine):
+    """close - Close figure windows.
+
+    close          closes the current figure.
+    close(n)       closes figure n (or the figures in a vector of numbers).
+    close all      closes all figures.
+
+    See also figure, clf.
+    """
+    graphics = _graphics(engine)
+    if not args:
+        figures = [graphics.current] if graphics.current else []
+    elif _is_text_value(args[0]):
+        _option_words(args, 'close', ('all',))
+        figures = list(graphics.figures.values())
+    else:
+        figures = graphics.handles(args[0], 'close')
+        if not all(isinstance(f, GFigure) for f in figures):
+            raise MatlabError("Error using close\nOnly figures can be closed; use a figure number.")
+    for figure in figures:
+        graphics.close(figure)
+    return None if nargout == 0 else to_matrix(1)
+
+
+@builtin('clf', category=CAT_GRAPHICS, outputs=0, keep_types=True, command_syntax=True)
+def fn_clf(*args, engine):
+    """clf - Clear the current figure.
+
+    clf deletes the axes of the current figure with everything plotted in
+    them; the window stays open.
+
+    See also cla, close, figure.
+    """
+    _option_words(args, 'clf', ('reset',))
+    _graphics(engine).current_figure().clear()
+    return None
+
+
+@builtin('cla', category=CAT_GRAPHICS, outputs=0, keep_types=True, command_syntax=True)
+def fn_cla(*args, engine):
+    """cla - Clear the current axes.
+
+    cla deletes the lines and the legend of the current axes; the title,
+    labels and limits settings stay. cla reset also resets those.
+
+    See also clf, hold.
+    """
+    words = _option_words(args, 'cla', ('reset',))
+    axes = _graphics(engine).current_axes()
+    axes.reset() if words else axes.clear_children()
+    return None
+
+
+@builtin('drawnow', category=CAT_GRAPHICS, outputs=0)
+def fn_drawnow(*, engine):
+    """drawnow - Update figure windows.
+
+    drawnow draws the figures right away. Figures are drawn after every
+    command line anyway; drawnow is useful within a line or a script, e.g.
+    to show a plot before a long calculation.
+
+    See also plot, figure.
+    """
+    graphics = _graphics(engine)
+    graphics.flush()
+    if graphics.host:
+        graphics.host.figures_update()
+    return None
+
+
+def _property_list(obj, names):
+    width = max(len(n) for n in names)
+    lines = []
+    for name in names:
+        value = obj.get(name)
+        if is_text(value):
+            shown = f"'{_as_text(value)}'"
+        elif value.size == 0:
+            shown = '[]'
+        elif value.size == 1:
+            shown = f"{value.item():.6g}"
+        else:
+            shown = '[' + ' '.join(f"{v:.4g}" for v in value.ravel(order='F')) + ']'
+        lines.append(f"  {name:>{width}}: {shown}")
+    return '\n'.join(lines) + '\n'
+
+
+@builtin('set', category=CAT_GRAPHICS, outputs=0, keep_types=True)
+def fn_set(h, *args, engine):
+    """set - Set properties of graphics objects.
+
+    set(h, 'Name', value, ...) sets properties of the objects with handles
+    h, e.g. set(gca, 'FontSize', 12) or set(h, 'LineWidth', 2). Names can
+    be written in any case and shortened ('linew').
+    set(h) lists the properties of h that can be set.
+
+    Handles are numbers: gcf and figure give the figure number, gca the
+    axes, plot the lines, and xlabel, ylabel, title, legend their objects.
+    Colors are matplotlib colors: 'r', 'red', '#ff8000' or [1 0.5 0].
+
+      Figure  Name, Color, Position, NumberTitle
+      Axes    XLim, YLim, XScale, YScale ('linear', 'log'), XGrid, YGrid,
+              Box, FontSize, LineWidth, Color, XDir, YDir ('normal',
+              'reverse'), XTick, YTick, TickDir, NextPlot ('replace', 'add')
+      Line    Color, LineStyle, LineWidth, Marker, MarkerSize, XData,
+              YData, MarkerFaceColor, MarkerEdgeColor, DisplayName, Visible
+      Text    String, FontSize, FontWeight, FontAngle, Color, Interpreter
+      Legend  Location, Orientation, FontSize, Box, Visible
+
+    See also get, gca, gcf, plot.
+    """
+    objects = _graphics(engine).handles(h, 'set')
+    if not args:
+        for obj in objects:
+            engine.write(f"  {obj.TYPE} {obj.handle:g}:\n  " + ', '.join(obj.settable()) + "\n")
+        return None
+    pairs = _name_value_pairs(args, 'set')
+    for obj in objects:
+        _set_all(obj, pairs, 'set')
+    return None
+
+
+@builtin('get', category=CAT_GRAPHICS, keep_types=True)
+def fn_get(h, name=None, *, nargout=1, engine):
+    """get - Query properties of graphics objects.
+
+    v = get(h, 'Name') returns the value of a property, e.g.
+    get(gca, 'XLim') or get(h, 'Color'). Names can be written in any case.
+    get(h) lists all properties of h with their values.
+
+    'on'/'off' properties give the text 'on' or 'off', colors an RGB
+    triplet [r g b], and Title, XLabel, Children, ... give handles.
+    See help set for the main properties of each kind of object.
+
+    See also set, gca, gcf.
+    """
+    objects = _graphics(engine).handles(h, 'get')
+    if name is None:
+        if nargout > 0:
+            raise MatlabError("Error using get\nget(h) only lists the properties; use get(h, 'Name') "
+                              "to get a value.")
+        for obj in objects:
+            engine.write(f"  {obj.TYPE} {obj.handle:g}\n" + _property_list(obj, obj.PROPERTIES))
+        return None
+    if not _is_text_value(name):
+        raise MatlabError("Error using get\nThe property name must be text, e.g. get(gca, 'XLim').")
+    if len(objects) != 1:
+        raise MatlabError("Error using get\nUse one handle at a time, e.g. get(h(1), 'Color').")
+    return objects[0].get(_as_text(name))
+
+
 # ---- help texts --------------------------------------------------------------
 OPERATORS_HELP = r"""ops - Operators and special characters.
 
@@ -2551,7 +4142,15 @@ class MatlabEngine:
         self.variables = {}
         self.last_error = None      # message of the error that stopped the last command line, if any
         self.files = {}             # open files: file identifier -> {'file', 'name', 'mode'}
+        self.figure_host = None     # the GUI that shows figures in windows (see Graphics)
+        self._graphics = None       # the figures, made at the first graphics command
         self._output = []
+
+    @property
+    def graphics(self):
+        if self._graphics is None:
+            self._graphics = Graphics(self.figure_host)
+        return self._graphics
 
     # ---- execution ---------------------------------------------------------
     def execute(self, line):
@@ -2579,6 +4178,11 @@ class MatlabEngine:
             error = f"Error: {err}"
         finally:
             _CURRENT_ENGINE = previous
+            if self._graphics is not None:
+                try:
+                    self._graphics.flush()  # draw the figures that changed
+                except Exception as err:
+                    error = error or f"Error while drawing a figure: {err}"
         self.last_error = error
         if error is not None:
             output.append(error + "\n")
@@ -2588,7 +4192,8 @@ class MatlabEngine:
         result = self._run_command(text, suppressed)
         if result is not None:
             return result
-        target, node = Parser(tokenize(text)).parse_statement()
+        node = self._command_syntax(text)
+        target, node = (None, node) if node is not None else Parser(tokenize(text)).parse_statement()
         with np.errstate(all='ignore'):  # 1/0 -> Inf and 0/0 -> NaN, as in MATLAB
             if isinstance(target, tuple) and target[0] == 'outputs':
                 return self._assign_outputs(target[1], node, suppressed)
@@ -2608,6 +4213,18 @@ class MatlabEngine:
                 target = target or 'ans'
                 self.variables[target] = value
         return [] if suppressed else [f"{target} =\n{self.format_value(value)}\n"]
+
+    def _command_syntax(self, text):
+        """'hold on', 'axis equal tight': a function that allows command syntax, with words as text inputs.
+
+        Returns the call as a parse tree, or None if text is not such a command.
+        """
+        words = text.split()
+        entry = FUNCTIONS.get(words[0]) if len(words) > 1 else None
+        if (entry is None or words[0] in self.variables or not entry[0].command_syntax
+                or not all(_IDENT_RE.fullmatch(w) for w in words[1:])):
+            return None
+        return ('name', words[0], [('str', w) for w in words[1:]])
 
     def _is_function_call(self, node):
         return node[0] == 'name' and node[1] not in self.variables and node[1] in FUNCTIONS
@@ -3920,6 +5537,10 @@ The help command describes everything {APP_NAME} can do, the same way as in MATL
   fprintf, fscanf and fclose to write and read text files.
 - Workspace: format short and format long set the number of decimals shown, whos lists
   the variables, clear removes them and clc clears the window.
+- Plots: plot(x, y) draws lines in a figure window (made with matplotlib), and figure
+  opens another one. hold on adds to a plot; xlabel, ylabel, title, legend, grid and
+  axis complete it, and set and get change details, e.g. set(gca, 'FontSize', 12).
+  The toolbar of a figure window zooms, pans and saves the plot as an image.
 
 ## Menus
 - File > Open runs the commands of a script (.m file) one line at a time, as if they
@@ -4124,6 +5745,82 @@ class SettingsDialog(tk.Toplevel):
         self.destroy()
 
 
+class FigureWindow(tk.Toplevel):
+    """A figure window: the matplotlib drawing with a toolbar (zoom, pan, save) at the top, as in MATLAB."""
+
+    def __init__(self, app, figure):
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        super().__init__(app.root, background=FIGURE_COLOR)
+        self.app, self.gfig, self.closed = app, figure, False
+        self.canvas = FigureCanvasTkAgg(figure.figure, master=self)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, self, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(side=tk.TOP, fill=tk.X)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.protocol('WM_DELETE_WINDOW', self.close)
+        self.bind('<FocusIn>', self._activated)
+        modifier = 'Command' if app.mac_menus else 'Control'
+        for key in ('w', 'W'):
+            self.bind(f'<{modifier}-{key}>', lambda event: self.close())
+        self.refresh()
+        self._place()
+
+    def _place(self):
+        """Beside the main window (to the right), each further figure a little lower."""
+        root = self.app.root
+        self.update_idletasks()
+        width, height = self.winfo_reqwidth(), self.winfo_reqheight()
+        step = 28 * (len(self.app.figure_windows) % 8)
+        x = root.winfo_rootx() + root.winfo_width() + 16 + step
+        y = root.winfo_rooty() + step
+        if x + width > self.winfo_screenwidth():
+            x = max(0, self.winfo_screenwidth() - width - 16 - step)
+        if y + height > self.winfo_screenheight() - 40:
+            y = max(0, self.winfo_screenheight() - height - 60)
+        self.geometry(f"+{x}+{y}")
+
+    def refresh(self):
+        """Show the changes of the figure: draw it again (when Tk is idle) and update the title."""
+        self.title(self.gfig.title())
+        color = self.gfig.figure.get_facecolor()
+        self.configure(background=_mpl()['colors'].to_hex(color))
+        self.canvas.draw_idle()
+
+    def position(self):
+        """[left bottom width height] of the plot area in pixels, from the bottom left of the screen."""
+        widget = self.canvas.get_tk_widget()
+        self.update_idletasks()
+        width, height = widget.winfo_width(), widget.winfo_height()
+        return [widget.winfo_rootx(), self.winfo_screenheight() - widget.winfo_rooty() - height, width, height]
+
+    def set_position(self, position):
+        left, bottom, width, height = (int(round(v)) for v in position)
+        bar = self.toolbar.winfo_reqheight()
+        top = self.winfo_screenheight() - bottom - height - bar
+        self.geometry(f"{width}x{height + bar}+{left}+{max(0, top)}")
+
+    def _activated(self, event=None):
+        if not self.closed:
+            self.app.engine.graphics.make_current(self.gfig)
+
+    def close(self):
+        """The close button, Ctrl/Cmd+W: close the figure, as close(n) does."""
+        self.app.engine.graphics.close(self.gfig)
+
+    def remove(self):
+        """Destroy the window (the figure has been closed)."""
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.toolbar.destroy()
+            self.canvas.get_tk_widget().destroy()
+            self.destroy()
+        except tk.TclError:
+            pass
+        gc.collect()  # free its Tk images here, in the main thread
+
+
 class MatlabConsoleApp:
     def __init__(self, root):
         self.root = root
@@ -4140,6 +5837,8 @@ class MatlabConsoleApp:
                 pass
 
         self.engine = MatlabEngine()
+        self.engine.figure_host = self  # figures are shown in FigureWindows (see the figure_... methods)
+        self.figure_windows = {}         # figure number -> FigureWindow
         self.history = []      # every command of the session, in order (File > Save writes them)
         self.history_idx = 0
         self.windows = {}      # the open About, Help and Settings windows
@@ -4429,6 +6128,49 @@ class MatlabConsoleApp:
     def _script_folder(self):
         folder = os.path.dirname(self.script_file) if self.script_file else os.getcwd()
         return folder if os.path.isdir(folder) else os.getcwd()
+
+    # ---- figure windows: the engine calls these when figures open, change or close ----
+    def figure_opened(self, figure):
+        self.figure_windows[figure.number] = FigureWindow(self, figure)
+        self.root.after(150, self._focus_console)  # keep typing in the Command Window
+
+    def _focus_console(self):
+        try:
+            if not self.closed:
+                self.output_area.focus_force()
+        except tk.TclError:
+            pass
+
+    def figure_raised(self, figure):
+        window = self.figure_windows.get(figure.number)
+        if window is not None:
+            window.deiconify()
+            window.lift()
+
+    def figure_changed(self, figure):
+        window = self.figure_windows.get(figure.number)
+        if window is not None:
+            window.refresh()
+
+    def figure_closed(self, figure):
+        window = self.figure_windows.pop(figure.number, None)
+        if window is not None:
+            window.remove()
+
+    def figure_position(self, figure):
+        window = self.figure_windows.get(figure.number)
+        return window.position() if window is not None else None
+
+    def set_figure_position(self, figure, position):
+        window = self.figure_windows.get(figure.number)
+        if window is not None:
+            window.set_position(position)
+
+    def figures_update(self):
+        """drawnow: draw the figure windows now."""
+        for window in self.figure_windows.values():
+            window.canvas.draw()
+        self.root.update_idletasks()
 
     # ---- history -------------------------------------------------------------
     def _replace_current_input(self, text):

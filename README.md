@@ -1,6 +1,6 @@
 # Matlab_Calc — MATLAB Command Window Emulator (`matlab_calc.py`)
 
-**Version 0.8.0** — see [Version History](#version-history).
+**Version 0.9.0** — see [Version History](#version-history).
 
 A lightweight, interactive desktop calculator built with Python, Tkinter, and NumPy that emulates the look, feel, and matrix-first syntax of the **MATLAB Command Window**.
 
@@ -18,6 +18,7 @@ A lightweight, interactive desktop calculator built with Python, Tkinter, and Nu
   - Raises MATLAB-style errors when operands have incompatible dimensions.
 - **Several Outputs**: functions such as `max`, `min`, `size`, `find`, `fopen` and `fscanf` return more than one result: `[m, i] = max(A)`, `[rows, cols] = size(A)`; `~` skips an output (`[~, i] = min(v)`).
 - **Text and Files**: text in quotes (`'Hello'`), `disp`, `fprintf`, `sprintf` and `num2str` for formatted output, and `fopen` / `fprintf` / `fscanf` / `fclose` with file identifiers to write and read text files.
+- **Plots**: `plot`, `figure`, `hold`, `xlabel`, `ylabel`, `title`, `legend`, `grid`, `axis`, `set` and `get` draw line plots in figure windows that look like MATLAB's, with a toolbar to zoom, pan and save (made with matplotlib).
 - **Data Analysis and Random Numbers**: `max`, `min`, `mean`, `median`, `std`, `rand`, `randn` and more, working down the columns of a matrix as in MATLAB.
 - **Multiple Statements and Comments**: `a = 1; b = 2, c = a + b` runs three statements (a trailing `;` suppresses output); `%` starts a comment and `...` continues a line. Multi-line pastes run line by line.
 - **Smart Adaptive Number Formatting**:
@@ -36,6 +37,7 @@ A lightweight, interactive desktop calculator built with Python, Tkinter, and Nu
 - **Python** 3.8+
 - **NumPy** (`pip install numpy`)
 - **Tkinter** (included with standard Python installations)
+- *Optional, for plots:* **matplotlib** (`pip install matplotlib`; included in Anaconda). Without it everything else works, and the plot commands say how to install it.
 - *Optional:* **Pillow** (`pip install pillow`) — smooth, anti-aliased edges for the rounded app icon. Without it the icon is still shrunk and rounded, but its edges are slightly jagged. On macOS the icon of the installed app is made with Pillow, or with the built-in tools `sips` and `iconutil`.
 - *Optional, macOS:* **PyObjC** (`pip install pyobjc-framework-Cocoa`) — shows `APP_NAME` instead of “Python” in the menu bar.
 
@@ -136,7 +138,7 @@ All settings are constants at the top of `matlab_calc.py`:
 | :--- | :--- | :--- |
 | `APP_NAME` | `'Matlab_Calc'` | Window title, Tk class name and macOS menu-bar name |
 | `APP_CREDITS` | `'Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, Claude)'` | Shown in the About window |
-| `APP_VERSION` | `'0.8.0'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
+| `APP_VERSION` | `'0.9.0'` | Version number, shown in the welcome banner and by the `version` command (also available as `matlab_calc.__version__`) |
 | `WINDOW_WIDTH`, `WINDOW_HEIGHT` | `750`, `520` | Initial window size in pixels |
 | `APP_ICON_FILE` | `'icon.png'` | Icon image, looked up next to the script |
 | `APP_ICON_MARGIN` | `0.1` | Transparent margin on each side, as a fraction of the icon size (keeps the Dock icon the same size as native macOS icons) |
@@ -147,6 +149,9 @@ All settings are constants at the top of `matlab_calc.py`:
 | `WINDOW_PADDING`, `PROMPT` | `10`, `'>> '` | Space around the console; prompt text |
 | `SHORT_DECIMALS`, `LONG_DECIMALS` | `4`, `15` | Maximum decimals for `format short` / `format long` |
 | `MAX_DISPLAY_ELEMENTS` | `10000` | Larger results are summarised instead of printed (end the statement with `;`) |
+| `FIGURE_WIDTH`, `FIGURE_HEIGHT` | `560`, `420` | Size of the plot area of a new figure window in pixels (MATLAB's default) |
+| `FIGURE_COLOR` | `'#f0f0f0'` | Background of the figure windows (MATLAB's light gray; the plot area is white) |
+| `PLOT_LINE_WIDTH` | `1.5` | Default width of plotted lines in points (matplotlib's default; MATLAB uses 0.5) |
 | `CONFIG_FILE` | `'~/.matlab_calc.json'` | Settings file in the home folder: remembers the answer to the installation question, what was installed, the update checks and the choices of the Settings window |
 | `UPDATE_REPOSITORY` | `'varallyay/matlab_calc'` | GitHub project (owner/name) where new versions are published |
 | `APP_WEBSITE` | `'https://github.com/' + UPDATE_REPOSITORY` | Web page shown in the About window and the Help window |
@@ -409,7 +414,39 @@ M =
 
 File names are relative to the current folder, shown by `pwd` and changed with `cd`. When the program is started from Launchpad or the application menu, the current folder is your home folder.
 
-### 7. Built-in Constants & Functions
+### 7. Plots
+`plot` draws lines in a **figure window**, which opens beside the command window. As in MATLAB, the window has a light gray background, a white plot area with a box and inward tick marks, a bold title, and a toolbar at the top to zoom, pan, go back to the original view and save the plot as an image (PNG, PDF, SVG, …). The plots are drawn with matplotlib, and the line colors and color order are matplotlib's.
+
+```
+x = linspace(0, 4*pi, 200);
+plot(x, sin(x), x, cos(x), '--')
+hold on
+plot(x(1:10:end), 0.5*sin(x(1:10:end)), 'o')
+xlabel('Time t_1 (s)'), ylabel('Amplitude A^2'), title('Signals with \alpha = 0.5')
+legend('sin', 'cos', 'samples')
+grid on
+```
+
+| Function | What it does |
+| :--- | :--- |
+| `plot(y)`, `plot(x, y)`, `plot(x1, y1, x2, y2, …)` | Lines; each column of a matrix is a line. `plot(x, y, 'r--o')` sets color, line style and marker (a LineSpec), `plot(…, 'LineWidth', 2)` any line property. `h = plot(…)` gives the line handles. |
+| `figure`, `figure(n)` | Opens a new figure window, or makes figure `n` the current one (the next plot goes there). `figure('Name', 'Results')` sets properties. |
+| `hold on`, `hold off`, `hold` | Keep the plot and add the next ones to it (the color order continues), or let the next plot replace it. `ishold` tells which. |
+| `xlabel`, `ylabel`, `title` | Axis labels and the title. As in MATLAB, `x_1`, `x^2`, `x_{max}` and `\alpha`, `\pi`, `\circ`, … are shown as subscript, superscript and symbols; `'Interpreter', 'none'` shows the text as typed. |
+| `legend('a', 'b', …)`, `legend` | A legend of the lines (unnamed lines are `data1`, `data2`, …); `'Location', 'southwest'` places it. `legend off`, `legend hide`/`show`, `legend boxoff`. Lines added with `hold on` join the legend. |
+| `grid on`/`off`/`minor`, `box on`/`off` | Grid lines; the box around the plot. |
+| `axis([xmin xmax ymin ymax])`, `xlim([a b])`, `ylim([a b])` | Axis limits; `axis tight`, `equal`, `image`, `square`, `ij`, `off`, `auto` change the look. Without inputs they return the limits. |
+| `gcf`, `gca` | Handles of the current figure and its axes. |
+| `set(h, 'Name', value, …)`, `get(h, 'Name')`, `get(h)` | Change or read properties, e.g. `set(gca, 'FontSize', 12)`, `set(h, 'LineWidth', 2)`, `get(gca, 'XLim')`. Names can be in any case and shortened (`'linew'`). `get(h)` lists all properties. |
+| `close`, `close(n)`, `close all`, `clf`, `cla`, `drawnow` | Close figures, clear the figure or the axes, draw right away. |
+
+- **Handles are numbers**, as in MATLAB before R2014b: figures are numbered 1, 2, …, and axes, lines, labels and legends get numbers such as 1.5, 2.5, … that are never a figure number. Store them in variables: `h = plot(x, y); set(h, 'Color', 'k')`.
+- **Properties** (see `help set`): figure `Name`, `Color`, `Position`, `NumberTitle`; axes `XLim`, `YLim`, `XScale`/`YScale` (`'linear'`, `'log'`), `XGrid`, `YGrid`, `Box`, `FontSize`, `LineWidth`, `Color`, `XDir`/`YDir`, `XTick`/`YTick`, `TickDir`, `NextPlot`, `Title`, `XLabel`, `YLabel`, `Children`; line `Color`, `LineStyle`, `LineWidth`, `Marker`, `MarkerSize`, `MarkerFaceColor`, `MarkerEdgeColor`, `XData`, `YData`, `DisplayName`, `Visible`; text `String`, `FontSize`, `FontWeight`, `FontAngle`, `Color`, `Interpreter`; legend `Location`, `Orientation`, `FontSize`, `Box`, `Visible`.
+- **Colors** are matplotlib colors: the letters `r g b c m y k w` (matplotlib's shades), names such as `'red'` or `'tab:orange'`, `'#ff8000'`, or an RGB triplet `[1 0.5 0]`. `get` returns colors as RGB triplets.
+- **Command syntax**: `hold on`, `grid on`, `axis equal tight`, `legend off`, `close all` are the same as `hold('on')`, … — as long as no variable has that name.
+- **Figures are drawn after every command line** (`drawnow` draws within a line). Without hold on, `plot` resets the axes, including the title and labels, so give those after `plot`. Clicking a figure window makes it the current figure; **Ctrl+W** / **⌘W** in it closes it.
+
+### 8. Built-in Constants & Functions
 - **Constants**: `pi`, `e`, `Inf`, `NaN`, `i`, `j` (imaginary unit; literals such as `3 + 4i` also work)
 - **Trigonometric**: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`
 - **Hyperbolic**: `sinh`, `cosh`, `tanh` and their inverses `asinh`, `acosh`, `atanh` (`acosh` and `atanh` return `NaN` outside their domain, like `asin` and `acos`)
@@ -446,12 +483,13 @@ File names are relative to the current folder, shown by `pwd` and changed with `
   - `resize(A, sz)` — pad with zeros or cut to size `sz` (`resize([1 2 3], 5)` is `1 2 3 0 0`); options `'FillValue', v` and `'Side', 'trailing' | 'leading' | 'both'`
   - `reshape(A, r, c)` — the same elements arranged in `r` rows and `c` columns (one size may be `[]`)
 - **Text and Files**: `disp`, `fprintf`, `sprintf`, `num2str`, `fopen`, `fclose`, `fscanf` (see sections 5 and 6)
+- **Graphics**: `plot`, `figure`, `hold`, `ishold`, `xlabel`, `ylabel`, `title`, `legend`, `grid`, `box`, `axis`, `xlim`, `ylim`, `gca`, `gcf`, `set`, `get`, `close`, `clf`, `cla`, `drawnow` (see section 7)
 - **Logical Values & Searching**:
   - `find(X)`, `find(X, N)` — positions of the nonzero (true) elements, e.g. `find(A >= 2)`; `[row, col] = find(X)` or `[row, col, v] = find(X)` give rows, columns and values
   - `logical(X)` — convert numbers to logical values (nonzero becomes true)
   - `true`, `false` — the logical values 1 and 0; `true(n)`, `false(r, c)` make logical matrices
 
-### 8. Console & Workspace Commands
+### 9. Console & Workspace Commands
 | Command | Description |
 | :--- | :--- |
 | `format short` / `format` | Cap display precision at up to 4 decimal places (default) |
@@ -474,7 +512,7 @@ File names are relative to the current folder, shown by `pwd` and changed with `
 
 Typing a variable's name shows its value without changing `ans`.
 
-### 9. Getting Help
+### 10. Getting Help
 `help` on its own lists the console commands, the operators and every function grouped by topic, each with a one-line description. `help <name>` shows the full help text:
 
 ```matlab
@@ -490,7 +528,7 @@ Typing a variable's name shows its value without changing `ans`.
 
 As in MATLAB, where a function's help is the comment block at the top of its `.m` file, the help of every command and function here is the comment block at the start of its code: the docstring of the Python function that implements it. The first line (`floor - Round toward minus infinity.`) is the summary shown in the `help` list.
 
-### 10. Adding Your Own Functions
+### 11. Adding Your Own Functions
 A new built-in function needs only a Python function with a help docstring and the `@builtin` decorator, placed next to the others in `matlab_calc.py`. It then works in calculations and appears in `help` automatically:
 
 ```python
@@ -505,10 +543,10 @@ def fn_cube(x):
     return op_power(x, to_matrix(3))
 ```
 
-Arguments arrive as 2-D NumPy arrays (scalars are 1×1) and the function must return one (`to_matrix` converts any result). The number of inputs comes from the Python signature; parameters with a default value (`n=None`) are optional. For several outputs, give `outputs=2` (or more) to `@builtin`, add a keyword-only parameter `nargout` and return a tuple with that many values; `keep_types=True` passes logical and text arguments unchanged instead of converting them to numbers. Console commands work the same way with the `@console_command` decorator on a `MatlabEngine` method. The tests check that every command and function has a help text whose first line has the form `name - Summary.`
+Arguments arrive as 2-D NumPy arrays (scalars are 1×1) and the function must return one (`to_matrix` converts any result). The number of inputs comes from the Python signature; parameters with a default value (`n=None`) are optional. For several outputs, give `outputs=2` (or more) to `@builtin`, add a keyword-only parameter `nargout` and return a tuple with that many values; `keep_types=True` passes logical and text arguments unchanged instead of converting them to numbers, and `command_syntax=True` allows calls such as `hold on`. Console commands work the same way with the `@console_command` decorator on a `MatlabEngine` method. The tests check that every command and function has a help text whose first line has the form `name - Summary.`
 
-### 11. Not Supported
-More than two subscripts and N-dimensional arrays, cell arrays, structures, the separate `string` class (`"text"` gives ordinary `char` text), user functions/scripts, and control flow (`if`, `for`, …). `asin`/`acos` return `NaN` outside [-1, 1], and `acosh` below 1 and `atanh` outside [-1, 1] likewise. Files are read and written as text (UTF-8); `fread`, `fwrite`, `fgetl` and `textscan` are not available. Non-integer matrix powers use an eigendecomposition, so they require a diagonalisable matrix.
+### 12. Not Supported
+More than two subscripts and N-dimensional arrays, cell arrays, structures, the separate `string` class (`"text"` gives ordinary `char` text), user functions/scripts, and control flow (`if`, `for`, …). `asin`/`acos` return `NaN` outside [-1, 1], and `acosh` below 1 and `atanh` outside [-1, 1] likewise. Files are read and written as text (UTF-8); `fread`, `fwrite`, `fgetl` and `textscan` are not available. Graphics: one axes per figure (no `subplot` yet), no `pcolor`, `surf`, `bar` or other plot types, no dot syntax (`h.LineWidth = 2`; use `set`), and `get` takes one handle at a time. Non-integer matrix powers use an eigendecomposition, so they require a diagonalisable matrix.
 
 ---
 
@@ -522,6 +560,7 @@ More than two subscripts and N-dimensional arrays, cell arrays, structures, the 
 - **`Ctrl+A` / `Cmd+A`**: Select all text.
 - **`Ctrl+O` / `Cmd+O`**, **`Ctrl+S` / `Cmd+S`**: Open (run) a script, save the session.
 - **`Ctrl +` / `Cmd +`**, **`Ctrl −` / `Cmd −`**, **`Ctrl 0` / `Cmd 0`**: Larger, smaller or default font size (remembered).
+- **`Ctrl+W` / `Cmd+W`** in a figure window: close the figure.
 - **`F1`** (Linux) / **`Cmd+?`** (macOS): Matlab_Calc Help. **`Cmd+,`** (macOS): Settings. **`Ctrl+Q` / `Cmd+Q`**: Quit.
 
 ---
@@ -532,7 +571,7 @@ More than two subscripts and N-dimensional arrays, cell arrays, structures, the 
 python3 test_matlab_calc.py
 ```
 
-Runs 125 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files (in a temporary folder), the statistics and random-number functions, the help texts, the menus, the About, Help and Settings windows, running and saving scripts, the update check of the Help menu, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available.
+Runs 139 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files (in a temporary folder), the statistics and random-number functions, the help texts, the menus, the About, Help and Settings windows, running and saving scripts, the update check of the Help menu, plotting (off-screen) and figure windows, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available, and the plot tests when matplotlib is not installed.
 
 ---
 
@@ -543,6 +582,14 @@ Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, 
 ---
 
 ## Version History
+
+### 0.9.0 — 2026-11-04
+- **Plots:** `plot` with all its usual forms (vectors, matrices, several x/y pairs, LineSpecs such as `'r--o'`, line properties), drawn with matplotlib in figure windows that look like MATLAB's, with a toolbar to zoom, pan and save.
+- **New functions:** `figure`, `hold`, `ishold`, `xlabel`, `ylabel`, `title` (with MATLAB's `x_1`, `x^2`, `\alpha` markup), `legend`, `grid`, `box`, `axis`, `xlim`, `ylim`, `gca`, `gcf`, `set`, `get`, `close`, `clf`, `cla` and `drawnow`.
+- **Graphics handles** are numbers, as in MATLAB before R2014b; `set` and `get` change and read the properties of figures, axes, lines, labels and legends.
+- **Command syntax** for the graphics commands: `hold on`, `grid on`, `axis equal`, `close all`, ….
+- **Colors** and the color order are matplotlib's.
+- **Parameters:** `FIGURE_WIDTH`, `FIGURE_HEIGHT`, `FIGURE_COLOR` and `PLOT_LINE_WIDTH`.
 
 ### 0.8.0 — 2026-11-04
 - **Menus:** a File menu with **Open…** (runs a `.m` script line by line, as if typed) and **Save…** (saves the commands of the session as a `.m` script), an Edit menu, and a Help menu with **Matlab_Calc Help** and **Check for Updates…**. On Linux, File also has Settings and Quit, and Help has About.

@@ -729,6 +729,322 @@ class TestTextOutputAndFiles(EngineCase):
         self.assertError('cd nowhere', 'Unable to change current folder')
 
 
+HAVE_MATPLOTLIB = importlib.util.find_spec('matplotlib') is not None
+
+
+@unittest.skipUnless(HAVE_MATPLOTLIB, 'matplotlib is not installed')
+class GraphicsCase(EngineCase):
+    def setUp(self):
+        super().setUp()
+        self.eng.execute('close all')
+
+    def axes(self):
+        return self.eng.graphics.current.axes
+
+    def lines(self):
+        return self.axes().lines
+
+    def render(self):
+        """Draw the current figure off-screen: math text and legends must be drawable."""
+        import io
+        self.eng.graphics.current.figure.savefig(io.BytesIO(), format='png')
+
+
+class TestPlot(GraphicsCase):
+    def test_forms_of_plot(self):
+        self.out('plot([4 5 6])')
+        self.assertEqual(self.lines()[0].artist.get_xdata().tolist(), [1, 2, 3])
+        self.out('plot([1 2; 3 4; 5 6])')                    # a line per column
+        self.assertEqual([l.artist.get_ydata().tolist() for l in self.lines()], [[1, 3, 5], [2, 4, 6]])
+        self.out('plot(1:2, [1 2; 3 4; 5 6])')               # x matches the rows' length
+        self.assertEqual(len(self.lines()), 3)
+        self.out('plot([1 2 3], [4 5 6], [1 2], [7 8])')
+        self.assertEqual(len(self.lines()), 2)
+        self.out('plot([1+2i 3+4i])')                          # complex: imaginary against real part
+        self.assertEqual(self.lines()[0].artist.get_ydata().tolist(), [2, 4])
+        self.assertIn('Imaginary parts', self.out('plot([1 2], [1i 2])'))
+        self.out('plot(2, [1 2 3], \'o\')')                     # separate points
+        self.assertEqual(len(self.lines()), 3)
+        self.assertError('plot(1:3, 1:4)', 'Vectors must be the same length')
+        self.assertError('plot([1 2], [3 4], [5 6])', 'single matrix Y or a list of pairs')
+        self.assertError("plot(1:3, 'q-')", "Invalid LineSpec 'q-'")
+        self.assertError("plot(1:3, 'LineColor', 'r')", 'Unrecognized property LineColor for class Line')
+        self.assertError("plot('r')", 'Not enough input arguments')
+        self.assertError("plot(1:3, 'LineWidth')", 'must come in pairs')
+
+    def test_returned_handles_and_output(self):
+        self.assertEqual(self.out('plot(1:3)'), '')            # nothing shown, ans unchanged
+        self.assertNotIn('ans', self.eng.variables)
+        h = self.ans('h = plot([1 2; 3 4])', var='h')
+        self.assertEqual(h.shape, (2, 1))
+        self.assertTrue(all(v % 1 == 0.5 for v in h.ravel()))  # never a figure number
+        self.assertEqual(self.ans('get(gca, \'Children\')').ravel().tolist(), h.ravel()[::-1].tolist())
+
+    def test_linespec_and_colors(self):
+        self.assertEqual(mc.parse_linespec('r--o'), {'color': 'r', 'linestyle': '--', 'marker': 'o'})
+        self.assertEqual(mc.parse_linespec('.-'), {'linestyle': '-', 'marker': '.'})
+        self.assertEqual(mc.parse_linespec('k-.'), {'linestyle': '-.', 'color': 'k'})
+        for bad in ('q', 'rr', '---', 'LineWidth', ''):
+            self.assertIsNone(mc.parse_linespec(bad), bad)
+        self.out("plot(1:3, 1:3, 'r--o', 1:3, 2:4, 'kd', 1:3, 3:5, ':')")
+        red, black, third = self.lines()
+        self.assertEqual((red.artist.get_linestyle(), red.artist.get_marker()), ('--', 'o'))
+        self.assertEqual(self.ans(f"get({red.handle}, 'Color')").ravel().tolist(), [1, 0, 0])
+        self.assertEqual((black.artist.get_linestyle(), black.artist.get_marker()), ('None', 'D'))
+        import matplotlib
+        import matplotlib.colors as mcolors
+        cycle = [c['color'] for c in matplotlib.rcParams['axes.prop_cycle']]
+        self.assertEqual(mcolors.to_hex(third.artist.get_color()), mcolors.to_hex(cycle[0]))  # matplotlib's order
+        self.out('hold on; plot(1:3)')
+        self.assertEqual(mcolors.to_hex(self.lines()[-1].artist.get_color()), mcolors.to_hex(cycle[1]))
+
+    def test_hold(self):
+        self.out("plot(1:3); title('First')")
+        self.out('plot(3:-1:1)')                                 # replaces the plot and its title
+        self.assertEqual(len(self.lines()), 1)
+        self.assertEqual(text_of(self.ans("get(get(gca, 'Title'), 'String')")), '')
+        self.out('hold on')
+        self.assertTrue(self.ans('ishold').item())
+        self.out('plot(1:3); plot(2:4)')
+        self.assertEqual(len(self.lines()), 3)
+        self.out('hold')                                         # toggles
+        self.assertFalse(self.ans('ishold').item())
+        self.assertEqual(text_of(self.ans("get(gca, 'NextPlot')")), 'replace')
+        self.out('hold all')
+        self.assertTrue(self.ans('ishold').item())
+        self.out('hold off; plot(1)')
+        self.assertEqual(len(self.lines()), 1)
+        self.assertError('hold maybe', "Unknown option 'maybe'")
+
+
+class TestLabelsAndLegend(GraphicsCase):
+    def test_labels_and_tex(self):
+        self.out("plot(1:3); h = xlabel('Time t_1 (s)');")
+        label = self.axes().labels['xlabel']
+        self.assertEqual(text_of(self.ans("get(h, 'String')")), 'Time t_1 (s)')
+        self.assertIn('${}_{1}$', label.artist().get_text())
+        self.out(r"ylabel('\alpha^{-2} and x_{max}'); title('Cost: $5', 'FontSize', 14)")
+        self.assertIn(r'$\alpha$', self.axes().labels['ylabel'].artist().get_text())
+        self.assertEqual(self.axes().labels['title'].artist().get_text(), 'Cost: $5')
+        self.assertEqual(self.axes().labels['title'].artist().get_fontsize(), 14)
+        self.out("xlabel('t_1', 'Interpreter', 'none')")
+        self.assertEqual(label.artist().get_text(), 't_1')
+        self.out(r"xlabel('$\sqrt{x}$', 'Interpreter', 'latex')")
+        self.assertEqual(label.artist().get_text(), r'$\sqrt{x}$')
+        self.assertEqual(mc.tex_to_mathtext(r'\notasymbol_1'), (r'\notasymbol${}_{1}$', True))
+        self.assertEqual(mc.tex_to_mathtext('plain'), ('plain', False))
+        self.render()
+        self.assertError('xlabel(5)', 'The first input must be the text')
+        self.assertError("title('x', 'Size', 3)", 'Unrecognized property Size for class Text')
+
+    def test_legend(self):
+        self.out("plot(1:3, 1:3, 1:3, 2:4, 1:3, 3:5)")
+        self.out("legend('a', 'b')")
+        legend = self.axes().legend
+        self.assertEqual([label for _, label in legend.entries()], ['a', 'b'])     # the third is left out
+        self.assertEqual([t.get_text() for t in legend.mpl_legend.get_texts()], ['a', 'b'])
+        self.out('legend')                                                        # all lines
+        self.assertEqual([label for _, label in legend.entries()], ['a', 'b', 'data3'])
+        self.out("hold on; plot(1:3, 'DisplayName', 'new')")                       # added automatically
+        self.assertEqual([label for _, label in self.axes().legend.entries()][-1], 'new')
+        self.assertIn('Ignoring extra legend entries', self.out("legend('1', '2', '3', '4', '5')"))
+        self.out("legend('x_1', 'Location', 'southwest', 'Orientation', 'horizontal')")
+        self.assertEqual(text_of(self.ans("get(legend, 'Location')")), 'southwest')
+        self.render()
+        self.out('legend hide')
+        self.assertFalse(self.axes().legend.mpl_legend.get_visible())
+        self.out('legend boxoff; legend show')
+        self.assertFalse(self.axes().legend.mpl_legend.get_frame_on())
+        self.out('legend off')
+        self.assertIsNone(self.axes().legend)
+        self.assertIsNone(self.axes().ax.get_legend())
+        h = self.ans('h = plot(1:3);', var='h')
+        self.out(f"legend({h.item()}, 'only this')")
+        self.assertEqual([label for _, label in self.axes().legend.entries()], ['only this'])
+        self.assertError("legend('a', 'Location', 'up')", "Invalid value for Location property")
+
+
+class TestSetAndGet(GraphicsCase):
+    def test_set_and_get(self):
+        h = self.ans('h = plot(1:3);', var='h').item()
+        self.out(f"set({h}, 'color', [0 0.5 0], 'LINEW', 3, 'LineStyle', ':', 'Marker', 'square')")
+        line = self.lines()[0]
+        self.assertEqual(line.artist.get_linewidth(), 3)
+        self.assertEqual(self.ans(f"get({h}, 'Color')").ravel().tolist(), [0, 0.5, 0])
+        self.assertEqual(text_of(self.ans(f"get({h}, 'Marker')")), 's')
+        self.assertEqual(text_of(self.ans(f"get({h}, 'LineStyle')")), ':')
+        self.out(f"set({h}, 'Color', 'tab:orange', 'MarkerFaceColor', 'none', 'XData', [1 2 4])")
+        self.assertEqual(text_of(self.ans(f"get({h}, 'MarkerFaceColor')")), 'none')
+        self.assertEqual(self.ans(f"get({h}, 'XData')").tolist(), [[1, 2, 4]])
+        self.assertError(f"set({h}, 'Line', 1)", 'Ambiguous property name Line for class Line')
+        self.assertError(f"set({h}, 'LineColor', 'r')", 'Unrecognized property LineColor for class Line')
+        self.assertError(f"set({h}, 'LineWidth', -1)", 'Invalid value for LineWidth property')
+        self.assertError(f"set({h}, 'Color', 'notacolor')", 'Invalid value for Color property')
+        self.assertError(f"set({h}, 'Type', 'x')", 'cannot be changed')
+        self.assertError("set(99.5, 'Color', 'r')", 'Invalid or deleted graphics object')
+        self.assertError("set('abc', 'Color', 'r')", 'must be graphics handles')
+        self.assertError("x = set(gca, 'Box', 'off')", 'Too many output arguments')
+        listing = self.out(f'get({h})')
+        self.assertIn("LineStyle: ':'", listing)
+        self.assertIn('MarkerSize', self.out(f'set({h})'))
+        self.assertError('s = get(gca)', 'only lists the properties')
+
+    def test_axes_properties(self):
+        self.out('plot(1:10, (1:10).^2)')
+        self.out("set(gca, 'XLim', [0 5], 'YScale', 'log', 'XGrid', 'on', 'FontSize', 12, 'Box', 'off')")
+        ax = self.axes().ax
+        self.assertEqual(self.ans("get(gca, 'XLim')").tolist(), [[0, 5]])
+        self.assertEqual(text_of(self.ans("get(gca, 'XLimMode')")), 'manual')
+        self.assertEqual(ax.get_yscale(), 'log')
+        self.assertFalse(ax.spines['top'].get_visible())
+        self.assertEqual(text_of(self.ans("get(gca, 'XGrid')")), 'on')
+        self.assertEqual(self.axes().labels['title'].artist().get_fontsize(), 12 * mc.LABEL_SIZE_FACTOR)
+        self.out("set(gca, 'XDir', 'reverse', 'XLimMode', 'auto')")
+        self.assertTrue(ax.xaxis.get_inverted())
+        self.assertEqual(self.ans("get(gca, 'XLim')").tolist(), [[0, 10]])           # still [min max]
+        self.out("set(gca, 'XTick', [0 2.5 10])")
+        self.assertEqual(self.ans("get(gca, 'XTick')").tolist(), [[0, 2.5, 10]])
+        self.assertEqual(self.ans("get(get(gca, 'XLabel'), 'Type')").tobytes(), mc.text_to_chars('text').tobytes())
+        self.assertError("set(gca, 'XLim', [5 1])", 'min < max')
+        self.assertError("set(gca, 'XScale', 'loglog')", "it must be 'linear' or 'log'")
+        self.render()
+
+    def test_figures(self):
+        self.assertEqual(self.ans('f = figure', var='f').item(), 1)
+        self.assertEqual(self.ans('g = figure(7);', var='g').item(), 7)
+        self.assertEqual(self.ans('gcf').item(), 7)
+        self.assertEqual(self.ans('n = figure;', var='n').item(), 2)  # the lowest free number
+        self.out('figure(1)')
+        self.assertEqual(self.ans('gcf').item(), 1)
+        self.out("figure(3, 'Name', 'Results', 'NumberTitle', 'off')")
+        figure = self.eng.graphics.figures[3]
+        self.assertEqual(figure.title(), 'Results')
+        self.out("set(gcf, 'NumberTitle', 'on')")
+        self.assertEqual(figure.title(), 'Figure 3: Results')
+        self.assertEqual(self.ans("get(gcf, 'Number')").item(), 3)
+        self.assertEqual(self.ans("get(gcf, 'Position')").shape, (1, 4))
+        self.assertEqual(self.ans("get(gca, 'Parent')").item(), 3)
+        self.out('close')                                          # the current one: 3
+        self.assertNotIn(3, self.eng.graphics.figures)
+        self.assertEqual(self.ans('gcf').item(), 1)                # the one active before it
+        self.out('close([1 2])')
+        self.assertEqual(sorted(self.eng.graphics.figures), [7])
+        self.assertError('figure(0)', 'whole number of 1 or more')
+        self.assertError('close(1.5)', 'Invalid or deleted graphics object')
+        self.out('plot(1:3); a = gca; clf')
+        self.assertIsNone(self.eng.graphics.current.axes)
+        self.assertError(f"get({self.eng.variables['a'].item()}, 'Type')", 'Invalid or deleted')
+        self.out("plot(1:3); title('kept'); cla")
+        self.assertEqual(self.lines(), [])
+        self.assertEqual(text_of(self.ans("get(get(gca, 'Title'), 'String')")), 'kept')
+        self.out('close all')
+        self.assertEqual(self.eng.graphics.figures, {})
+
+    def test_axis_and_limits(self):
+        self.out('plot(0:0.1:2.05, sin(0:0.1:2.05))')
+        self.assertEqual(self.ans('axis').shape, (1, 4))
+        self.out('axis([0 3 -2 2])')
+        self.assertEqual(self.ans('axis').tolist(), [[0, 3, -2, 2]])
+        self.out('xlim([-Inf 1])')
+        self.assertEqual(self.ans('xlim').tolist(), [[0, 1]])
+        self.assertEqual(text_of(self.ans("xlim('mode')")), 'manual')
+        self.out('xlim auto; axis tight')
+        self.assertAlmostEqual(self.ans('xlim')[0, 1], 2.0)
+        self.out('axis equal; axis ij; axis off')
+        ax = self.axes().ax
+        self.assertEqual(ax.get_aspect(), 1.0)
+        self.assertTrue(ax.yaxis.get_inverted())
+        self.assertFalse(ax.axison)
+        self.out('axis on xy normal; axis square')
+        self.assertFalse(ax.yaxis.get_inverted())
+        self.assertError('axis([1 2 3])', '[xmin xmax ymin ymax]')
+        self.assertError('axis sideways', "Unknown option 'sideways'")
+        self.out('grid on')
+        self.assertTrue(self.axes().grid['x'] and self.axes().grid['y'])
+        self.out('grid minor')
+        self.assertTrue(self.axes().grid['xminor'])
+        self.out('grid off; box off')
+        self.assertFalse(self.axes().grid['x'] or self.axes().grid['xminor'] or self.axes().box)
+        self.render()
+
+    def test_command_syntax(self):
+        self.out('hold on')
+        self.assertTrue(self.ans('ishold').item())
+        self.out('axis equal tight')
+        self.assertValue('hold = 3', 3, var='hold')          # assignment, not a command
+        self.out('hold on')                                     # now the variable is shown, not a command
+        self.assertNotIn('Error', self.out('close all'))
+        self.assertEqual(self.eng.graphics.figures, {})
+        self.assertIsNone(self.eng._command_syntax('disp hello'))  # only graphics commands take words
+
+    def test_without_matplotlib(self):
+        saved, saved_modules = dict(mc._MPL), {k: v for k, v in sys.modules.items() if k.startswith('matplotlib')}
+        mc._MPL.clear()
+        sys.modules['matplotlib'] = None   # makes "import matplotlib" fail
+        try:
+            eng = mc.MatlabEngine()
+            self.assertIn('pip install matplotlib', ''.join(eng.execute('plot(1:3)')))
+            self.assertIn('plot - Plot lines.', ''.join(eng.execute('help plot')))
+        finally:
+            del sys.modules['matplotlib']
+            sys.modules.update(saved_modules)
+            mc._MPL.update(saved)
+
+
+@unittest.skipUnless(HAVE_MATPLOTLIB, 'matplotlib is not installed')
+class TestFigureWindows(unittest.TestCase):
+    """Figures shown in their own windows by the GUI."""
+
+    def setUp(self):
+        self.root = make_root(visible=True)
+        self.app = mc.MatlabConsoleApp(self.root)
+        self.root.update()
+
+    def tearDown(self):
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+        gc.collect()
+
+    def run_line(self, line):
+        self.app.run_typed(line)
+        self.root.update()
+        return self.app.output_area.get('1.0', 'end-1c')
+
+    def test_figure_windows(self):
+        self.run_line('x = 0:0.1:6; plot(x, sin(x), x, cos(x)); legend; grid on')
+        window = self.app.figure_windows[1]
+        self.assertEqual(window.title(), 'Figure 1')
+        self.assertTrue(window.winfo_ismapped())
+        self.assertIsNotNone(window.toolbar)
+        self.run_line('figure')
+        self.assertEqual(sorted(self.app.figure_windows), [1, 2])
+        window.event_generate('<FocusIn>')                       # clicking figure 1 makes it current
+        self.assertEqual(self.app.engine.graphics.current.number, 1)
+        self.run_line("set(gcf, 'Name', 'Waves')")
+        self.assertEqual(window.title(), 'Figure 1: Waves')
+        self.run_line("set(gcf, 'Position', [50 100 500 300])")
+        position = self.app.engine.graphics.figures[1].get_position()
+        self.assertEqual(position[2:], [500, 300])
+        self.run_line('drawnow')
+        window.close()                                            # the close button of the window
+        self.assertNotIn(1, self.app.engine.graphics.figures)
+        self.assertEqual(sorted(self.app.figure_windows), [2])
+        self.assertEqual(self.app.engine.graphics.current.number, 2)
+        self.assertFalse(window.winfo_exists())
+        self.run_line('close all')
+        self.assertEqual(self.app.figure_windows, {})
+        content = self.run_line('plot(1:3)')
+        self.assertNotIn('Error', content)
+        self.assertEqual(sorted(self.app.figure_windows), [1])
+
+    def test_exit_with_open_figures(self):
+        self.run_line('plot(1:3); figure; plot(3:-1:1)')
+        self.app.run_typed('exit')
+        self.assertTrue(self.app.closed)
+
+
 class TestDisplay(EngineCase):
     def test_readme_examples(self):
         self.out('A = [1 3 2.4 6 4.4 3.2 1];')
