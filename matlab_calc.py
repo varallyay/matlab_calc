@@ -4,6 +4,7 @@ Matlab_Calc - a MATLAB Command Window emulator built with Tkinter and NumPy.
 Run with:  python3 matlab_calc.py
 """
 
+import contextlib
 import functools
 import gc
 import glob
@@ -36,7 +37,7 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
-APP_VERSION = '0.10.1'          # Shown in the welcome banner; see the version history in README.md
+APP_VERSION = '0.12.0'          # Shown in the welcome banner; see the version history in README.md
 APP_CREDITS = "Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, Claude)"
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
@@ -70,7 +71,8 @@ CONFIG_FILE = '~/.matlab_calc.json'  # Settings file in the home folder: first s
 UPDATE_REPOSITORY = 'varallyay/matlab_calc'  # GitHub project (owner/name) that publishes new versions
 APP_WEBSITE = 'https://github.com/' + UPDATE_REPOSITORY  # Shown in the About window
 UPDATE_CHECK_DAYS = 7           # Look for a new version this often (days); 0 = only with the update command
-SCRIPT_EXTENSION = '.m'         # File type of File > Open and File > Save
+SCRIPT_EXTENSION = '.m'         # File type of scripts: File > Open, File > Save, run and typing a name
+MAX_SCRIPT_DEPTH = 32           # How deeply scripts may run other scripts (stops a script that runs itself)
 # =============================================================================
 
 __version__ = APP_VERSION
@@ -99,6 +101,11 @@ MSG_MPOWER = (
 
 class MatlabError(Exception):
     """An error whose message is shown to the user as-is (MATLAB style)."""
+
+
+class StopError(MatlabError):
+    """An error that is not about a line of a script (Ctrl+C, scripts nested too deeply): it is
+    shown without 'Error in name (line n)'."""
 
 
 # =============================================================================
@@ -2064,6 +2071,53 @@ def fn_delete(*names, engine):
     return None
 
 
+def script_in_folder(name):
+    """The path of the script name.m in the current folder, or None if there is none.
+    Upper and lower case must match, as in MATLAB (also where the file system ignores case)."""
+    file = name + SCRIPT_EXTENSION
+    try:
+        return os.path.abspath(file) if os.path.isfile(file) and file in os.listdir('.') else None
+    except OSError:
+        return None
+
+
+@builtin('run', category=CAT_FILES, outputs=0, keep_types=True, command_syntax='files')
+def fn_run(name, *, engine):
+    """run - Run a script.
+
+    run name          runs the commands of the script name.m, e.g. run demo.
+                      run demo.m is the same; another file type must be
+                      given in full: run notes.txt.
+    run folder/name   runs a script in another folder, e.g. run ../demo or
+                      run ~/Documents/demo. While it runs, the current
+                      folder is the folder of the script, so it finds its
+                      data files; afterwards the previous folder is back,
+                      unless the script changed it with cd.
+    run('My Script')  the same as a function; needed for names with spaces
+                      (or: run 'My Script').
+    name              typing the name of a script in the current folder
+                      runs it too, e.g. demo for demo.m - unless a variable,
+                      command or built-in function has that name.
+
+    A script is a text file with one command per line, as they are typed in
+    the Command Window; File > Save writes one. It works with the variables
+    of the workspace and can run other scripts. Its commands are not shown,
+    only their results (end a line with ; to hide one). An error stops the
+    script and names the line: Error in demo (line 3).
+
+    See also cd, ls, pwd, disp.
+    """
+    name = _path_argument(name, 'run', 'The script name')
+    path = os.path.expanduser(name)
+    choices = [path] if os.path.splitext(path)[1] else [path + SCRIPT_EXTENSION, path]
+    script = next((p for p in choices if os.path.isfile(p)), None)
+    if script is None:
+        raise MatlabError(f"Error using run\nThe script '{name}' was not found"
+                          + (" (it is a folder)." if os.path.isdir(path) else "."))
+    engine.run_script(os.path.abspath(script), change_folder=True)
+    return None
+
+
 def _delete_graphics(value, engine):
     """delete(h): close figures, clear axes, remove lines and legends."""
     graphics = _graphics(engine)
@@ -3746,15 +3800,134 @@ OPERATOR_SUMMARY = (
     ("'text'  \"text\"  [a, b] = f(x)", "text, several outputs"),
 )
 
+CONTROL_FLOW_SUMMARY = (
+    ("for k = 1:n ... end", "repeat for each value"),
+    ("while cond ... end", "repeat while a condition is true"),
+    ("if ... elseif ... else ... end", "run statements if a condition is true"),
+    ("break  continue", "leave a loop, skip to its next pass"),
+)
+
 # 'help' followed by any of these shows OPERATORS_HELP
 OPERATOR_TOPICS = {
     'ops', 'operators', '+', '-', '*', '/', '\\', '^', "'", '.*', './', '.\\', '.^', ".'",
     '==', '~=', '<', '<=', '>', '>=', '&', '|', '~', '&&', '||', '=', '[', ']', '(', ')', ':', '%', '...',
     'plus', 'minus', 'uplus', 'uminus', 'mtimes', 'mrdivide', 'mldivide', 'mpower', 'rdivide', 'ldivide',
     'transpose', 'ctranspose', 'eq', 'ne', 'lt', 'le', 'gt', 'ge', 'and', 'or', 'not', 'colon',
-    'horzcat', 'vertcat', 'end', 'paren', 'indexing', 'index', 'subsref', 'subsasgn', 'assignment',
+    'horzcat', 'vertcat', 'paren', 'indexing', 'index', 'subsref', 'subsasgn', 'assignment',
     'text', 'char', 'string', 'strings', '"', 'outputs', 'nargout',
 }
+
+# 'help for', 'help if', ...: the control-flow keywords. Each text starts with "name - Summary."
+KEYWORD_HELP = {
+    'for': r"""for - Repeat statements a specific number of times.
+
+    for name = values
+        statements
+    end
+
+runs the statements once for each column of values, with the variable
+name set to that column: for a row vector (such as a range), once for
+each element.
+
+    for k = 1:5
+        fprintf('%d squared is %d\n', k, k^2);
+    end
+
+    s = 0;
+    for x = [2 4 8], s = s + x; end     % on one line: commas or ;
+
+for k = 10:-2:0 counts down, for c = A takes the columns of a matrix A.
+After the loop the variable keeps its last value. If values is empty,
+the statements do not run.
+break leaves the loop, continue goes on with the next value.
+Ctrl+C stops a loop that runs too long.
+
+See also while, if, break, continue, end.""",
+    'while': r"""while - Repeat statements while a condition is true.
+
+    while condition
+        statements
+    end
+
+runs the statements again and again as long as the condition is true:
+not empty and all of its elements nonzero (see help if).
+
+    n = 1;
+    while n < 1000
+        n = 2 * n;
+    end
+
+break leaves the loop, continue goes on with the next test of the
+condition. Ctrl+C stops a loop that never ends, e.g. while true.
+
+See also for, if, break, continue, end.""",
+    'if': r"""if - Run statements if a condition is true.
+
+    if condition
+        statements
+    elseif condition
+        statements
+    else
+        statements
+    end
+
+runs the statements after the first true condition; if none is true,
+the statements after else. elseif and else are optional, and there may
+be several elseif parts.
+
+    if x > 0
+        disp('positive')
+    elseif x < 0
+        disp('negative')
+    else
+        disp('zero')
+    end
+
+    if x > 0, y = sqrt(x); end      % on one line: commas or ;
+
+A condition is true if it is not empty and all of its elements are
+nonzero: if A > 0 is true only when every element of A is positive.
+To test whether some element is positive, use if max(A(:)) > 0.
+Combine conditions with &&, || and ~. A NaN in a condition is an error.
+
+See also for, while, end, ops.""",
+    'break': r"""break - Leave a for or while loop.
+
+break stops the innermost for or while loop that contains it; the
+program goes on after the end of that loop.
+
+    for k = 1:100
+        if k^2 > 50, break, end
+    end
+    k                                  % 8
+
+See also continue, for, while.""",
+    'continue': r"""continue - Go on with the next pass of a loop.
+
+continue skips the rest of the statements of the innermost for or
+while loop in this pass and goes on with the next value (for) or the
+next test of the condition (while).
+
+    for k = 1:6
+        if mod(k, 2) == 0, continue, end
+        disp(k)                        % 1, 3, 5
+    end
+
+See also break, for, while.""",
+    'end': r"""end - End of a block, or the last index.
+
+end closes a for, while or if block:
+
+    for k = 1:3, disp(k), end
+
+In a subscript such as A(i, j), end is the last position in that place
+(the number of rows, of columns, or of elements):
+
+    v(end), A(end, :), A(2, end-1), v(2:end), v(end+1) = 7
+
+help ops describes indexing. See also for, while, if.""",
+}
+KEYWORD_HELP['elseif'] = KEYWORD_HELP['else'] = KEYWORD_HELP['if']
 
 _HELP_FIELDS = re.compile(r"\{(APP_NAME|APP_VERSION|SHORT_DECIMALS|LONG_DECIMALS|CONFIG_FILE|"
                           r"UPDATE_REPOSITORY|UPDATE_CHECK_DAYS)\}")
@@ -3848,13 +4021,13 @@ def _text_end(text, i):
         return k + 1
 
 
-# ---- scripts: File > Open runs a .m file, File > Save writes one ---------------
+# ---- scripts: File > Open and run run a .m file, File > Save writes one --------
 def script_commands(text):
     """The commands of a script (.m file) in the order they run, as (line number, command) pairs.
 
     Each line is one command, run as if it were typed after the prompt. A command goes on
-    in the next lines while a [ ] is open or after '...'. Blank lines and lines with only
-    a comment are skipped.
+    in the next lines while a [ ] is open, after '...', and up to the end of a for, while
+    or if block. Blank lines and lines with only a comment are skipped.
     """
     commands, lines, start = [], [], 0
     for number, line in enumerate(text.splitlines(), 1):
@@ -3863,12 +4036,37 @@ def script_commands(text):
                 continue
             start = number
         lines.append(line.rstrip())
-        if not _continues('\n'.join(lines)):
-            commands.append((start, '\n'.join(lines)))
+        command = '\n'.join(lines)
+        if not (_continues(command) or block_is_open(command)):
+            commands.append((start, command))
             lines = []
-    if lines:  # a [ that is never closed: run it anyway, so its error is shown
+    if lines:  # a [ or a block that is never closed: run it anyway, so its error is shown
         commands.append((start, '\n'.join(lines)))
     return commands
+
+
+@contextlib.contextmanager
+def working_folder(folder):
+    """Make folder the current folder for a while (None: leave it), as MATLAB's run does for a script.
+
+    Afterwards the previous folder is restored, unless the current folder was changed in the
+    meantime: a cd in the script is kept.
+    """
+    before = os.getcwd()
+    if folder:
+        try:
+            os.chdir(folder)
+        except OSError:
+            folder = None
+    try:
+        yield
+    finally:
+        # realpath: on macOS os.getcwd() gives /private/var/... for a script in /var/...
+        if folder and os.path.realpath(os.getcwd()) == os.path.realpath(folder):
+            try:
+                os.chdir(before)
+            except OSError:
+                pass
 
 
 def _continues(text):
@@ -3917,9 +4115,13 @@ def _starts_new_element(text, j):
     return c in '\'"'  # text
 
 
-def tokenize(text):
-    """Turn one statement into tokens (kind, text, value); kind is 'num', 'id', 'op', a bracket, ',', ';' or 'eof'."""
+def tokenize(text, positions=None):
+    """Turn one statement into tokens (kind, text, value); kind is 'num', 'id', 'op', a bracket, ',', ';' or 'eof'.
+
+    If a list is given as positions, the index in text where each token starts is appended to it.
+    """
     tokens, stack, i, n = [], [], 0, len(text)
+    start = 0  # where the tokens made in the current step of the loop start
 
     def prev_ends_operand():
         if not tokens:
@@ -3928,6 +4130,9 @@ def tokenize(text):
         return kind in ('num', 'id', 'str', ')', ']') or (kind == 'op' and tok in ("'", ".'"))
 
     while i < n:
+        if positions is not None:
+            positions.extend([start] * (len(tokens) - len(positions)))
+            start = i
         ch = text[i]
         in_brackets = bool(stack) and stack[-1] == '['
         if ch in ' \t\r\n':
@@ -3994,6 +4199,8 @@ def tokenize(text):
                               "or non-ASCII characters.")
     if stack:
         raise MatlabError(MSG_UNBALANCED)
+    if positions is not None:
+        positions.extend([start] * (len(tokens) - len(positions)) + [n])
     tokens.append(('eof', '', None))
     return tokens
 
@@ -4227,6 +4434,163 @@ class Parser:
         return ('matrix', [r for r in rows if r])
 
 
+# ---- control flow: for, while, if / elseif / else, break, continue, end ------------
+# A command line (or script) is first split into statements; parse_program() groups them
+# into blocks. The statements themselves stay text and are parsed when they run, so the
+# statements before an error in a later one still run, as before.
+KEYWORDS = ('for', 'while', 'if', 'elseif', 'else', 'end', 'break', 'continue')
+_KEYWORD_RE = re.compile(r"(for|while|if|elseif|else|end|break|continue)(?![A-Za-z0-9_])\s*(.*)", re.S)
+MSG_END_MISSING = "Error: At least one END is missing: the statement '{}' has no matching end."
+
+
+class IncompleteBlock(MatlabError):
+    """A for, while or if block is not closed by end (yet): the Command Window waits for more lines."""
+
+
+def _keyword(text):
+    """(keyword, rest) if the statement text starts with a control-flow keyword, else (None, text)."""
+    m = _KEYWORD_RE.fullmatch(text)
+    if m is None or (m.group(1) in ('end', 'break', 'continue') and m.group(2)):
+        return None, text
+    return m.group(1), m.group(2)
+
+
+def _parse_header(keyword, text):
+    """The condition of if, elseif and while, or (name, values) of for, from the text after the keyword.
+
+    As in MATLAB, the first statement of the block may follow on the same line without a comma
+    (for k = 1:3 disp(k), end); it is returned as the second value ('' if there is none).
+    """
+    positions = []
+    p = Parser(tokenize(text, positions))
+    if keyword == 'for':
+        paren = p.at('(')  # for (k = 1:3)
+        if paren:
+            p.advance()
+        if not (p.at('id') and p.peek(1)[:2] == ('op', '=')) or p.peek()[1] in KEYWORDS:
+            raise MatlabError("Error: Invalid for statement. A for loop starts with: for name = values")
+        name = p.advance()[1]
+        p.advance()  # '='
+        header = (name, p.parse_expr())
+        if paren:
+            p.expect(')')
+    else:
+        if p.at('eof'):
+            raise MatlabError(f"Error: The '{keyword}' statement needs a condition, as in: {keyword} x > 0")
+        header = p.parse_expr()
+    if p.at_op('='):
+        raise MatlabError("Error: Incorrect use of '=' operator. To assign a value to a variable, use '='.\n"
+                          "To compare values for equality, use '=='.")
+    rest = '' if p.at('eof') else text[positions[p.pos]:].strip()
+    return header, rest
+
+
+class _ProgramParser:
+    """Groups statements into a tree of blocks:
+
+        ('stmt', text, suppressed)          a statement, run by MatlabEngine._run_statement
+        ('if', [(condition, body), ...], else_body or None)
+        ('for', name, values, body)         ('while', condition, body)
+        ('break',)  ('continue',)
+    """
+
+    def __init__(self, statements):
+        self.items = list(statements)
+        self.pos = 0
+        self.loops = 0  # how many for / while loops the current statement is in
+
+    def push(self, text, suppressed):
+        """Run text next: the statement that followed a keyword on the same line."""
+        if text:
+            self.items.insert(self.pos, (text, suppressed))
+
+    def block(self, opener=None, closers=()):
+        """Statements up to one whose keyword is in closers. Returns (body, keyword, rest, suppressed)."""
+        body = []
+        while self.pos < len(self.items):
+            text, suppressed = self.items[self.pos]
+            self.pos += 1
+            keyword, rest = _keyword(text)
+            if keyword is not None and re.match(r"=(?!=)", rest):  # for = 3
+                raise MatlabError(f'Error: Illegal use of reserved keyword "{keyword}". '
+                                  'It cannot be used as a variable name.')
+            if keyword is None:
+                body.append(('stmt', text, suppressed))
+            elif keyword in closers:
+                return body, keyword, rest, suppressed
+            elif keyword in ('end', 'else', 'elseif'):
+                raise MatlabError(f'Error: Illegal use of reserved keyword "{keyword}".')
+            elif keyword in ('break', 'continue'):
+                if not self.loops:
+                    raise MatlabError(f"Error: '{keyword}' can only be used inside a for or while loop.")
+                body.append((keyword,))
+            elif keyword == 'if':
+                body.append(self._if(text, rest, suppressed))
+            else:
+                header, rest_ = _parse_header(keyword, rest)
+                self.push(rest_, suppressed)
+                self.loops += 1
+                inner = self.block(text, ('end',))[0]
+                self.loops -= 1
+                body.append(('for', *header, inner) if keyword == 'for' else ('while', header, inner))
+        if opener is not None:
+            raise IncompleteBlock(MSG_END_MISSING.format(opener))
+        return body, None, '', False
+
+    def _if(self, text, rest, suppressed):
+        branches, otherwise = [], None
+        condition, rest = _parse_header('if', rest)
+        self.push(rest, suppressed)
+        while True:
+            body, closer, rest, suppressed = self.block(text, ('elseif', 'else', 'end'))
+            branches.append((condition, body))
+            if closer == 'elseif':
+                condition, rest = _parse_header('elseif', rest)
+                self.push(rest, suppressed)
+            elif closer == 'else':
+                self.push(rest, suppressed)  # else disp(x), as in MATLAB
+                otherwise = self.block(text, ('end',))[0]
+                return ('if', branches, otherwise)
+            else:
+                return ('if', branches, otherwise)
+
+
+def parse_program(statements):
+    """The block tree (see _ProgramParser) of the (text, suppressed) pairs from split_statements().
+
+    Raises IncompleteBlock if a for, while or if has no end, and MatlabError for a misplaced
+    keyword (end, else, break, ... where they cannot be) or an invalid for / if / while line.
+    """
+    return _ProgramParser(statements).block()[0]
+
+
+def block_is_open(text):
+    """Does text open a for, while or if block that it does not close? Then the Command Window
+    (and a script) takes the next lines as part of it, as MATLAB does."""
+    try:
+        parse_program(split_statements(text))
+    except IncompleteBlock:
+        return True
+    except MatlabError:
+        return False  # run it, so the error is shown
+    return False
+
+
+@functools.lru_cache(maxsize=4096)
+def parse_statement_text(text):
+    """Parse tree of one statement. Cached, so that statements in a loop are parsed only once."""
+    return Parser(tokenize(text)).parse_statement()
+
+
+def condition_is_true(value, keyword):
+    """The test of if and while, as in MATLAB: true if the value is not empty and all of its
+    elements are nonzero (for complex numbers: their real parts)."""
+    a = np.real(value) if np.iscomplexobj(value) else value
+    if a.dtype != bool and a.dtype != CHAR and np.isnan(a).any():
+        raise MatlabError(f"Error: NaN's cannot be converted to logicals (in the {keyword} condition).")
+    return a.size > 0 and bool(np.all(a != 0))
+
+
 def _subscript(node, extent, variables, position, check_bounds=True):
     """Evaluate one subscript. Returns (0-based positions, kind, shape of the subscript).
 
@@ -4424,6 +4788,9 @@ def evaluate(node, variables, end_value=None):
             return index_matrix(variables[name], args, variables)
         if name in FUNCTIONS:
             return call_function(name, args, variables, end_value)
+        if script_in_folder(name):
+            raise MatlabError(f"Attempt to execute SCRIPT {name} as a function: a script gives no value "
+                              f"and takes no inputs. Type {name} on its own to run it.")
         raise MatlabError(f"Unrecognized function or variable '{name}'.")
     if kind == 'un':
         return UNARY_OPS[node[1]](evaluate(node[2], variables, end_value))
@@ -4464,6 +4831,7 @@ def evaluate(node, variables, end_value=None):
 #  Engine: runs command lines and formats results (independent of the GUI)
 # =============================================================================
 CLEAR_SCREEN = object()  # returned by MatlabEngine.execute() for 'clc'
+INTERRUPT_CHECK_SECONDS = 0.1  # how often a running loop lets the GUI react (show output, Ctrl+C)
 EXIT_APP = object()      # returned by MatlabEngine.execute() for 'exit' / 'quit'
 
 COMMANDS = {}  # command name -> (unbound MatlabEngine method, maximum number of arguments or None, argument regex)
@@ -4526,12 +4894,28 @@ def help_overview():
             lines.append("Operators and special characters (help ops)")
             lines += [f"  {ops:<{op_width}}  {meaning}" for ops, meaning in OPERATOR_SUMMARY]
             lines.append("")
+            lines.append("Control flow (help for, help if, ...)")
+            lines += [f"  {label:<{op_width}}  {summary}" for label, summary in CONTROL_FLOW_SUMMARY]
+            lines.append("")
     lines.append('Type "help <name>" for details, e.g. help round.')
     return "\n".join(lines)
 
 
 def _indent(text):
     return "\n".join(("  " + line).rstrip() for line in text.splitlines()) + "\n"
+
+
+def error_message(err):
+    """The text shown for an exception raised while a command runs."""
+    if isinstance(err, MatlabError):
+        return str(err)
+    if isinstance(err, np.linalg.LinAlgError):
+        return f"Error: {err}."
+    if isinstance(err, MemoryError):
+        return "Error: Out of memory."
+    if isinstance(err, RecursionError):
+        return "Error: The expression is nested too deeply."
+    return f"Error: {err}"  # unexpected NumPy/Python failure: report it, keep the app alive
 
 
 class MatlabEngine:
@@ -4543,6 +4927,11 @@ class MatlabEngine:
         self.figure_host = None     # the GUI that shows figures in windows (see Graphics)
         self._graphics = None       # the figures, made at the first graphics command
         self._output = []
+        self._script_depth = 0      # how many scripts are running (one that runs another: 2)
+        # Called now and then while a loop runs (at most every INTERRUPT_CHECK_SECONDS); if it returns
+        # True the loop stops with "Operation terminated by user". The GUI uses it for Ctrl+C.
+        self.interrupt_check = None
+        self._next_check = 0.0
 
     @property
     def graphics(self):
@@ -4552,28 +4941,18 @@ class MatlabEngine:
 
     # ---- execution ---------------------------------------------------------
     def execute(self, line):
-        """Run one command line. Returns output chunks (str), CLEAR_SCREEN and/or EXIT_APP.
+        """Run one command line (or several lines, e.g. a for loop). Returns output chunks (str),
+        CLEAR_SCREEN and/or EXIT_APP.
 
-        Like MATLAB, the remaining statements on the line are skipped after an error or 'exit'.
+        Like MATLAB, the remaining statements are skipped after an error or 'exit'.
         """
         global _CURRENT_ENGINE
         output, error = [], None
         previous, _CURRENT_ENGINE, self._output = _CURRENT_ENGINE, self, output
         try:
-            for text, suppressed in split_statements(line):
-                output.extend(self._run_statement(text, suppressed))
-                if output and output[-1] is EXIT_APP:
-                    break
-        except MatlabError as err:
-            error = str(err)
-        except np.linalg.LinAlgError as err:
-            error = f"Error: {err}."
-        except MemoryError:
-            error = "Error: Out of memory."
-        except RecursionError:
-            error = "Error: The expression is nested too deeply."
-        except Exception as err:  # unexpected NumPy/Python failure: report it, keep the app alive
-            error = f"Error: {err}"
+            self._run_block(parse_program(split_statements(line)))
+        except Exception as err:
+            error = error_message(err)
         finally:
             _CURRENT_ENGINE = previous
             if self._graphics is not None:
@@ -4586,12 +4965,87 @@ class MatlabEngine:
             output.append(error + "\n")
         return output
 
+    def _run_block(self, block):
+        """Run the statements of a block (see parse_program). Returns None when the block has run to
+        its end, or 'break', 'continue' or 'exit' when one of them stopped it."""
+        for node in block:
+            kind = node[0]
+            if kind == 'stmt':
+                self._output.extend(self._run_statement(node[1], node[2]))
+                if self._output and self._output[-1] is EXIT_APP:  # exit, also in a script that was run
+                    return 'exit'
+                continue
+            if kind in ('break', 'continue'):
+                return kind
+            if kind == 'if':
+                for condition, body in node[1]:
+                    if self._condition(condition, 'if'):
+                        break
+                else:
+                    body = node[2] or ()
+                flow = self._run_block(body)
+            elif kind == 'for':
+                flow = self._run_for(*node[1:])
+            else:  # while
+                flow = None
+                while self._condition(node[1], 'while'):
+                    self._check_interrupt()
+                    flow = self._run_block(node[2])
+                    if flow in ('break', 'exit'):
+                        break
+                flow = 'exit' if flow == 'exit' else None
+            if flow is not None:
+                return flow
+        return None
+
+    def _run_for(self, name, values_node, body):
+        """for name = values: one pass for each column of the values, as in MATLAB (so for a row
+        vector, each element). The variable keeps the last value afterwards."""
+        with np.errstate(all='ignore'):
+            values = evaluate(values_node, self.variables)
+        if values.shape[1] == 0:
+            self.variables[name] = np.zeros((0, 0), dtype=values.dtype)
+        for k in range(values.shape[1]):
+            self._check_interrupt()
+            self.variables[name] = values[:, k:k + 1].copy()
+            flow = self._run_block(body)
+            if flow == 'break':
+                break
+            if flow == 'exit':
+                return flow
+        return None
+
+    def _condition(self, node, keyword):
+        with np.errstate(all='ignore'):
+            return condition_is_true(evaluate(node, self.variables), keyword)
+
+    def _check_interrupt(self):
+        """Ask interrupt_check (now and then) whether the user wants to stop the running loop."""
+        if self.interrupt_check is None:
+            return
+        now = time.monotonic()
+        if now < self._next_check:
+            return
+        self._next_check = now + INTERRUPT_CHECK_SECONDS
+        if self.interrupt_check():
+            raise StopError("Operation terminated by user.")
+
+    def take_output(self):
+        """The output made so far by the running command line, which is then not returned by
+        execute(): the GUI shows the output of a long loop while it runs."""
+        chunks = list(self._output)
+        del self._output[:]
+        return chunks
+
     def _run_statement(self, text, suppressed):
         result = self._run_command(text, suppressed)
         if result is not None:
             return result
+        if self._is_script_name(text):  # typing the name of a script in the current folder runs it
+            self.run_script(script_in_folder(text))
+            return []
         node = self._command_syntax(text)
-        target, node = (None, node) if node is not None else Parser(tokenize(text)).parse_statement()
+        target, node = (None, node) if node is not None else parse_statement_text(text)
         with np.errstate(all='ignore'):  # 1/0 -> Inf and 0/0 -> NaN, as in MATLAB
             if isinstance(target, tuple) and target[0] == 'outputs':
                 return self._assign_outputs(target[1], node, suppressed)
@@ -4611,6 +5065,49 @@ class MatlabEngine:
                 target = target or 'ans'
                 self.variables[target] = value
         return [] if suppressed else [f"{target} =\n{self.format_value(value)}\n"]
+
+    def _is_script_name(self, text):
+        """Is text the name of a script in the current folder? Variables and built-in functions
+        of that name come first (run name.m runs such a script)."""
+        return (_IDENT_RE.fullmatch(text) is not None and text not in self.variables
+                and text not in FUNCTIONS and script_in_folder(text) is not None)
+
+    def run_script(self, path, change_folder=False):
+        """Run the commands of the script file `path` in the workspace, one after the other.
+
+        Unlike File > Open, which types the lines, the commands are not shown and the first
+        error stops the script; its message names the script and the line of the command.
+        change_folder: the folder of the script is the current folder while it runs (run).
+        Returns 'exit' if the script closed the program, otherwise None.
+        """
+        name = os.path.splitext(os.path.basename(path))[0]
+        if self._script_depth >= MAX_SCRIPT_DEPTH:
+            raise StopError(f"Error: Scripts are nested more than {MAX_SCRIPT_DEPTH} deep. "
+                            f"Does the script {name} run itself?")
+        try:
+            with open(path, encoding='utf-8-sig', errors='replace') as f:
+                commands = script_commands(f.read())
+        except OSError as err:
+            raise MatlabError(f"Error using run\n{_os_message(err)}") from None
+        if commands and re.match(r"function(?![A-Za-z0-9_])", commands[0][1]):
+            raise MatlabError(f"Error: {os.path.basename(path)} is a function file. {APP_NAME} runs scripts; "
+                              "functions written in MATLAB are not supported.")
+        self._script_depth += 1
+        try:
+            with working_folder(os.path.dirname(path) if change_folder else None):
+                for number, command in commands:
+                    self._check_interrupt()  # Ctrl+C stops a script; its output appears while it runs
+                    try:
+                        flow = self._run_block(parse_program(split_statements(command)))
+                    except StopError:
+                        raise
+                    except Exception as err:
+                        raise MatlabError(f"{error_message(err)}\n\nError in {name} (line {number})") from None
+                    if flow == 'exit':
+                        return flow
+        finally:
+            self._script_depth -= 1
+        return None
 
     def _command_syntax(self, text):
         """'hold on', 'axis equal tight': a function that allows command syntax, with words as text inputs.
@@ -4759,6 +5256,8 @@ class MatlabEngine:
         help NAME     shows the help of NAME, e.g. help round.
         help ops      describes the operators and special characters;
                       help .* or help + show the same.
+        help for      describes a control-flow keyword: for, while, if,
+                      elseif, else, break, continue or end.
 
         As in MATLAB, the help of each command and function is the comment
         block at the start of its code: the docstring of the Python function
@@ -4770,6 +5269,8 @@ class MatlabEngine:
 
     def _help_topic(self, topic):
         for key in (topic, topic.lower()):  # help ROUND works too
+            if key in KEYWORD_HELP:
+                return KEYWORD_HELP[key]
             if key in COMMANDS:
                 return help_text(COMMANDS[key][0])
             if key in FUNCTIONS:
@@ -5910,7 +6411,8 @@ def app_help_text(mac):
     key = "Cmd" if mac else "Ctrl"
     keys = (("Enter", "run the command"), ("Up, Down", "earlier commands"), ("Home", "start of the command"),
             (f"{key} +, {key} -", f"larger or smaller font ({key} 0: the default size)"),
-            (f"{key} O, {key} S", "open a script, save the session"))
+            (f"{key} O, {key} S", "open a script, save the session"),
+            ("Ctrl C", "stop a running loop; drop an unfinished for / if block"))
     keyboard = '\n'.join(f"    {keys_:<18}  {meaning}" for keys_, meaning in keys)
     return f"""## {APP_NAME} {APP_VERSION}
 {APP_NAME} is a calculator that works like the Command Window of MATLAB. Type a command
@@ -5936,6 +6438,10 @@ The help command describes everything {APP_NAME} can do, the same way as in MATL
 - Variables: x = 5 stores a value, and a result that is not stored goes to ans. A
   semicolon at the end of a command hides its output; commas or semicolons separate
   several commands on one line.
+- Loops and conditions: for k = 1:10 ... end repeats commands, while repeats them as
+  long as a condition holds, and if ... elseif ... else ... end runs them only when a
+  condition is true; break and continue control loops. Type the lines one after the
+  other (the window waits for the end) or on one line separated by commas.
 - Indexing: A(2,3), A(end, :) and v(2:end) take elements, rows and columns; A(2,3) = 5
   changes an element, A(A > 2) selects the elements that meet a condition, and find
   gives their positions.
@@ -5953,11 +6459,15 @@ The help command describes everything {APP_NAME} can do, the same way as in MATL
   opens another one. hold on adds to a plot; xlabel, ylabel, title, legend, grid and
   axis complete it, and set and get change details, e.g. set(gca, 'FontSize', 12).
   The toolbar of a figure window zooms, pans and saves the plot as an image.
+- Scripts: a script is a text file (.m) with one command per line. Typing its name runs
+  a script of the current folder, e.g. demo for demo.m, and run ../demo or
+  run('My Script') runs one from any folder. Only the results are shown, and an error
+  stops the script and names its line.
 
 ## Menus
 - File > Open runs the commands of a script (.m file) one line at a time, as if they
-  were typed, and shows their results. While it runs, the current folder is the
-  folder of the script, so it finds its data files.
+  were typed (a for, while or if block at once), and shows their results. While it
+  runs, the current folder is the folder of the script, so it finds its data files.
 - File > Save writes the commands of this session to a .m file, one per line, so that
   File > Open can run them again later.
 - {settings} sets the font of the Command Window, the number format at the start and
@@ -6257,6 +6767,9 @@ class MatlabConsoleApp:
         self.history_idx = 0
         self.windows = {}      # the open About, Help and Settings windows
         self.closed = False    # set when 'exit' (or File > Quit) has closed the window
+        self.pending = []      # lines typed so far of a for / while / if block that has no end yet
+        self.running = False   # a command is running (a long loop keeps the window responsive)
+        self.interrupted = False  # Ctrl+C was pressed while a command was running
         self.script_file = None   # the .m file opened or saved last: the file dialogs start in its folder
         self.session_file = None  # the file File > Save wrote last: offered again as the file name
         self._looking_for_update = False
@@ -6281,6 +6794,9 @@ class MatlabConsoleApp:
         self.output_area.bind("<Home>", self.on_home)
         self.output_area.bind("<Key>", self.on_key)
         self.output_area.bind("<<Paste>>", self.on_paste)
+        for widget in (self.output_area, self.root):
+            widget.bind("<Control-c>", self.on_interrupt)
+            widget.bind("<Control-C>", self.on_interrupt)
 
         self.mac_menus = root.tk.call('tk', 'windowingsystem') == 'aqua'
         self.build_menus()
@@ -6329,6 +6845,8 @@ class MatlabConsoleApp:
         # Allow copy/select-all shortcuts anywhere in the buffer (Ctrl on Windows/Linux, Cmd on macOS)
         if (event.state & 0x4 or event.state & 0x8) and event.keysym.lower() in ('c', 'a'):
             return
+        if self.running:  # no typing while a command runs (its output goes to the end of the text)
+            return "break"
         if event.keysym in (
             'Shift_L', 'Shift_R', 'Control_L', 'Control_R',
             'Alt_L', 'Alt_R', 'Meta_L', 'Meta_R', 'Super_L', 'Super_R',
@@ -6341,6 +6859,24 @@ class MatlabConsoleApp:
         if self.output_area.compare(tk.INSERT, "<", "input_start"):
             self.output_area.mark_set(tk.INSERT, tk.END)
 
+
+    def on_interrupt(self, event=None):
+        """Ctrl+C: stop the running command, as in MATLAB, or drop the lines typed so far of a
+        for / while / if block. With text selected (and nothing running) it copies, as before."""
+        if self.running:
+            self.interrupted = True
+            return "break"
+        if self.output_area.tag_ranges(tk.SEL) or not self.pending:
+            return None
+        self._cancel_pending()
+        return "break"
+
+    def _cancel_pending(self):
+        """Forget the unfinished block typed so far and show a new prompt."""
+        self.pending = []
+        self.output_area.mark_set(tk.INSERT, tk.END)
+        self.output_area.insert(tk.END, "\n")
+        self.show_prompt()
 
     # ---- menus -----------------------------------------------------------------
     def build_menus(self):
@@ -6479,6 +7015,8 @@ class MatlabConsoleApp:
         afterwards it is changed back, unless the script itself changed it with cd.
         Returns False if the script closed the program with exit.
         """
+        if self.running:
+            return True
         if path is None:
             path = filedialog.askopenfilename(
                 parent=self.root, title="Open Script", initialdir=self._script_folder(),
@@ -6494,23 +7032,11 @@ class MatlabConsoleApp:
             return True
         self.script_file = path
         typed = self.output_area.get("input_start", "end-1c")
-        before, folder = os.getcwd(), os.path.dirname(path)
-        try:
-            os.chdir(folder)
-        except OSError:
-            folder = None
-        try:
+        with working_folder(os.path.dirname(path)):
             for _, command in script_commands(text):
                 if not self.run_typed(command):
                     return False  # 'exit' in the script closed the window
                 self.output_area.update_idletasks()
-        finally:
-            # realpath: on macOS os.getcwd() gives /private/var/... for a script in /var/...
-            if folder is not None and os.path.realpath(os.getcwd()) == os.path.realpath(folder):
-                try:
-                    os.chdir(before)
-                except OSError:
-                    pass
         self._replace_current_input(typed)
         return True
 
@@ -6595,12 +7121,16 @@ class MatlabConsoleApp:
         self.output_area.see(tk.END)
 
     def history_up(self, event):
+        if self.running:
+            return "break"
         if self.history and self.history_idx > 0:
             self.history_idx -= 1
             self._replace_current_input(self.history[self.history_idx])
         return "break"
 
     def history_down(self, event):
+        if self.running:
+            return "break"
         if self.history_idx < len(self.history) - 1:
             self.history_idx += 1
             self._replace_current_input(self.history[self.history_idx])
@@ -6615,16 +7145,32 @@ class MatlabConsoleApp:
         self._submit()
         return "break"
 
-    def _submit(self):
-        """Run the text after the prompt. Returns False if it closed the application."""
+    def _submit(self, complete=False):
+        """Run the text after the prompt. Returns False if it closed the application.
+
+        A line that opens a for, while or if block without closing it is not run yet: as in
+        MATLAB, the next lines (typed without a prompt) are added to it until its end.
+        complete: run the text even then (a script), so that the missing end is reported.
+        """
+        if self.running:
+            return True
         raw_cmd = self.output_area.get("input_start", "end-1c").strip()
+        if not self.pending:
+            self.output_area.mark_set("block_start", f"input_start - {len(PROMPT)} chars")
         self.output_area.mark_set(tk.INSERT, tk.END)
         self.output_area.insert(tk.END, "\n")
 
-        if raw_cmd:
-            self.history.append(raw_cmd)
+        if self.pending or raw_cmd:
+            command = '\n'.join(self.pending + [raw_cmd])
+            if not complete and block_is_open(command):
+                self.pending.append(raw_cmd)
+                self.output_area.mark_set("input_start", "end-1c")  # the next line, without a prompt
+                self.output_area.see(tk.END)
+                return True
+            self.pending = []
+            self.history.append(command)
             self.history_idx = len(self.history)
-            if not self._execute_command(raw_cmd):
+            if not self._execute_command(command):
                 return False  # the window has been closed by 'exit'
         self.show_prompt()
         return True
@@ -6634,17 +7180,47 @@ class MatlabConsoleApp:
 
         keep_input: put back what had been typed at the prompt before.
         """
+        if self.running:
+            return True
+        if self.pending:
+            self._cancel_pending()
         typed = self.output_area.get("input_start", "end-1c")
         self._replace_current_input(command)
-        if not self._submit():
+        if not self._submit(complete=True):
             return False
         if keep_input:
             self._replace_current_input(typed)
         return True
 
     def _execute_command(self, raw_cmd):
-        """Show the command's output. Returns False if it closed the application."""
-        for chunk in self.engine.execute(raw_cmd):
+        """Run a command and show its output. Returns False if it closed the application.
+
+        While a loop runs, the engine calls _keep_responsive() now and then: the output so far
+        is shown, the windows are redrawn and Ctrl+C can stop it.
+        """
+        self.running, self.interrupted = True, False
+        self.engine.interrupt_check = self._keep_responsive
+        try:
+            chunks = self.engine.execute(raw_cmd)
+        finally:
+            self.running = False
+            self.engine.interrupt_check = None
+        if self.closed:  # the window was closed while the command ran
+            return False
+        return self._show_output(chunks)
+
+    def _keep_responsive(self):
+        """Called by the engine during long loops. Returns True if the loop should stop."""
+        try:
+            self._show_output(self.engine.take_output())
+            self.root.update()
+        except tk.TclError:  # the window has been closed
+            self.closed = True
+        return self.interrupted or self.closed
+
+    def _show_output(self, chunks):
+        """Show output chunks of the engine. Returns False if one of them closed the application."""
+        for chunk in chunks:
             if chunk is EXIT_APP:
                 self.closed = True
                 self.root.destroy()  # ends mainloop(), so the program exits
@@ -6844,9 +7420,13 @@ class MatlabConsoleApp:
         os.execv(sys.executable, [sys.executable, script])
 
     def print_message(self, text):
-        """Show text above the prompt, as if a command had printed it; typed input is kept."""
+        """Show text above the prompt, as if a command had printed it; typed input is kept
+        (the lines of an unfinished for / while / if block too)."""
         typed = self.output_area.get("input_start", "end-1c")
-        self.output_area.delete_raw(f"input_start - {len(PROMPT)} chars", "end")  # the prompt line
+        start = "block_start" if self.pending else f"input_start - {len(PROMPT)} chars"
+        if self.pending:
+            typed, self.pending = '\n'.join(self.pending + [typed]), []
+        self.output_area.delete_raw(start, "end")  # the prompt line(s)
         if self.output_area.get("end-2c", "end-1c") not in ("\n", ""):  # after fprintf output without \n
             self.output_area.insert(tk.END, "\n")
         self.write_output(_indent(text))

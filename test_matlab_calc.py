@@ -729,8 +729,8 @@ class TestTextOutputAndFiles(EngineCase):
         self.assertError('cd nowhere', 'Unable to change current folder')
 
 
-class TestFilesAndFolders(EngineCase):
-    """ls, mkdir, rmdir, isfile, isfolder, copyfile, movefile and delete, in a temporary folder."""
+class FolderCase(EngineCase):
+    """Engine tests that work in a temporary folder."""
 
     def setUp(self):
         super().setUp()
@@ -751,6 +751,10 @@ class TestFilesAndFolders(EngineCase):
 
     def here(self, name=''):
         return os.path.join(self.tmp, name)
+
+
+class TestFilesAndFolders(FolderCase):
+    """ls, mkdir, rmdir, isfile, isfolder, copyfile, movefile and delete, in a temporary folder."""
 
     def test_mkdir_and_isfolder(self):
         self.assertEqual(self.out('mkdir results'), '')
@@ -925,6 +929,125 @@ HAVE_MATPLOTLIB = importlib.util.find_spec('matplotlib') is not None
 
 
 @unittest.skipUnless(HAVE_MATPLOTLIB, 'matplotlib is not installed')
+class TestRunningScripts(FolderCase):
+    """run name and typing the name of a script, in a temporary folder."""
+
+    def script(self, name, text):
+        os.makedirs(os.path.dirname(self.here(name)), exist_ok=True)
+        with open(self.here(name), 'w', encoding='utf-8') as f:
+            f.write(text)
+
+    def test_typing_the_name(self):
+        self.script('demo.m', "% Demo\na = 2;\nb = a ^ 2\nfor k = 1:2\n  disp(k)\nend\nM = [1 2\n     3 4];\n")
+        self.assertEqual(self.out('demo'), 'b =\n    4\n    1\n    2\n')  # results only, not the commands
+        self.assertIsNone(self.eng.last_error)
+        self.assertEqual(self.eng.variables['M'].tolist(), [[1, 2], [3, 4]])     # in the workspace
+        self.assertEqual(self.out('x = 10; demo; y = x + b'), 'b =\n    4\n    1\n    2\ny =\n    14\n')
+        self.assertEqual(self.out('for k = 1:2, demo, end').count('b =\n'), 2)
+        self.assertError('Demo', "Unrecognized function or variable 'Demo'")     # the case must match
+        self.assertError('q = demo', 'Attempt to execute SCRIPT demo as a function')
+        self.assertError('demo(1)', 'Attempt to execute SCRIPT demo as a function')
+
+    def test_names_that_come_first(self):
+        self.script('demo.m', "disp('script')\n")
+        self.script('sin.m', "disp('my sin')\n")
+        self.script('pwd.m', "disp('my pwd')\n")
+        self.out('demo = 5;')
+        self.assertEqual(self.out('demo'), 'demo =\n    5\n')               # a variable
+        self.assertEqual(self.out('run demo'), 'script\n')
+        self.out('clear demo')
+        self.assertEqual(self.out('demo'), 'script\n')
+        self.assertError('sin', 'Not enough input arguments')                    # a built-in function
+        self.assertEqual(self.out('run sin'), 'my sin\n')
+        self.assertIn(self.tmp, self.out('pwd'))                                 # a command
+        self.assertEqual(self.out('run pwd.m'), 'my pwd\n')
+
+    def test_run(self):
+        self.script('demo.m', 'a = 1\n')
+        self.script('My Script.m', 'b = 2;\n')
+        self.script('notes.txt', 'c = 3;\n')
+        for line in ('run demo', 'run demo.m', "run('demo')", 'run("demo.m")', 'run ./demo', f"run('{self.here('demo')}')"):
+            self.assertEqual(self.out(line), 'a =\n    1\n', line)
+            self.assertIsNone(self.eng.last_error, line)
+        self.assertEqual(self.out('run demo;'), 'a =\n    1\n')              # ; hides nothing of the script
+        self.out("run 'My Script', run notes.txt")
+        self.assertEqual((self.eng.variables['b'].item(), self.eng.variables['c'].item()), (2, 3))
+        self.assertError('run missing', "The script 'missing' was not found.")
+        self.assertError('run notes', "The script 'notes' was not found.")
+        self.out('mkdir sub')
+        self.assertError('run sub', 'it is a folder')
+        self.assertError('run', 'Not enough input arguments')
+        self.assertError('run(1)', 'The script name must be text')
+        self.assertError("x = run('demo')", 'Too many output arguments')
+        self.assertIn('run - Run a script.', self.out('help run'))
+
+    def test_run_changes_the_folder(self):
+        self.make('sub/data.txt')
+        self.script('sub/there.m', "ok = isfile('data.txt');\n")
+        self.script('sub/away.m', 'cd ..\ncd ..\n')
+        self.out('run sub/there')
+        self.assertEqual(self.eng.variables['ok'].item(), 1)                     # found next to the script
+        self.assertEqual(os.path.realpath(os.getcwd()), self.tmp)                # and back again
+        self.out('cd sub, there')                                                # typed: the folder stays
+        self.assertEqual(os.path.realpath(os.getcwd()), self.here('sub'))
+        self.out('run away')
+        self.assertEqual(os.path.realpath(os.getcwd()), os.path.dirname(self.tmp))  # the script's cd is kept
+
+    def test_errors_name_the_line(self):
+        self.script('bad.m', '% a comment\nx = 1;\n\ny = nope + 1\nz = 3\n')
+        self.script('outer.m', 'before = 1;\nbad\nafter = 1;\n')
+        self.script('singular.m', 'w = [1 2 3] * [4 5 6]\n')
+        self.assertEqual(self.out('bad'), "Unrecognized function or variable 'nope'.\n\nError in bad (line 4)\n")
+        self.assertNotIn('z', self.eng.variables)                                # the script stopped
+        self.assertEqual(self.out('outer, later = 1'),
+                         "Unrecognized function or variable 'nope'.\n\nError in bad (line 4)\n\n"
+                         "Error in outer (line 2)\n")
+        self.assertEqual(sorted(set(self.eng.variables) & {'before', 'after', 'later'}), ['before'])
+        self.assertError('singular', 'Error in singular (line 1)')
+        self.script('block.m', 'for k = 1:3\n  disp(k)\n')
+        self.assertError('block', 'At least one END is missing')
+
+    def test_nested_scripts(self):
+        self.script('one.m', 'a = 1;\ntwo\nc = a + b;\n')
+        self.script('two.m', 'b = 2;\n')
+        self.script('self.m', 'n = n + 1;\nself\n')
+        self.out('one')
+        self.assertEqual(self.eng.variables['c'].item(), 3)
+        text = self.out('n = 0; self')
+        self.assertIn(f'nested more than {mc.MAX_SCRIPT_DEPTH} deep', text)
+        self.assertNotIn('Error in self', text)
+        self.assertEqual(self.eng.variables['n'].item(), mc.MAX_SCRIPT_DEPTH)
+        self.out('one')                                                          # scripts run again afterwards
+        self.assertIsNone(self.eng.last_error)
+
+    def test_function_file(self):
+        self.script('f.m', '% Doubles x\nfunction y = f(x)\ny = 2 * x;\n')
+        self.assertError('f', 'f.m is a function file')
+        self.script('functions.m', 'functions = 1;\n')                         # not the keyword
+        self.out('run functions')
+        self.assertIsNone(self.eng.last_error)
+
+    def test_exit_in_a_script(self):
+        self.script('bye.m', 'a = 1;\nexit\na = 2;\n')
+        self.script('outer.m', 'bye\na = 3;\n')
+        for line in ('bye, a = 4', 'run bye.m, a = 4', 'outer, a = 4', 'for k = 1:3, bye, end, a = 4'):
+            chunks = self.eng.execute(line)
+            self.assertIs(chunks[-1], mc.EXIT_APP, line)
+            self.assertEqual(chunks.count(mc.EXIT_APP), 1, line)
+            self.assertEqual(self.eng.variables['a'].item(), 1, line)
+
+    def test_ctrl_c_stops_a_script(self):
+        self.script('long.m', ''.join(f'a = {k};\n' for k in range(1, 6)))
+        calls = []
+        self.eng.interrupt_check = lambda: calls.append(1) or len(calls) >= 3
+        original, mc.INTERRUPT_CHECK_SECONDS = mc.INTERRUPT_CHECK_SECONDS, 0
+        try:
+            self.assertEqual(self.out('long'), 'Operation terminated by user.\n')
+        finally:
+            mc.INTERRUPT_CHECK_SECONDS = original
+        self.assertEqual(self.eng.variables['a'].item(), 2)
+
+
 class GraphicsCase(EngineCase):
     def setUp(self):
         super().setUp()
@@ -1253,6 +1376,130 @@ class TestFigureWindows(unittest.TestCase):
         self.assertTrue(self.app.closed)
 
 
+class TestControlFlow(EngineCase):
+    def test_for_loops(self):
+        self.assertValue('s = 0; for k = 1:100, s = s + k; end', 5050, var='s')
+        self.assertEqual(self.ans('k;', var='k').tolist(), [[100]])           # keeps the last value
+        self.assertEqual(self.out('for k = 1:3, disp(k), end'), '    1\n    2\n    3\n')
+        self.assertEqual(self.out('for k = 1:2 disp(k*10); end'), '    10\n    20\n')   # no comma
+        self.assertEqual(self.out('for (k = 3:-1:2) disp(k), end'), '    3\n    2\n')
+        self.assertEqual(self.out('for x = [2 4], x, end'), 'x =\n    2\nx =\n    4\n')
+        cols = self.out('for c = [1 2; 3 4], c, end')                         # columns of a matrix
+        self.assertEqual(cols, 'c =\n    1\n    3\nc =\n    2\n    4\n')
+        self.assertEqual(self.out("for ch = 'ab', fprintf('%s.', ch); end"), 'a.b.')
+        self.assertEqual(self.out("for k = [], disp('never'), end"), '')
+        self.assertEqual(self.ans('k;', var='k').shape, (0, 0))
+        self.assertValue('A = [5 6]; for c = A, c(1) = 0; end', [5, 6], var='A')  # the loop works on a copy
+
+    def test_nested_loops_and_multiline(self):
+        text = 'M = zeros(2, 3);\nfor i = 1:2\n    for j = 1:3\n        M(i, j) = 10*i + j;\n    end\nend'
+        self.assertValue(text, [[11, 12, 13], [21, 22, 23]], var='M')
+
+    def test_if_elseif_else(self):
+        block = ("if x > 3\n  r = 'big';\nelseif x > 1\n  r = 'mid';\nelse\n  r = 'small';\nend")
+        for x, expected in ((5, 'big'), (2, 'mid'), (0, 'small')):
+            self.out(f'x = {x};\n' + block)
+            self.assertEqual(text_of(self.eng.variables['r']), expected)
+        self.assertEqual(self.out("x = 2; if x > 3, disp('a'), elseif x > 1, disp('b'), else disp('c'), end"), 'b\n')
+        self.assertEqual(self.out("if 0 disp('a'), else disp('b'), end"), 'b\n')
+        self.assertEqual(self.out("if 1, end"), '')
+
+    def test_conditions(self):
+        def taken(condition):
+            return self.out(f"if {condition}, disp('yes'), else, disp('no'), end") == 'yes\n'
+        self.assertTrue(taken('[1 2 3]'))
+        self.assertFalse(taken('[1 0 3]'))           # all elements must be nonzero
+        self.assertFalse(taken('[]'))                # empty is false
+        self.assertTrue(taken("'abc'"))
+        self.assertTrue(taken('3 > 2 && 1'))
+        self.assertFalse(taken('true & false'))
+        self.assertTrue(taken('1 + 2i'))
+        self.assertFalse(taken('0 + 2i'))            # the real part counts
+        self.assertError('if NaN, end', "NaN's cannot be converted to logicals")
+
+    def test_while_break_continue(self):
+        self.assertValue('n = 1; while n < 1000, n = 2 * n; end', 1024, var='n')
+        text = self.out("n = 0; while n < 10, n = n + 1; if n == 2, continue, end, "
+                        "if n == 4, break, end, disp(n), end")
+        self.assertEqual(text, '    1\n    3\n')
+        self.assertEqual(self.ans('n;', var='n').tolist(), [[4]])
+        text = self.out("for i = 1:3, for j = 1:3, if j > i, break, end, fprintf('%d%d ', i, j); end, end")
+        self.assertEqual(text, '11 21 22 31 32 33 ')                       # break leaves the inner loop
+        self.assertValue('c = 0; for k = 1:10, if mod(k, 2), continue, end, c = c + k; end', 30, var='c')
+        self.assertValue('while true, break, end, 7', 7)
+
+    def test_output_inside_loops(self):
+        self.assertEqual(self.out('for k = 1:2; y = k, end'), 'y =\n    1\ny =\n    2\n')
+        self.assertEqual(self.out('for k = 1:2, y = k; end'), '')
+
+    def test_errors(self):
+        self.assertError('for k = 1:3', 'At least one END is missing')
+        self.assertError('if 1, while 1', 'At least one END is missing')
+        self.assertError('end', 'Illegal use of reserved keyword "end"')
+        self.assertError('else', 'Illegal use of reserved keyword "else"')
+        self.assertError('if 1, else, else, end', 'Illegal use of reserved keyword "else"')
+        self.assertError('break', "'break' can only be used inside a for or while loop")
+        self.assertError('if 1, continue, end', "'continue' can only be used inside")
+        self.assertError('if x = 1, end', "Incorrect use of '=' operator")
+        self.assertError('for 3, end', 'Invalid for statement')
+        self.assertError('if, end', "needs a condition")
+        self.assertError('for = 3', 'Illegal use of reserved keyword "for"')
+        self.assertValue('format = 2', 2, var='format')          # other names are still variables
+        self.assertValue('endpoint = 4', 4, var='endpoint')
+
+    def test_error_stops_everything(self):
+        text = self.out('a = 1, for k = 1:3, b = k, foo, end, c = 2')
+        self.assertIn('a =', text)
+        self.assertIn('b =\n    1\n', text)
+        self.assertNotIn('b =\n    2', text)
+        self.assertNotIn('c', self.eng.variables)
+        self.assertIn("Unrecognized function or variable 'foo'", text)
+        self.assertIs(self.eng.execute('for k = 1:3, exit, end')[-1], mc.EXIT_APP)
+
+    def test_interrupt(self):
+        calls = []
+        self.eng.interrupt_check = lambda: (calls.append(1), len(calls) > 1)[1]
+        start = time.monotonic()
+        self.assertError('while true, end', 'Operation terminated by user')
+        self.assertLess(time.monotonic() - start, 5)
+        self.eng.interrupt_check = None
+
+    def test_take_output(self):
+        seen = []
+
+        def check():
+            seen.extend(self.eng.take_output())
+            return False
+        self.eng.interrupt_check = check
+        mc.INTERRUPT_CHECK_SECONDS, saved = 0, mc.INTERRUPT_CHECK_SECONDS
+        try:
+            rest = self.out('for k = 1:3, disp(k), end')
+        finally:
+            mc.INTERRUPT_CHECK_SECONDS = saved
+            self.eng.interrupt_check = None
+        self.assertEqual(''.join(seen) + rest, '    1\n    2\n    3\n')
+        self.assertEqual(''.join(seen), '    1\n    2\n')   # shown while the loop ran
+
+    def test_block_is_open(self):
+        self.assertTrue(mc.block_is_open('for k = 1:3'))
+        self.assertTrue(mc.block_is_open('if x\n  for k = 1:3\n  end'))
+        self.assertTrue(mc.block_is_open('while 1, if 0, end'))
+        self.assertFalse(mc.block_is_open('for k = 1:3, end'))
+        self.assertFalse(mc.block_is_open('x = 1'))
+        self.assertFalse(mc.block_is_open('end'))              # an error: run it, so it is shown
+        self.assertFalse(mc.block_is_open("disp('for k = 1:3')"))
+        self.assertFalse(mc.block_is_open('v(end)'))
+
+    def test_help(self):
+        for word in ('for', 'while', 'if', 'elseif', 'else', 'break', 'continue', 'end'):
+            text = self.out(f'help {word}')
+            self.assertRegex(text, r'^  \S+ - [A-Z].*\.\n', word)
+            for line in text.splitlines():
+                self.assertLessEqual(len(line), 76, f'help {word}: {line!r}')
+        self.assertEqual(self.out('help elseif'), self.out('help if'))
+        self.assertIn('Control flow', self.out('help'))
+
+
 class TestDisplay(EngineCase):
     def test_readme_examples(self):
         self.out('A = [1 3 2.4 6 4.4 3.2 1];')
@@ -1453,6 +1700,53 @@ class TestGui(unittest.TestCase):
         self.app.history_down(None)
         self.assertEqual(self.text.get('input_start', 'end-1c'), '')
         self.assertEqual(self.type_and_run('clc'), mc.PROMPT)
+
+    def test_block_typed_line_by_line(self):
+        self.type_and_run('clc')
+        content = self.type_and_run('for k = 1:2')
+        self.assertTrue(content.endswith('>> for k = 1:2\n'), content)    # no prompt: waits for more
+        self.assertEqual(self.app.pending, ['for k = 1:2'])
+        self.type_and_run('  fprintf(\'k=%d\\n\', k)')
+        content = self.type_and_run('end')
+        self.assertTrue(content.endswith(">> for k = 1:2\n  fprintf('k=%d\\n', k)\nend\nk=1\nk=2\n" + mc.PROMPT),
+                        content)
+        self.assertEqual(self.app.pending, [])
+        self.assertEqual(self.app.history[-1], "for k = 1:2\nfprintf('k=%d\\n', k)\nend")
+        self.app.history_up(None)                                          # the whole block comes back
+        self.assertEqual(self.text.get('input_start', 'end-1c'), self.app.history[-1])
+        self.app.process_command()
+        self.assertTrue(self.text.get('1.0', 'end-1c').endswith('k=1\nk=2\n' + mc.PROMPT))
+
+    def test_ctrl_c_drops_an_unfinished_block(self):
+        self.type_and_run('if 1')
+        self.assertEqual(self.app.pending, ['if 1'])
+        self.assertEqual(self.app.on_interrupt(), 'break')
+        self.assertEqual(self.app.pending, [])
+        self.assertTrue(self.text.get('1.0', 'end-1c').endswith('if 1\n\n' + mc.PROMPT))
+        self.assertIsNone(self.app.on_interrupt())       # nothing to stop: Ctrl+C copies as usual
+        self.assertTrue(self.text.bind('<Control-c>'))
+
+    def test_message_while_a_block_is_typed(self):
+        self.type_and_run('clc')
+        self.type_and_run('for k = 1:2')
+        self.text.insert('input_start', 'disp(k)')
+        self.app.print_message('Hello')
+        self.assertEqual(self.app.pending, [])
+        self.assertEqual(self.text.get('input_start', 'end-1c'), 'for k = 1:2\ndisp(k)')  # kept as input
+        self.assertIn('  Hello\n', self.text.get('1.0', 'input_start'))
+        self.text.insert('end-1c', '\nend')
+        self.app.process_command()
+        self.assertTrue(self.text.get('1.0', 'end-1c').endswith('    1\n    2\n' + mc.PROMPT))
+
+    def test_ctrl_c_stops_a_running_loop(self):
+        self.type_and_run('clc')
+        self.root.after(300, self.app.on_interrupt)        # pressed while the loop runs
+        start = time.monotonic()
+        content = self.type_and_run('n = 0; while true, n = n + 1; end')
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertTrue(content.endswith('Operation terminated by user.\n\n' + mc.PROMPT), content)
+        self.assertGreater(self.app.engine.variables['n'][0, 0], 0)
+        self.assertFalse(self.app.running)
 
     def test_keypad_enter_is_bound(self):
         self.assertTrue(self.text.bind('<KP_Enter>'))
@@ -1687,6 +1981,24 @@ class TestScripts(unittest.TestCase):
             self.assertIsNone(eng.last_error, command)
         self.assertEqual(eng.variables['B'].tolist(), [[1, 2], [3, 4]])
         self.assertEqual(eng.variables['c'].tolist(), [[1, 2, 3]])
+
+    def test_script_with_blocks(self):
+        text = ("total = 0;\n"
+                "for k = 1:4   % loop\n"
+                "    if mod(k, 2) == 0\n"
+                "        total = total + k;\n"
+                "    end\n"
+                "end\n"
+                "disp(total)\n"
+                "while total > 0\n"
+                "    total = total - 1;\n")
+        commands = mc.script_commands(text)
+        self.assertEqual([n for n, _ in commands], [1, 2, 7, 8])
+        eng = mc.MatlabEngine()
+        for _, command in commands[:3]:
+            self.assertEqual(eng.execute(command)[-1:], [] if command != 'disp(total)' else ['    6\n'])
+        eng.execute(commands[3][1])
+        self.assertIn('END is missing', eng.last_error)
 
     def test_session_script(self):
         text = mc.session_script(['a = 1', 'B = [1 2\n3 4]', 'disp(a)  '])
@@ -1932,6 +2244,18 @@ class TestMenusAndWindows(InstallationCase):
         self.assertEqual(self.app.engine.variables['B'].tolist(), [[1, 2], [3, 4]])
         self.assertEqual(self.app.history[0], 'a = 2 + 3')
         self.assertEqual(len(self.app.history), 6)
+
+    def test_run_script_by_name(self):
+        self.write_script('demo.m', "a = 5\nfprintf('done\\n')\n")
+        self.write_script('bye.m', 'exit\n')
+        self.app.run_typed(f"cd '{self.folder}'")
+        self.app.run_typed('demo')
+        self.assertTrue(self.console().endswith('>> demo\na =\n    5\n\ndone\n' + mc.PROMPT), self.console())
+        self.app.run_typed('run demo.m;')
+        self.assertTrue(self.console().endswith('>> run demo.m;\na =\n    5\n\ndone\n' + mc.PROMPT), self.console())
+        self.assertEqual(self.app.history[-2:], ['demo', 'run demo.m;'])        # the commands, not the script's
+        self.assertFalse(self.app.run_typed('bye'))
+        self.assertTrue(self.app.closed)
 
     def test_script_that_changes_folder(self):
         path = self.write_script('go.m', 'cd ..\n')

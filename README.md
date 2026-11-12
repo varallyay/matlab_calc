@@ -1,6 +1,6 @@
 # Matlab_Calc — MATLAB Command Window Emulator (`matlab_calc.py`)
 
-**Version 0.10.1** — see [Version History](#version-history).
+**Version 0.12.0** — see [Version History](#version-history).
 
 A lightweight, interactive desktop calculator built with Python, Tkinter, and NumPy that emulates the look, feel, and matrix-first syntax of the **MATLAB Command Window**.
 
@@ -16,6 +16,7 @@ A lightweight, interactive desktop calculator built with Python, Tkinter, and Nu
   - Matrix operations: `*`, `/`, `\`, `^`, `'` (conjugate transpose), `.'` (transpose).
   - Element-wise operations: `.*`, `./`, `.\`, `.^`.
   - Raises MATLAB-style errors when operands have incompatible dimensions.
+- **Loops and Conditions**: `for`, `while`, `if` / `elseif` / `else`, `break` and `continue`, typed line by line (the window waits for the `end`, as MATLAB does), on one line (`for k = 1:3, disp(k), end`) or in a script. **Ctrl+C** stops a loop that runs too long.
 - **Several Outputs**: functions such as `max`, `min`, `size`, `find`, `fopen` and `fscanf` return more than one result: `[m, i] = max(A)`, `[rows, cols] = size(A)`; `~` skips an output (`[~, i] = min(v)`).
 - **Text and Files**: text in quotes (`'Hello'`), `disp`, `fprintf`, `sprintf` and `num2str` for formatted output, and `fopen` / `fprintf` / `fscanf` / `fclose` with file identifiers to write and read text files.
 - **Files and Folders**: `ls`, `mkdir`, `rmdir`, `isfile`, `isfolder`, `copyfile`, `movefile` and `delete`, with `*` wildcards and MATLAB's command syntax (`mkdir results`, `delete *.txt`).
@@ -29,6 +30,7 @@ A lightweight, interactive desktop calculator built with Python, Tkinter, and Nu
 - **Installable**: on macOS and Linux it installs itself as a normal application (asked at the first start), so it starts from Launchpad or the application menu.
 - **Automatic Updates**: once a week the installed program looks for a new version on [GitHub](https://github.com/varallyay/matlab_calc) and, if you agree, downloads and installs it.
 - **Built-in Help**: `help` lists every command, operator and function; `help <name>` shows the full help of one of them, as in MATLAB. *Help > Matlab_Calc Help* describes the program.
+- **Scripts**: typing the name of a script (`demo` for `demo.m` in the current folder) or `run demo`, `run ../other/demo.m` runs its commands in the workspace, as in MATLAB; an error stops it and names the line
 - **Menus**: *File > Open* runs a script (`.m` file) line by line, *File > Save* saves the commands of the session as a script, *Settings* chooses the font, the number format and the update checks, and *About* shows the version and the credits.
 
 ---
@@ -113,9 +115,35 @@ On macOS the *Matlab_Calc* menu (with About, Settings and Quit) and the *Window*
 ### Running and saving scripts
 **File > Open…** runs a MATLAB script (`.m` file) one line at a time, exactly as if the lines were typed after the prompt: each command and its result appear in the command window, and the commands are added to the command history (↑/↓).
 
-- Blank lines and comment lines (`% ...`) are skipped. A command continues on the next lines while a `[` is open (`A = [1 2` / `3 4]`) or after `...`.
+- Blank lines and comment lines (`% ...`) are skipped. A command continues on the next lines while a `[` is open (`A = [1 2` / `3 4]`), after `...`, and up to the `end` of a `for`, `while` or `if` block, which runs as one command.
 - An error is shown and the script goes on with the next line, as when typing.
 - While the script runs, the current folder is the folder of the script (as with MATLAB's `run`), so `fopen('data.txt')` finds the data files next to it. Afterwards the previous folder is restored, unless the script changed it with `cd`.
+
+#### Running a script from the command line
+A script also runs from the prompt, as in MATLAB:
+
+```matlab
+>> cd ~/Documents/calc
+>> demo                  % runs demo.m of the current folder
+>> run demo              % the same; run demo.m too
+>> run ../other/demo     % a script in another folder
+>> run('My Script')      % a name with spaces (or: run 'My Script')
+```
+
+- **Typing the name** runs the script `name.m` of the current folder (`pwd`, `cd`). A variable, a command or a built-in function of the same name comes first; `run name.m` runs such a script anyway. Upper and lower case must match.
+- **`run`** takes a name with or without `.m` and with or without a folder (`~` is your home folder); another file type must be written in full (`run notes.txt`). While the script runs, the current folder is the folder of the script, so it finds its data files; afterwards the previous folder is back, unless the script changed it with `cd`.
+- **Output**: unlike *File > Open*, the commands themselves are not shown and not added to the history, only their results appear — end a line with `;` to hide one. A `;` after `demo` or `run demo` hides nothing of the script.
+- **Workspace**: the script works with the variables of the command window and leaves its own there. Scripts can run other scripts (up to 32 deep), also inside `for`, `while` and `if` blocks.
+- **Errors** stop the script, and the message names the script and the line where the failing command starts:
+
+  ```matlab
+  >> demo
+  Unrecognized function or variable 'radius'.
+
+  Error in demo (line 4)
+  ```
+- **Ctrl+C** stops a running script; `exit` in a script closes the program.
+- Function files (`function y = f(x)`) are not supported: `x = demo` and `demo(1)` give `Attempt to execute SCRIPT demo as a function`.
 
 **File > Save…** writes every command of the session (typed or run from a script) to a `.m` file, one per line, below a comment line with the date. *File > Open* runs it again later and gives the same variables. The same file name is offered the next time.
 
@@ -355,7 +383,49 @@ k =
 - Without brackets only the first output is returned, as in MATLAB: `max(A)` gives just the maximum values.
 - Asking for more outputs than a function has gives MATLAB's error `Too many output arguments.`
 
-### 5. Text
+### 5. Loops and Conditions
+`for`, `while` and `if` blocks run a group of statements several times or only when a condition holds. Type them line by line as in MATLAB: after a line such as `for k = 1:3` the window shows no prompt and collects the next lines until the matching `end`, then runs the whole block. A block can also be written on one line, with commas or semicolons between its parts, and in scripts.
+
+```matlab
+>> for k = 1:3
+     fprintf('%d squared is %d\n', k, k^2);
+   end
+1 squared is 1
+2 squared is 4
+3 squared is 9
+
+>> x = -2;
+>> if x > 0
+     disp('positive')
+   elseif x < 0
+     disp('negative')
+   else
+     disp('zero')
+   end
+negative
+
+>> n = 1; while n < 1000, n = 2*n; end, n
+n =
+    1024
+```
+
+| Statement | What it does |
+| :--- | :--- |
+| `for name = values` … `end` | Runs the statements once for each **column** of `values`: for a row vector or range (`1:10`, `10:-2:0`, `[2 3 5]`), once per element; for a matrix, once per column. After the loop the variable keeps its last value; for empty `values` the statements do not run |
+| `while condition` … `end` | Runs the statements again and again as long as the condition is true |
+| `if condition` … `elseif condition` … `else` … `end` | Runs the statements after the first true condition, or those after `else` if none is true; `elseif` and `else` are optional |
+| `break` | Leaves the innermost `for` / `while` loop |
+| `continue` | Goes on with the next pass of the innermost loop |
+
+- **A condition is true** if it is not empty and **all** of its elements are nonzero (for complex numbers, their real parts), as in MATLAB: `if A > 0` holds only when every element of `A` is positive, and `if []` is false. Combine conditions with `&&`, `||` and `~`. A `NaN` in a condition is an error.
+- **One-line forms**: `for k = 1:5, s = s + k; end`, `if x > 0, y = 1; else, y = -1; end`. As in MATLAB, the first statement may also follow the condition without a comma: `for k = 1:3 disp(k), end`, `else disp('no')`.
+- **Output** inside a block works as everywhere: a statement without `;` shows its result in every pass of a loop.
+- **Errors** stop the whole block (and the rest of the line). A missing `end` gives `At least one END is missing`; `end`, `else`, `break` and `continue` in the wrong place give MATLAB's `Illegal use of reserved keyword` and similar messages. The keywords cannot be used as variable names.
+- **Stopping a loop**: press **Ctrl+C** (on macOS too: the Control key) while a loop runs, e.g. after `while true, end`; it stops with `Operation terminated by user.` The output of a long loop appears while it runs. Before the `end` has been typed, **Ctrl+C** drops the unfinished block.
+- **History**: ↑ brings back the whole block, which can be edited and run again with Enter; *File > Save* saves it on several lines.
+- `help for`, `help while`, `help if`, `help break`, `help continue` and `help end` describe them.
+
+### 6. Text
 Text is written in single quotes; a doubled quote inside stands for one quote (`'it''s'`). Double quotes (`"text"`) are accepted too and give the same kind of text. Text is a row of characters (a `char` array), so it can be joined with brackets, indexed and measured like any vector:
 
 ```matlab
@@ -389,7 +459,7 @@ Formats use the conversions `%d`, `%i`, `%u`, `%f`, `%e`, `%g`, `%x`, `%o`, `%c`
 
 As in MATLAB, output without `\n` at the end leaves the next `>>` prompt on the same line.
 
-### 6. Writing and Reading Files
+### 7. Writing and Reading Files
 A file is opened with `fopen`, which returns a *file identifier*: a number (3, 4, …) that `fprintf`, `fscanf` and `fclose` use to name the file. Identifier `1` is the command window, so `fprintf(1, ...)` is the same as `fprintf(...)`.
 
 ```matlab
@@ -446,7 +516,7 @@ ans =
 
 `mkdir`, `rmdir`, `copyfile` and `movefile` stop with an error when they fail. Asking for their status gives `true` / `false` and the reason instead: `[status, msg] = copyfile('a.txt', 'b.txt')`.
 
-### 7. Plots
+### 8. Plots
 `plot` draws lines in a **figure window**, which opens beside the command window. As in MATLAB, the window has a light gray background, a white plot area with a box and inward tick marks, a bold title, and a toolbar at the top to zoom, pan, go back to the original view and save the plot as an image (PNG, PDF, SVG, …). The plots are drawn with matplotlib, and the line colors and color order are matplotlib's.
 
 ```
@@ -478,7 +548,7 @@ grid on
 - **Command syntax**: `hold on`, `grid on`, `axis equal tight`, `legend off`, `close all` are the same as `hold('on')`, … — as long as no variable has that name.
 - **Figures are drawn after every command line** (`drawnow` draws within a line). Without hold on, `plot` resets the axes, including the title and labels, so give those after `plot`. Clicking a figure window makes it the current figure; **Ctrl+W** / **⌘W** in it closes it.
 
-### 8. Built-in Constants & Functions
+### 9. Built-in Constants & Functions
 - **Constants**: `pi`, `e`, `Inf`, `NaN`, `i`, `j` (imaginary unit; literals such as `3 + 4i` also work)
 - **Trigonometric**: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`
 - **Hyperbolic**: `sinh`, `cosh`, `tanh` and their inverses `asinh`, `acosh`, `atanh` (`acosh` and `atanh` return `NaN` outside their domain, like `asin` and `acos`)
@@ -514,15 +584,15 @@ grid on
   - `linspace(a, b, n)` — `n` evenly spaced numbers from `a` to `b` (100 if `n` is not given): `linspace(0, 1, 5)` is `0 0.25 0.5 0.75 1`
   - `resize(A, sz)` — pad with zeros or cut to size `sz` (`resize([1 2 3], 5)` is `1 2 3 0 0`); options `'FillValue', v` and `'Side', 'trailing' | 'leading' | 'both'`
   - `reshape(A, r, c)` — the same elements arranged in `r` rows and `c` columns (one size may be `[]`)
-- **Text and Files**: `disp`, `fprintf`, `sprintf`, `num2str`, `fopen`, `fclose`, `fscanf` (see sections 5 and 6)
-- **Files and Folders**: `ls`, `mkdir`, `rmdir`, `isfile`, `isfolder`, `copyfile`, `movefile`, `delete` (see section 6)
-- **Graphics**: `plot`, `figure`, `hold`, `ishold`, `xlabel`, `ylabel`, `title`, `legend`, `grid`, `box`, `axis`, `xlim`, `ylim`, `gca`, `gcf`, `set`, `get`, `close`, `clf`, `cla`, `drawnow` (see section 7)
+- **Text and Files**: `disp`, `fprintf`, `sprintf`, `num2str`, `fopen`, `fclose`, `fscanf` (see sections 6 and 7)
+- **Files and Folders**: `ls`, `mkdir`, `rmdir`, `isfile`, `isfolder`, `copyfile`, `movefile`, `delete` (see section 7), `run` (see *Running and saving scripts*)
+- **Graphics**: `plot`, `figure`, `hold`, `ishold`, `xlabel`, `ylabel`, `title`, `legend`, `grid`, `box`, `axis`, `xlim`, `ylim`, `gca`, `gcf`, `set`, `get`, `close`, `clf`, `cla`, `drawnow` (see section 8)
 - **Logical Values & Searching**:
   - `find(X)`, `find(X, N)` — positions of the nonzero (true) elements, e.g. `find(A >= 2)`; `[row, col] = find(X)` or `[row, col, v] = find(X)` give rows, columns and values
   - `logical(X)` — convert numbers to logical values (nonzero becomes true)
   - `true`, `false` — the logical values 1 and 0; `true(n)`, `false(r, c)` make logical matrices
 
-### 9. Console & Workspace Commands
+### 10. Console & Workspace Commands
 | Command | Description |
 | :--- | :--- |
 | `format short` / `format` | Cap display precision at up to 4 decimal places (default) |
@@ -533,7 +603,9 @@ grid on
 | `clc` | Clear the command window screen |
 | `pwd` | Show the current folder, where `fopen` looks for files |
 | `cd <folder>` | Change the current folder (`cd ..`, `cd ~/Documents`); `cd` alone shows it |
-| `ls` | List the files and folders in the current folder (see section 6 for `mkdir`, `copyfile`, `delete`, …) |
+| `run <script>` | Run the commands of a script: `run demo`, `run ../demo.m`, `run('My Script')` (see *Running and saving scripts*) |
+| `<script>` | Typing the name of a script in the current folder runs it: `demo` for `demo.m` |
+| `ls` | List the files and folders in the current folder (see section 7 for `mkdir`, `copyfile`, `delete`, …) |
 | `help` | List all commands, operators and functions |
 | `help <name>` | Show the help of a command or function, e.g. `help round`; `help ops` (or `help .*`, `help +`, …) explains the operators |
 | `version` | Show the application name and version number |
@@ -546,7 +618,7 @@ grid on
 
 Typing a variable's name shows its value without changing `ans`.
 
-### 10. Getting Help
+### 11. Getting Help
 `help` on its own lists the console commands, the operators and every function grouped by topic, each with a one-line description. `help <name>` shows the full help text:
 
 ```matlab
@@ -562,7 +634,7 @@ Typing a variable's name shows its value without changing `ans`.
 
 As in MATLAB, where a function's help is the comment block at the top of its `.m` file, the help of every command and function here is the comment block at the start of its code: the docstring of the Python function that implements it. The first line (`floor - Round toward minus infinity.`) is the summary shown in the `help` list.
 
-### 11. Adding Your Own Functions
+### 12. Adding Your Own Functions
 A new built-in function needs only a Python function with a help docstring and the `@builtin` decorator, placed next to the others in `matlab_calc.py`. It then works in calculations and appears in `help` automatically:
 
 ```python
@@ -579,8 +651,8 @@ def fn_cube(x):
 
 Arguments arrive as 2-D NumPy arrays (scalars are 1×1) and the function must return one (`to_matrix` converts any result). The number of inputs comes from the Python signature; parameters with a default value (`n=None`) are optional. For several outputs, give `outputs=2` (or more) to `@builtin`, add a keyword-only parameter `nargout` and return a tuple with that many values; `keep_types=True` passes logical and text arguments unchanged instead of converting them to numbers, and `command_syntax=True` allows calls such as `hold on`. Console commands work the same way with the `@console_command` decorator on a `MatlabEngine` method. The tests check that every command and function has a help text whose first line has the form `name - Summary.`
 
-### 12. Not Supported
-More than two subscripts and N-dimensional arrays, cell arrays, structures, the separate `string` class (`"text"` gives ordinary `char` text), user functions/scripts, and control flow (`if`, `for`, …). `asin`/`acos` return `NaN` outside [-1, 1], and `acosh` below 1 and `atanh` outside [-1, 1] likewise. Files are read and written as text (UTF-8); `fread`, `fwrite`, `fgetl` and `textscan` are not available, nor are `dir` and `exist` (use `ls`, `isfile` and `isfolder`); `*` is the only wildcard. Graphics: one axes per figure (no `subplot` yet), no `pcolor`, `surf`, `bar` or other plot types, no dot syntax (`h.LineWidth = 2`; use `set`), and `get` takes one handle at a time. Non-integer matrix powers use an eigendecomposition, so they require a diagonalisable matrix.
+### 13. Not Supported
+More than two subscripts and N-dimensional arrays, cell arrays, structures, the separate `string` class (`"text"` gives ordinary `char` text), user functions (function M-files; scripts do run), a search path for scripts (`path`, `addpath`: only the current folder is searched), and the control-flow statements `switch`, `try`/`catch` and `return`. `asin`/`acos` return `NaN` outside [-1, 1], and `acosh` below 1 and `atanh` outside [-1, 1] likewise. Files are read and written as text (UTF-8); `fread`, `fwrite`, `fgetl` and `textscan` are not available, nor are `dir` and `exist` (use `ls`, `isfile` and `isfolder`); `*` is the only wildcard. Graphics: one axes per figure (no `subplot` yet), no `pcolor`, `surf`, `bar` or other plot types, no dot syntax (`h.LineWidth = 2`; use `set`), and `get` takes one handle at a time. Non-integer matrix powers use an eigendecomposition, so they require a diagonalisable matrix.
 
 ---
 
@@ -594,6 +666,7 @@ More than two subscripts and N-dimensional arrays, cell arrays, structures, the 
 - **`Ctrl+A` / `Cmd+A`**: Select all text.
 - **`Ctrl+O` / `Cmd+O`**, **`Ctrl+S` / `Cmd+S`**: Open (run) a script, save the session.
 - **`Ctrl +` / `Cmd +`**, **`Ctrl −` / `Cmd −`**, **`Ctrl 0` / `Cmd 0`**: Larger, smaller or default font size (remembered).
+- **`Ctrl+C`** (the Control key, on macOS too): stop a running loop (`Operation terminated by user.`); while a `for` / `while` / `if` block is being typed, drop it. With text selected it copies, as before (Linux).
 - **`Ctrl+W` / `Cmd+W`** in a figure window: close the figure.
 - **`F1`** (Linux) / **`Cmd+?`** (macOS): Matlab_Calc Help. **`Cmd+,`** (macOS): Settings. **`Ctrl+Q` / `Cmd+Q`**: Quit.
 
@@ -605,7 +678,7 @@ More than two subscripts and N-dimensional arrays, cell arrays, structures, the 
 python3 test_matlab_calc.py
 ```
 
-Runs 150 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files, the file and folder functions (in temporary folders), the statistics and random-number functions, the help texts, the menus, the About, Help and Settings windows, running and saving scripts, the update check of the Help menu, plotting (off-screen) and figure windows, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available, and the plot tests when matplotlib is not installed.
+Runs 177 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files, the file and folder functions (in temporary folders), the statistics and random-number functions, the help texts, the menus, the About, Help and Settings windows, running and saving scripts, the update check of the Help menu, plotting (off-screen) and figure windows, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available, and the plot tests when matplotlib is not installed.
 
 ---
 
@@ -616,6 +689,19 @@ Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, 
 ---
 
 ## Version History
+
+### 0.12.0 — 2026-11-12
+- **Running scripts from the command line:** typing the name of a script in the current folder (`demo` for `demo.m`) runs it, and so does `run demo`, `run demo.m`, `run folder/demo` or `run('My Script')`. `run` makes the folder of the script the current folder while it runs.
+- A script run this way shows only its results, works in the workspace of the command window, can run other scripts, and stops at the first error with `Error in demo (line 4)`. Ctrl+C stops it.
+- `x = demo` gives MATLAB's `Attempt to execute SCRIPT demo as a function`; a function file gives a clear message; a script that runs itself stops after 32 levels.
+- `help run` describes it.
+
+### 0.11.0 — 2026-11-05
+- **Loops and conditions:** `for`, `while`, `if` / `elseif` / `else`, `break` and `continue`, with MATLAB's rules: `for` takes the columns of its values, a condition is true when it is not empty and all its elements are nonzero, and blocks can be written on one line (`for k = 1:3, disp(k), end`).
+- **Typing blocks line by line:** after `for`, `while` or `if` the command window waits (without a prompt) for the lines up to the matching `end`, then runs the block. ↑ recalls the whole block.
+- **Ctrl+C** stops a running loop; the output of a long loop appears while it runs, and the window stays responsive. Ctrl+C also drops an unfinished block.
+- **Scripts:** *File > Open* runs a block that spans several lines of a `.m` file as one command.
+- **Help:** `help for`, `help while`, `help if`, `help break`, `help continue` and `help end`; `help` lists the control-flow statements.
 
 ### 0.10.1 — 2026-11-05
 - **Figure windows** open directly at their place beside the command window, instead of appearing elsewhere for a moment and then jumping there.
@@ -705,3 +791,97 @@ Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, 
 
 ### 0.1.0
 - Initial version: Tkinter command window with a `>>` prompt and command history, MATLAB matrix and vector syntax, matrix and element-wise operators, adaptive number formatting, and the workspace commands `whos`, `clear`, `clc` and `format`.
+
+---
+
+## Missing Compared to MATLAB around 2000
+
+What MATLAB 6.0 (R12, released in November 2000) — the base product, without toolboxes — had and Matlab_Calc 0.12.0 does not have yet. Items already available in Matlab_Calc are not listed; where only part of a feature exists, the missing part is named.
+
+### The most noticeable gaps
+1. **User functions**: function M-files (`function y = f(x)`) with their own workspace, subfunctions, `nargin` / `nargout`, `varargin` / `varargout`, `return`, `global` and `persistent` variables. (Scripts run by typing their name or with `run`, from the current folder.)
+2. **Control flow** beyond `for` / `while` / `if`: `switch` / `case` / `otherwise`, `try` / `catch` with `lasterr`, `error` and `warning`.
+3. **Data types**: N-dimensional arrays, cell arrays (`{}`), structures (`s.field`), sparse matrices, and the integer and `single` classes (`int8` … `uint32`).
+4. **Basic matrix and data functions** used in almost every program: `sum`, `prod`, `cumsum`, `cumprod`, `diff`, `sort`, `any`, `all`, `isempty`, `diag`, `trace`, `rank`, `norm`, `eig`, `svd`, `repmat`.
+5. **Workspace files**: `save` / `load` (MAT and ASCII files).
+6. **More plot types and `subplot`**.
+
+### Language and workspace
+- `eval`, `feval`, `evalin`, `assignin`, `inline` objects and function handles (`@sin`, new in MATLAB 6.0).
+- `input` (ask the user for a value), `keyboard`, `pause`, `beep`.
+- `who`, `exist`, `which`, `what`, `type`, `edit`, `class`, `isa`, `isnumeric`, `ischar`, `islogical`, `isreal`.
+- `clear` options such as `clear functions` and `clear global`; `pack`.
+- `diary` (record the session to a file), `more`, the `!` operator (run an operating-system command), `dos` / `unix`.
+- Search path for M-files: `path`, `addpath`, `rmpath`.
+- Number formats: `format short e`, `long e`, `short g`, `long g`, `rat`, `hex`, `bank`, `+`, `compact`, `loose`.
+- Debugging and profiling: `dbstop`, `dbstep`, `dbcont`, `dbquit`, `profile`.
+- Dot-indexing and multi-level indexing (`s.a(2).b{3}`), comma-separated lists, `deal`.
+
+### Elementary math
+- Complex numbers: `real`, `imag`, `conj`, `angle`, `isreal`.
+- Rounding and signs: `fix`, `sign`.
+- Trigonometry: `atan2`, `sec`, `csc`, `cot` and their inverses and hyperbolic forms.
+- Exponentials: `log2`, `pow2`, `nextpow2`.
+- Number theory: `gcd`, `lcm`, `factor`, `primes`, `isprime`, `nchoosek`, `factorial`, `rat`, `rats`.
+- Special functions: `gamma`, `gammaln`, `beta`, `erf`, `erfc`, `erfinv`, `besselj` and the other Bessel functions, `legendre`, `ellipke`.
+- `eps`, `realmax`, `realmin`.
+- Element-wise operators as named functions: `plus`, `minus`, `rdivide`, `mtimes`, `eq`, `and`, `xor`, …  (only `power` and `times` exist).
+
+### Matrices and linear algebra
+- Building matrices: `diag`, `tril`, `triu`, `repmat`, `cat`, `horzcat`, `vertcat`, `kron`, `meshgrid`, `ndgrid`, `logspace`, `colon`.
+- Rearranging: `fliplr`, `flipud`, `flipdim`, `rot90`, `permute`, `squeeze`, `ndims`, `isempty`, `isequal`.
+- Special matrices: `magic`, `hilb`, `invhilb`, `pascal`, `toeplitz`, `hankel`, `vander`, `hadamard`, `compan`, `wilkinson`, `rosser`, `gallery`.
+- Linear algebra: `rank`, `trace`, `norm`, `cond`, `rcond`, `null`, `orth`, `pinv`, `rref`, `lu`, `qr`, `chol`, `eig`, `svd`, `schur`, `hess`, `qz`, `expm`, `logm`, `sqrtm`, `funm`, `subspace`.
+- Sparse matrices: `sparse`, `full`, `spones`, `speye`, `nnz`, `spy`, iterative solvers (`pcg`, `bicg`, `gmres`, …), `eigs`, `svds`.
+
+### Data analysis and signal processing
+- `sum`, `prod`, `cumsum`, `cumprod`, `diff`, `sort`, `sortrows`, `unique`, `union`, `intersect`, `setdiff`, `ismember`.
+- `any`, `all`, `xor`, `isnan`, `isinf`, `isfinite`.
+- Statistics: `var`, `cov`, `corrcoef`, `hist`, `histc`.
+- Integration and differences: `trapz`, `cumtrapz`, `gradient`, `del2`.
+- Signals: `filter`, `filter2`, `conv`, `conv2`, `deconv`, `fft`, `ifft`, `fft2`, `ifft2`, `fftshift`.
+- Polynomials: `polyfit`, `polyval`, `polyvalm`, `roots`, `poly`, `polyder`, `polyint`, `residue`.
+- Interpolation: `interp1`, `interp2`, `interp3`, `interpn`, `spline`, `griddata`.
+
+### Numerical methods ("function functions")
+- Differential equations: `ode45`, `ode23`, `ode113`, `ode15s`, `ode23s`, `ode23t`, `ode23tb`, `odeset`, `odeget`.
+- Zeros and minimization: `fzero`, `fminbnd`, `fminsearch`, `optimset`.
+- Integration: `quad`, `quad8`, `quadl`, `dblquad`.
+- Plotting functions: `fplot`, `ezplot` and the other `ez…` functions.
+
+### Text
+- Comparing and searching: `strcmp`, `strcmpi`, `strncmp`, `strncmpi`, `findstr`, `strmatch`, `strtok`, `strrep`.
+- Building: `strcat`, `strvcat`, `char` with several rows, `blanks`, `deblank`, `upper`, `lower`.
+- Converting: `int2str`, `mat2str`, `str2num`, `str2double`, `num2cell`, `sscanf`, `double`, `char`, `dec2bin`, `bin2dec`, `dec2hex`, `hex2dec`, `dec2base`.
+- Tests: `ischar`, `isspace`, `isletter`.
+- Cell arrays of text (`{'a', 'bc'}`), `cellstr`, `iscellstr`.
+
+### Files
+- `save` and `load` of the workspace (MAT files and ASCII), `load data.txt`.
+- Low-level I/O: `fgetl`, `fgets`, `fread`, `fwrite` (binary files), `fseek`, `ftell`, `frewind`, `feof`, `ferror`.
+- Text and spreadsheet files: `textread`, `dlmread`, `dlmwrite`, `csvread`, `csvwrite`, `wk1read`, `wk1write`.
+- Images and sound: `imread`, `imwrite`, `imfinfo`, `wavread`, `wavwrite`, `sound`, `auread`.
+- File names and folders: `dir`, `exist`, `fullfile`, `fileparts`, `tempdir`, `tempname`, `what`, `which`.
+
+### Time and date
+- `tic`, `toc`, `clock`, `etime`, `cputime`, `date`, `datestr`, `datenum`, `now`, `calendar`, `weekday`.
+
+### Graphics
+- Layout: `subplot`, `axes` (several axes in a figure), `plotyy`.
+- 2-D plot types: `semilogx`, `semilogy`, `loglog`, `polar`, `bar`, `barh`, `hist`, `pie`, `area`, `stairs`, `stem`, `errorbar`, `fill`, `patch`, `scatter`, `scatter3`, `compass`, `feather`, `rose`, `comet`.
+- 3-D plots: `plot3`, `mesh`, `meshc`, `meshz`, `surf`, `surfc`, `surfl`, `contour`, `contourf`, `contour3`, `clabel`, `quiver`, `quiver3`, `waterfall`, `ribbon`, `slice`, `sphere`, `cylinder`.
+- Labels and annotation: `text`, `gtext`, `zlabel`, `zlim`, `line`.
+- Color and view: `colormap`, `colorbar`, `caxis`, `shading`, `view`, `rotate3d`, `light`, `lighting`, `material`, `camlight` and the camera functions, `hidden`.
+- Images: `image`, `imagesc`, `pcolor`.
+- Interaction: `ginput`, `zoom` and `pan` from the command line, `waitforbuttonpress`.
+- Handle graphics: `findobj`, `gco`, `gcbo`, the root object `0`, `copyobj`, callback properties (`ButtonDownFcn`, …), `get` / `set` on several handles at once, `allchild`.
+- Printing and export from the command line: `print`, `saveas` (the toolbar can save images).
+- Animation: `getframe`, `movie`.
+- GUIs: `uicontrol`, `uimenu`, `uicontextmenu`, `dialog`, `msgbox`, `questdlg`, `inputdlg`, `waitbar`, the GUIDE layout editor.
+
+### Desktop (new in MATLAB 6.0)
+- Workspace browser and Array Editor, Command History window, Current Directory browser, Launch Pad, Help Browser with HTML documentation, and the Editor/Debugger with breakpoints.
+
+### Interfaces and products around MATLAB
+- MEX files (C and Fortran functions called from MATLAB), the MATLAB Engine, the Java interface (new in 6.0: `java.lang.String(...)` objects in the command window), ActiveX and DDE on Windows, Notebook for Word, and the MATLAB Compiler.
+- Simulink and the toolboxes (Signal Processing, Control System, Optimization, Statistics, Symbolic Math, Image Processing, …), which are separate products and were never part of the base MATLAB.
