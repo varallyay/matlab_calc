@@ -2,14 +2,17 @@
 
 # Matlab_Calc — MATLAB Command Window Emulator (`matlab_calc.py`)
 
-**Version 0.13.0** — see [Version History](#version-history).
+**Version 0.14.0** — see [Version History](#version-history).
 
 A lightweight, interactive desktop calculator built with Python, Tkinter, and NumPy that emulates the look, feel, and matrix-first syntax of the **MATLAB Command Window**.
+
+**It starts immediately.** MATLAB takes a while to start, which is a lot of waiting for a quick calculation. Matlab_Calc is ready for the first command within a second, so it is the quick choice when you need just a few calculations: start it, type them in MATLAB syntax, and close it again.
 
 ---
 
 ## Features
 
+- **Starts Immediately**: the command window is ready within a second (about 0.3–0.5 s on a recent Mac), unlike MATLAB, which needs much longer to start. Ideal for a few quick calculations.
 - **Inline Interactive Command Window**: Type expressions directly after the `>> ` prompt in a single scrollable console window—just like native MATLAB. Previous outputs and prompts are protected from every kind of edit (typing, Backspace, Delete, cut, paste, Emacs-style shortcuts such as Ctrl+H) while remaining selectable for copying.
 - **Native MATLAB Matrix & Vector Syntax**: Define row vectors (`[1 2 3]` or `[1, 2, 3]`), column vectors (`[1; 2; 3]`), 2D matrices (`[1 2; 3 4]`), block matrices (`[A A; A A]`) and ranges (`1:5`, `0:0.1:1`). MATLAB's whitespace rules apply inside brackets: `[1 -2]` has two elements, `[1 - 2]` has one.
 - **Indexing**: Use single elements, rows, columns and sub-matrices in calculations, as in `A(2,3) + A(1,4)`, `A(end, :)` or `v(2:end)`; change them (`A(2,3) = 5`), delete them (`A(2, :) = []`) or select them by a condition (`A(A > 2)`, `A(A > 2) = 0`). `find` gives the positions where a condition holds.
@@ -19,11 +22,12 @@ A lightweight, interactive desktop calculator built with Python, Tkinter, and Nu
   - Element-wise operations: `.*`, `./`, `.\`, `.^`.
   - Raises MATLAB-style errors when operands have incompatible dimensions.
 - **Loops and Conditions**: `for`, `while`, `if` / `elseif` / `else`, `break` and `continue`, typed line by line (the window waits for the `end`, as MATLAB does), on one line (`for k = 1:3, disp(k), end`) or in a script. **Ctrl+C** stops a loop that runs too long.
-- **Several Outputs**: functions such as `max`, `min`, `size`, `find`, `fopen` and `fscanf` return more than one result: `[m, i] = max(A)`, `[rows, cols] = size(A)`; `~` skips an output (`[~, i] = min(v)`).
+- **Several Outputs**: functions such as `max`, `min`, `sort`, `size`, `find`, `eig`, `fopen` and `fscanf` return more than one result: `[m, i] = max(A)`, `[rows, cols] = size(A)`, `[V, D] = eig(A)`; `~` skips an output (`[~, i] = min(v)`).
 - **Text and Files**: text in quotes (`'Hello'`), `disp`, `fprintf`, `sprintf` and `num2str` for formatted output, and `fopen` / `fprintf` / `fscanf` / `fclose` with file identifiers to write and read text files.
 - **Files and Folders**: `ls`, `mkdir`, `rmdir`, `isfile`, `isfolder`, `copyfile`, `movefile` and `delete`, with `*` wildcards and MATLAB's command syntax (`mkdir results`, `delete *.txt`).
 - **Plots**: `plot`, `figure`, `hold`, `xlabel`, `ylabel`, `title`, `legend`, `grid`, `axis`, `set` and `get` draw line plots in figure windows that look like MATLAB's, with a toolbar to zoom, pan and save (made with matplotlib).
-- **Data Analysis and Random Numbers**: `max`, `min`, `mean`, `median`, `std`, `rand`, `randn` and more, working down the columns of a matrix as in MATLAB.
+- **Data Analysis and Random Numbers**: `sum`, `prod`, `cumsum`, `cumprod`, `diff`, `sort`, `max`, `min`, `mean`, `median`, `std`, `rand`, `randn` and more, working down the columns of a matrix as in MATLAB.
+- **Linear Algebra**: `inv`, `det`, `norm` (vector and matrix norms), `eig` (eigenvalues and eigenvectors), `diag` and `repmat`, besides the matrix operators and `\` for solving linear systems.
 - **Multiple Statements and Comments**: `a = 1; b = 2, c = a + b` runs three statements (a trailing `;` suppresses output); `%` starts a comment and `...` continues a line. Multi-line pastes run line by line.
 - **Smart Adaptive Number Formatting**:
   - Automatically aligns matrix columns and matches the decimal precision across all elements of a vector/matrix to the maximum significant decimals needed by the calculation (capped at 4 digits in `format short` and 15 digits in `format long`).
@@ -565,6 +569,10 @@ grid on
   - `ones(n)`, `ones(r, c)` or `ones([r c])` — matrix of ones
   - `inv(M)` — matrix inverse
   - `det(M)` — matrix determinant
+  - `diag(v)` — square matrix with `v` on its diagonal; `diag(A)` — the diagonal of `A` as a column; `diag(v, k)`, `diag(A, k)` — the `k`-th diagonal above (`k > 0`) or below (`k < 0`) the main one
+  - `norm(v)` — length of a vector; `norm(v, p)` with `p` = 1, 2, …, `Inf`, `-Inf`; `norm(A)` — 2-norm of a matrix (largest singular value), `norm(A, 1)`, `norm(A, Inf)`, `norm(A, 'fro')`
+  - `eig(A)` — eigenvalues of a square matrix; `[V, D] = eig(A)` — eigenvectors (columns of `V`, of length 1) and eigenvalues (diagonal of `D`), so that `A*V = V*D`. A symmetric matrix gives real eigenvalues in ascending order and orthonormal eigenvectors
+  - `repmat(A, m, n)`, `repmat(A, [m n])`, `repmat(A, n)` — tile copies of `A` (`repmat([1 2], 2, 3)` is 2×6; `repmat('-', 1, 20)` is a line of text)
   - `abs(x)` — absolute value / magnitude
 - **Rounding** (element-wise; complex numbers are rounded in their real and imaginary parts separately):
   - `round(x)` — nearest integer, halves rounded away from zero as in MATLAB (`round(2.5) = 3`, `round(-2.5) = -3`)
@@ -577,6 +585,10 @@ grid on
   - `max(A)`, `min(A)` — largest / smallest elements; `[m, i] = max(A)` also gives their positions. `max(A, B)` compares element by element (`max([1 5 3], 4)` is `4 5 4`), `max(A, [], dim)` works along a dimension. `NaN` values are ignored
   - `mean(A)`, `median(A)` — average and middle value (`mean(A, 2)` per row, `mean(A, 'all')`)
   - `std(A)` — standard deviation (normalised by `N-1`; `std(A, 1)` by `N`; `std(A, w, dim)`)
+  - `sum(A)`, `prod(A)` — sum and product (`sum(A, 2)` per row, `sum(A, 'all')`); `sum([])` is 0, `prod([])` is 1, and `sum(v > 2)` counts the elements greater than 2
+  - `cumsum(A)`, `cumprod(A)` — cumulative sum and product (`cumsum([1 2 3])` is `1 3 6`); `cumsum(A, dim)`, `cumsum(A, 'reverse')`
+  - `diff(A)` — differences between neighbouring elements (`diff([1 4 9 16])` is `3 5 7`); `diff(A, n)` the `n`-th difference, `diff(A, n, dim)` along a dimension
+  - `sort(A)`, `sort(A, 'descend')`, `sort(A, dim, mode)` — sorted elements; `[B, I] = sort(A)` also gives their former positions. Equal elements keep their order, `NaN` comes last (first with `'descend'`), complex numbers are sorted by magnitude, and text stays text (`sort('hello')` is `'ehllo'`)
 - **Random Numbers**:
   - `rand(n)`, `rand(r, c)` — uniformly distributed numbers between 0 and 1
   - `randn(n)`, `randn(r, c)` — normally distributed numbers (mean 0, standard deviation 1)
@@ -682,7 +694,7 @@ More than two subscripts and N-dimensional arrays, cell arrays, structures, the 
 python3 test_matlab_calc.py
 ```
 
-Runs 182 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files, the file and folder functions (in temporary folders), the statistics and random-number functions, the help texts, the menus, the About, Help and Settings windows, running and saving scripts, the update check of the Help menu, plotting (off-screen) and figure windows, precedence, parsing, number display, workspace commands, the read-only console and Tab completion (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available, and the plot tests when matplotlib is not installed.
+Runs 190 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files, the file and folder functions (in temporary folders), the statistics, sum, sorting, linear-algebra and random-number functions, the help texts, the menus, the About, Help and Settings windows, running and saving scripts, the update check of the Help menu, plotting (off-screen) and figure windows, precedence, parsing, number display, workspace commands, the read-only console and Tab completion (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available, and the plot tests when matplotlib is not installed.
 
 ---
 
@@ -693,6 +705,14 @@ Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, 
 ---
 
 ## Version History
+
+### 0.14.0 — 2026-11-25
+- **Sums and products:** `sum`, `prod`, `cumsum` and `cumprod`, down the columns of a matrix or along dimension `dim`; `sum` and `prod` also take `'all'`, `cumsum` and `cumprod` also `'reverse'`. `sum([])` is 0 and `prod([])` is 1, as in MATLAB.
+- **Differences:** `diff(X)`, `diff(X, n)` and `diff(X, n, dim)`.
+- **Sorting:** `sort(A)`, `sort(A, dim)`, `sort(A, 'descend')`, and `[B, I] = sort(A)` with the former positions. The sort is stable; `NaN` comes last (first when descending), complex numbers are sorted by magnitude, and text and logical values keep their type.
+- **Linear algebra and building matrices:** `diag` (diagonal matrices and diagonals, also the `k`-th one), `norm` (vector norms with any `p`, `Inf`, `-Inf`; matrix 1-, 2-, Inf- and Frobenius norms), `eig` (eigenvalues; `[V, D] = eig(A)` with the eigenvectors; real and sorted for symmetric matrices) and `repmat`.
+- `help` describes each of them; Tab completes their names.
+- The README and the Help window point out that Matlab_Calc starts immediately (within a second), unlike MATLAB: handy for a few quick calculations.
 
 ### 0.13.0 — 2026-11-25
 - **Tab completion:** Tab completes the name before the cursor: console commands, built-in functions, keywords, the variables of the workspace and the scripts (`.m` files) of the current folder. Case matters, as in MATLAB.
@@ -805,13 +825,13 @@ Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, 
 
 ## Missing Compared to MATLAB around 2000
 
-What MATLAB 6.0 (R12, released in November 2000) — the base product, without toolboxes — had and Matlab_Calc 0.13.0 does not have yet. Items already available in Matlab_Calc are not listed; where only part of a feature exists, the missing part is named.
+What MATLAB 6.0 (R12, released in November 2000) — the base product, without toolboxes — had and Matlab_Calc 0.14.0 does not have yet. Items already available in Matlab_Calc are not listed; where only part of a feature exists, the missing part is named.
 
 ### The most noticeable gaps
 1. **User functions**: function M-files (`function y = f(x)`) with their own workspace, subfunctions, `nargin` / `nargout`, `varargin` / `varargout`, `return`, `global` and `persistent` variables. (Scripts run by typing their name or with `run`, from the current folder.)
 2. **Control flow** beyond `for` / `while` / `if`: `switch` / `case` / `otherwise`, `try` / `catch` with `lasterr`, `error` and `warning`.
 3. **Data types**: N-dimensional arrays, cell arrays (`{}`), structures (`s.field`), sparse matrices, and the integer and `single` classes (`int8` … `uint32`).
-4. **Basic matrix and data functions** used in almost every program: `sum`, `prod`, `cumsum`, `cumprod`, `diff`, `sort`, `any`, `all`, `isempty`, `diag`, `trace`, `rank`, `norm`, `eig`, `svd`, `repmat`.
+4. **Basic matrix and data functions** used in almost every program: `any`, `all`, `isempty`, `trace`, `rank`, `svd`.
 5. **Workspace files**: `save` / `load` (MAT and ASCII files).
 6. **More plot types and `subplot`**.
 
@@ -837,14 +857,14 @@ What MATLAB 6.0 (R12, released in November 2000) — the base product, without t
 - Element-wise operators as named functions: `plus`, `minus`, `rdivide`, `mtimes`, `eq`, `and`, `xor`, …  (only `power` and `times` exist).
 
 ### Matrices and linear algebra
-- Building matrices: `diag`, `tril`, `triu`, `repmat`, `cat`, `horzcat`, `vertcat`, `kron`, `meshgrid`, `ndgrid`, `logspace`, `colon`.
+- Building matrices: `tril`, `triu`, `cat`, `horzcat`, `vertcat`, `kron`, `meshgrid`, `ndgrid`, `logspace`, `colon`.
 - Rearranging: `fliplr`, `flipud`, `flipdim`, `rot90`, `permute`, `squeeze`, `ndims`, `isempty`, `isequal`.
 - Special matrices: `magic`, `hilb`, `invhilb`, `pascal`, `toeplitz`, `hankel`, `vander`, `hadamard`, `compan`, `wilkinson`, `rosser`, `gallery`.
-- Linear algebra: `rank`, `trace`, `norm`, `cond`, `rcond`, `null`, `orth`, `pinv`, `rref`, `lu`, `qr`, `chol`, `eig`, `svd`, `schur`, `hess`, `qz`, `expm`, `logm`, `sqrtm`, `funm`, `subspace`.
+- Linear algebra: `rank`, `trace`, `cond`, `rcond`, `null`, `orth`, `pinv`, `rref`, `lu`, `qr`, `chol`, `svd`, `schur`, `hess`, `qz`, `expm`, `logm`, `sqrtm`, `funm`, `subspace`.
 - Sparse matrices: `sparse`, `full`, `spones`, `speye`, `nnz`, `spy`, iterative solvers (`pcg`, `bicg`, `gmres`, …), `eigs`, `svds`.
 
 ### Data analysis and signal processing
-- `sum`, `prod`, `cumsum`, `cumprod`, `diff`, `sort`, `sortrows`, `unique`, `union`, `intersect`, `setdiff`, `ismember`.
+- `sortrows`, `unique`, `union`, `intersect`, `setdiff`, `ismember`.
 - `any`, `all`, `xor`, `isnan`, `isinf`, `isfinite`.
 - Statistics: `var`, `cov`, `corrcoef`, `hist`, `histc`.
 - Integration and differences: `trapz`, `cumtrapz`, `gradient`, `del2`.

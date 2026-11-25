@@ -639,6 +639,151 @@ class TestStatistics(EngineCase):
         self.assertError('std(A, 2)', 'weight must be 0')
 
 
+class TestSumsDifferencesAndSorting(EngineCase):
+    """sum, prod, cumsum, cumprod, diff and sort."""
+    A = np.array([[3.0, 1, 4], [1, 5, 9], [2, 6, 5]])
+
+    def setUp(self):
+        super().setUp()
+        self.out('A = [3 1 4; 1 5 9; 2 6 5];')
+
+    def test_sum_and_prod(self):
+        self.assertValue('sum(A)', self.A.sum(axis=0))
+        self.assertValue('sum(A, 2)', self.A.sum(axis=1).reshape(-1, 1))
+        self.assertValue("sum(A, 'all')", 36)
+        self.assertValue('sum([1 2 3])', 6)
+        self.assertValue('sum([1; 2; 3])', 6)
+        self.assertValue('sum(A, 3)', self.A)                         # along a dimension of length 1
+        self.assertValue('sum([])', 0)
+        self.assertValue('sum(zeros(0, 3))', [[0, 0, 0]])
+        self.assertValue('sum([1 5 3] > 2)', 2)                       # logical values count as 1 and 0
+        self.assertValue('sum([1+2i, 3])', 4 + 2j)
+        self.assertValue('prod(1:5)', 120)
+        self.assertValue('prod(A)', self.A.prod(axis=0))
+        self.assertValue("prod([1 2; 3 4], 'all')", 24)
+        self.assertValue('prod([])', 1)
+        self.assertTrue(np.isnan(self.ans('sum([1 NaN])')).all())
+        self.assertError("sum(A, 'rows')", "1, 2 or 'all'")
+        self.assertError('sum(A, 0)', 'whole number of at least 1')
+
+    def test_cumsum_and_cumprod(self):
+        self.assertValue('cumsum([1 2 3 4])', [1, 3, 6, 10])
+        self.assertValue('cumsum(A)', np.cumsum(self.A, axis=0))
+        self.assertValue('cumsum(A, 2)', np.cumsum(self.A, axis=1))
+        self.assertValue("cumsum(1:4, 'reverse')", [10, 9, 7, 4])
+        self.assertValue("cumsum([1; 2; 3], 1, 'reverse')", [[6], [5], [3]])
+        self.assertValue('cumprod(1:5)', [1, 2, 6, 24, 120])
+        self.assertValue('cumprod(A, 2)', np.cumprod(self.A, axis=1))
+        self.assertValue("cumprod([2 3 4], 'reverse')", [24, 12, 4])
+        self.assertEqual(self.ans('cumsum([])').shape, (0, 0))
+        self.assertError("cumsum(A, 'backward')", "'forward' or 'reverse'")
+
+    def test_diff(self):
+        self.assertValue('diff([1 4 9 16])', [3, 5, 7])
+        self.assertValue('diff([1 4 9 16], 2)', [2, 2])
+        self.assertValue('diff([1; 4; 9])', [[3], [5]])
+        self.assertValue('diff(A)', np.diff(self.A, axis=0))
+        self.assertValue('diff(A, 1, 2)', np.diff(self.A, axis=1))
+        self.assertValue('diff([1 2; 4 8], 2)', 3)                    # out of rows: continues along the rows
+        self.assertValue('diff([1 4 9], 0)', [1, 4, 9])
+        self.assertEqual(self.ans('diff([1 2 3], 5)').shape, (1, 0))
+        self.assertEqual(self.ans('diff([1; 2], 3)').shape, (0, 1))
+        self.assertEqual(self.ans('diff([1; 2], 1, 2)').shape, (2, 0))
+        self.assertEqual(self.ans('diff([])').shape, (0, 0))
+        self.assertError('diff([1 2 3], -1)', 'whole number')
+
+    def test_sort(self):
+        self.assertValue('sort([3 1 2])', [1, 2, 3])
+        self.assertValue("sort([3 1 2], 'descend')", [3, 2, 1])
+        self.assertValue('sort(A)', np.sort(self.A, axis=0))
+        self.assertValue('sort(A, 2)', np.sort(self.A, axis=1))
+        self.assertValue("sort(A, 2, 'descend')", -np.sort(-self.A, axis=1))
+        self.assertValue('[b, i] = sort([3 1 2 1]);', [2, 4, 3, 1], var='i')   # equal values keep their order
+        self.assertValue("[b, i] = sort([2 2 1], 'descend');", [1, 2, 3], var='i')
+        self.assertValue('[b, i] = sort(A);', np.argsort(self.A, axis=0, kind='stable') + 1, var='i')
+        b = self.ans('sort([3 NaN 1])')
+        self.assertEqual(b[0, :2].tolist(), [1, 3])
+        self.assertTrue(np.isnan(b[0, 2]))                             # NaN last
+        self.assertTrue(np.isnan(self.ans("sort([3 NaN 1], 'descend')")[0, 0]))  # and first when descending
+        self.assertValue('sort([1+2i, -3, 2])', [2, 1 + 2j, -3])        # complex: by magnitude
+        self.assertEqual(self.out("sort('hello')"), "ans =\n    'ehllo'\n")
+        self.assertEqual(self.ans('sort([true false true])').dtype, bool)
+        self.assertEqual(self.ans('sort([])').shape, (0, 0))
+        self.assertError("sort(A, 'up')", "'ascend' or 'descend'")
+        self.assertError('[a, b, c] = sort(A)', 'Too many output')
+
+
+class TestMatrixFunctions(EngineCase):
+    """diag, norm, eig and repmat."""
+
+    def test_diag(self):
+        self.assertValue('diag([1 2 3])', np.diag([1, 2, 3]))
+        self.assertValue('diag([1; 2])', np.diag([1, 2]))
+        self.assertValue('diag([1 2], 1)', np.diag([1, 2], 1))
+        self.assertValue('diag([1 2], -2)', np.diag([1, 2], -2))
+        self.assertValue('diag([1 2; 3 4])', [[1], [4]])
+        self.assertValue('diag([1 2 3; 4 5 6], 1)', [[2], [6]])
+        self.assertValue('diag([1 2 3; 4 5 6], -1)', 4)
+        self.assertValue('diag(diag([1 2; 3 4]))', [[1, 0], [0, 4]])
+        self.assertValue('diag(5)', 5)
+        self.assertEqual(self.ans('diag([1 2; 3 4], 5)').shape, (0, 1))
+        self.assertEqual(self.ans('diag([])').shape, (0, 0))
+        self.assertEqual(self.ans('diag([true true])').dtype, bool)
+        self.assertError('diag([1 2], 0.5)', 'whole number')
+
+    def test_norm(self):
+        M = np.array([[1.0, 2], [3, 4]])
+        self.out('M = [1 2; 3 4];')
+        self.assertValue('norm([3 4])', 5)
+        self.assertValue('norm([3; -4], 1)', 7)
+        self.assertValue('norm([3 -4], Inf)', 4)
+        self.assertValue("norm([3 -4], 'inf')", 4)
+        self.assertValue('norm([3 -4], -Inf)', 3)
+        self.assertValue('norm([1 2 3], 3)', 36 ** (1 / 3))
+        self.assertValue('norm([3+4i, 0])', 5)
+        self.assertValue('norm(M)', np.linalg.norm(M, 2))
+        self.assertValue('norm(M, 1)', 6)
+        self.assertValue('norm(M, Inf)', 7)
+        self.assertValue("norm(M, 'fro')", np.sqrt(30))
+        self.assertValue('norm([])', 0)
+        self.assertValue('norm([1e200 1e200])', np.sqrt(2) * 1e200)   # no overflow
+        self.assertValue('norm([1 Inf])', np.inf)
+        self.assertTrue(np.isnan(self.ans('norm([1 NaN; 2 3])')).all())
+        self.assertError('norm(M, 3)', "1, 2, Inf or 'fro'")
+        self.assertError('norm([1 2], 0)', 'must be positive')
+        self.assertError("norm(M, 'max')", 'norm type')
+
+    def test_eig(self):
+        self.assertValue('eig([2 0; 0 1])', [[1], [2]])                 # symmetric: ascending
+        self.assertValue('eig([0 1; -1 0])', [[1j], [-1j]])
+        self.assertValue('eig([1 2; 3 4])', [[(5 - np.sqrt(33)) / 2], [(5 + np.sqrt(33)) / 2]])
+        self.out('A = [4 1 2; 1 3 0; 2 0 5]; [V, D] = eig(A);')
+        V, D, A = (self.eng.variables[k] for k in 'VDA')
+        np.testing.assert_allclose(A @ V, V @ D, atol=1e-12)
+        np.testing.assert_allclose(V.T @ V, np.eye(3), atol=1e-12)        # orthonormal eigenvectors
+        self.assertTrue(np.all(np.diff(np.diag(D)) >= 0))
+        self.out('B = [1 2; 3 4]; [V, D] = eig(B);')
+        V, D = self.eng.variables['V'], self.eng.variables['D']
+        np.testing.assert_allclose(np.array([[1, 2], [3, 4]]) @ V, V @ D, atol=1e-12)
+        np.testing.assert_allclose(np.linalg.norm(V, axis=0), [1, 1])
+        self.assertEqual(self.ans('eig([])').shape, (0, 1))
+        self.assertError('eig([1 2 3])', 'must be square')
+        self.assertError('eig([1 NaN; 0 1])', 'NaN or Inf')
+        self.assertError('[a, b, c] = eig(B)', 'Too many output')
+
+    def test_repmat(self):
+        self.assertValue('repmat([1 2], 2, 3)', np.tile([1, 2], (2, 3)))
+        self.assertValue('repmat([1 2], [3 1])', np.tile([1, 2], (3, 1)))
+        self.assertValue('repmat(7, 2)', [[7, 7], [7, 7]])
+        self.assertValue('repmat([1; 2], 1, 2)', [[1, 1], [2, 2]])
+        self.assertEqual(self.ans('repmat([1 2], 0, 3)').shape, (0, 6))
+        self.assertEqual(self.out("repmat('ab', 1, 3)"), "ans =\n    'ababab'\n")
+        self.assertEqual(self.ans('repmat(true, 2, 2)').dtype, bool)
+        self.assertError('repmat(1, 1e5, 1e5)', 'maximum allowed size')
+        self.assertError('repmat(1, 1.5)', 'integers')
+        self.assertError('repmat(1, [1 2 3])', '2-D')
+
+
 class TestTextOutputAndFiles(EngineCase):
     def setUp(self):
         super().setUp()

@@ -37,7 +37,7 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
-APP_VERSION = '0.13.0'          # Shown in the welcome banner; see the version history in README.md
+APP_VERSION = '0.14.0'          # Shown in the welcome banner; see the version history in README.md
 APP_CREDITS = "Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, Claude)"
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
@@ -895,6 +895,126 @@ def fn_det(x):
     return to_matrix(np.linalg.det(x))
 
 
+def _integer(value, function, what):
+    """A whole number (it may be negative) given as a scalar argument."""
+    if value.size != 1 or np.iscomplexobj(value) or is_text(value) or not float(value.flat[0]).is_integer():
+        raise MatlabError(f"Error using {function}\n{what} must be a whole number.")
+    return int(value.flat[0])
+
+
+@builtin('diag', category=CAT_MATRIX, keep_types=True)
+def fn_diag(v, k=None):
+    """diag - Diagonal matrices and diagonals of a matrix.
+
+    diag(V) of a vector V is a square matrix with the elements of V on its
+    diagonal and zeros elsewhere: diag([1 2 3]).
+    diag(A) of a matrix is a column with the elements of its diagonal,
+    A(1,1), A(2,2), ...
+    diag(V, k) and diag(A, k) use the k-th diagonal instead: k > 0 above
+    the main diagonal, k < 0 below it. diag(diag(A)) keeps only the
+    diagonal of A.
+
+    See also eye, eig, repmat.
+    """
+    offset = 0 if k is None else _integer(to_double(k), 'diag', 'The diagonal number')
+    if v.shape[0] == 1 or v.shape[1] == 1 or v.shape == (0, 0):  # a vector: build the matrix
+        side = v.size + abs(offset)
+        if side * side > MAX_ELEMENTS:
+            raise MatlabError("Error using diag\nRequested array exceeds the maximum allowed size.")
+        if v.size == 0:
+            return to_matrix(np.zeros((side, side), dtype=v.dtype))
+        return to_matrix(np.diag(v.ravel(), offset))
+    return to_matrix(np.diagonal(v, offset).reshape(-1, 1))
+
+
+@builtin('norm', category=CAT_MATRIX, keep_types=True)
+def fn_norm(x, p=None):
+    """norm - Vector and matrix norms.
+
+    norm(V) of a vector is its length, sqrt(sum(abs(V).^2)).
+    norm(V, p) is sum(abs(V).^p)^(1/p) for a positive p; norm(V, Inf) is
+    max(abs(V)) and norm(V, -Inf) is min(abs(V)).
+    norm(A) of a matrix is its 2-norm, the largest singular value.
+    norm(A, 1) is the largest column sum of abs(A), norm(A, Inf) the
+    largest row sum, and norm(A, 'fro') the Frobenius norm,
+    sqrt(sum(abs(A).^2, 'all')).
+
+    See also abs, sqrt, det.
+    """
+    x = to_double(x)
+    if p is None:
+        kind = 2.0
+    elif is_text(p):
+        kind = chars_to_text(p).lower()
+        if kind not in ('fro', 'inf', '-inf'):
+            raise MatlabError("Error using norm\nThe norm type must be a number, Inf, -Inf or 'fro'.")
+        kind = {'inf': np.inf, '-inf': -np.inf}.get(kind, kind)
+    else:
+        if p.size != 1 or np.iscomplexobj(p) or np.isnan(p.flat[0]):
+            raise MatlabError("Error using norm\nThe norm type must be a number, Inf, -Inf or 'fro'.")
+        kind = float(to_double(p).flat[0])
+    if x.size == 0:
+        return to_matrix(0.0)
+    vector = x.shape[0] == 1 or x.shape[1] == 1
+    magnitudes = np.abs(x)
+    if kind == 'fro':
+        value = np.sqrt(np.sum(magnitudes ** 2))
+    elif np.any(np.isnan(magnitudes)):
+        value = np.nan
+    elif vector:
+        v = magnitudes.ravel()
+        if kind == np.inf:
+            value = v.max()
+        elif kind == -np.inf:
+            value = v.min()
+        elif kind <= 0:
+            raise MatlabError("Error using norm\nThe p of a vector norm must be positive, Inf or -Inf.")
+        elif np.any(np.isinf(v)):
+            value = np.inf
+        else:
+            scale = v.max()  # avoids overflow and underflow of v.^p
+            value = 0.0 if scale == 0 else scale * np.sum((v / scale) ** kind) ** (1 / kind)
+    elif kind == 1:
+        value = magnitudes.sum(axis=0).max()
+    elif kind == np.inf:
+        value = magnitudes.sum(axis=1).max()
+    elif kind == 2:
+        value = np.inf if np.any(np.isinf(magnitudes)) else np.linalg.norm(x, 2)
+    else:
+        raise MatlabError("Error using norm\nThe norm of a matrix can be 1, 2, Inf or 'fro'.")
+    return to_matrix(float(value))
+
+
+@builtin('eig', category=CAT_MATRIX, outputs=2)
+def fn_eig(a, *, nargout=1):
+    """eig - Eigenvalues and eigenvectors.
+
+    eig(A) is a column with the eigenvalues of the square matrix A.
+    [V, D] = eig(A) also gives the eigenvectors: the columns of V (each of
+    length 1) and the diagonal matrix D of the eigenvalues, so that
+    A*V = V*D.
+    A symmetric matrix (A equal to A') has real eigenvalues, in ascending
+    order, and orthonormal eigenvectors; other matrices can have complex
+    eigenvalues. The generalized problem eig(A, B) is not available.
+
+    See also det, inv, diag, norm.
+    """
+    _need_square('eig', a)
+    if a.size == 0:
+        return (to_matrix(np.zeros((0, 0))),) * 2 if nargout > 1 else to_matrix(np.zeros((0, 1)))
+    if not np.all(np.isfinite(a)):
+        raise MatlabError("Error using eig\nInput to EIG must not contain NaN or Inf.")
+    symmetric = np.array_equal(a, a.conj().T)
+    try:
+        if nargout <= 1:
+            values = np.linalg.eigvalsh(a) if symmetric else np.linalg.eigvals(a)
+            return to_matrix(values.reshape(-1, 1))
+        values, vectors = np.linalg.eigh(a) if symmetric else np.linalg.eig(a)
+    except np.linalg.LinAlgError:
+        raise MatlabError("Error using eig\nThe eigenvalues could not be computed.") from None
+    return to_matrix(vectors), to_matrix(np.diag(values))
+
+
 # ---- helpers for the functions below ------------------------------------------
 def _whole_number(value, function, what, minimum=0):
     """A non-negative (or >= minimum) whole number given as a scalar argument."""
@@ -1157,6 +1277,197 @@ def fn_std(a, w=None, dim=None):
     return _statistic('std', a, dim, compute)
 
 
+def _total(function, a, dim, compute, empty_value):
+    """sum / prod: along the columns (or the elements of a row vector), along dim, or of 'all'."""
+    a = to_double(a)
+    if dim is None and a.shape == (0, 0):
+        return to_matrix(empty_value)  # sum([]) is 0 and prod([]) is 1, as in MATLAB
+    axis = _reduce_axis(a, dim, function)
+    if axis is None:
+        return a
+    if axis == 'all':
+        return to_matrix(compute(a.ravel()))
+    return to_matrix(compute(a, axis=axis, keepdims=True))
+
+
+@builtin('sum', category=CAT_STATS, keep_types=True)
+def fn_sum(a, dim=None):
+    """sum - Sum of elements.
+
+    sum(V) is the sum of the elements of a vector V; sum(A) of a matrix is
+    a row with the sum of each column.
+    sum(A, dim) works along dimension dim (1: columns, 2: rows), and
+    sum(A, 'all') adds all elements. sum([]) is 0. Logical values count as
+    1 and 0, so sum(v > 2) counts the elements greater than 2.
+
+    See also prod, cumsum, mean.
+    """
+    return _total('sum', a, dim, np.sum, 0.0)
+
+
+@builtin('prod', category=CAT_STATS, keep_types=True)
+def fn_prod(a, dim=None):
+    """prod - Product of elements.
+
+    prod(V) is the product of the elements of a vector V; prod(A) of a
+    matrix is a row with the product of each column.
+    prod(A, dim) works along dimension dim (1: columns, 2: rows), and
+    prod(A, 'all') multiplies all elements. prod([]) is 1.
+    Example: prod(1:5) is 120, the factorial of 5.
+
+    See also sum, cumprod.
+    """
+    return _total('prod', a, dim, np.prod, 1.0)
+
+
+def _work_axis(a, dim, function):
+    """Direction for cumsum, diff, sort: 0 down the columns, 1 along the rows, or None (dim > 2).
+    Without dim: the first dimension longer than 1."""
+    if dim is None:
+        return 1 if a.shape[0] == 1 and a.shape[1] != 1 else 0
+    if is_text(dim):
+        raise MatlabError(f"Error using {function}\nThe dimension must be 1 or 2.")
+    return {1: 0, 2: 1}.get(_whole_number(dim, function, 'The dimension', 1))
+
+
+def _cumulative(function, a, dim, direction, compute):
+    """cumsum / cumprod, forward or 'reverse' (from the last element back)."""
+    if direction is None and dim is not None and is_text(dim):  # cumsum(A, 'reverse')
+        dim, direction = None, dim
+    reverse = False
+    if direction is not None:
+        word = text_argument(direction, function, 'The direction').lower()
+        if word not in ('forward', 'reverse'):
+            raise MatlabError(f"Error using {function}\nThe direction must be 'forward' or 'reverse'.")
+        reverse = word == 'reverse'
+    a = to_double(a)
+    axis = _work_axis(a, dim, function)
+    if axis is None or a.size == 0:
+        return a
+    if reverse:
+        return to_matrix(np.flip(compute(np.flip(a, axis=axis), axis=axis), axis=axis))
+    return to_matrix(compute(a, axis=axis))
+
+
+@builtin('cumsum', category=CAT_STATS, keep_types=True)
+def fn_cumsum(a, dim=None, direction=None):
+    """cumsum - Cumulative sum.
+
+    cumsum(V) is a vector of the same size as V whose element k is the
+    sum of the first k elements of V: cumsum([1 2 3]) is 1 3 6.
+    cumsum(A) of a matrix works down each column.
+    cumsum(A, dim) works along dimension dim (1: columns, 2: rows), and
+    cumsum(A, 'reverse') or cumsum(A, dim, 'reverse') adds from the end.
+
+    See also sum, cumprod, diff.
+    """
+    return _cumulative('cumsum', a, dim, direction, np.cumsum)
+
+
+@builtin('cumprod', category=CAT_STATS, keep_types=True)
+def fn_cumprod(a, dim=None, direction=None):
+    """cumprod - Cumulative product.
+
+    cumprod(V) is a vector of the same size as V whose element k is the
+    product of the first k elements of V: cumprod(1:5) is 1 2 6 24 120.
+    cumprod(A) of a matrix works down each column.
+    cumprod(A, dim) works along dimension dim (1: columns, 2: rows), and
+    cumprod(A, 'reverse') or cumprod(A, dim, 'reverse') multiplies from
+    the end.
+
+    See also prod, cumsum.
+    """
+    return _cumulative('cumprod', a, dim, direction, np.cumprod)
+
+
+@builtin('diff', category=CAT_STATS)
+def fn_diff(x, n=None, dim=None):
+    """diff - Differences between neighbouring elements.
+
+    diff(V) is [V(2)-V(1), V(3)-V(2), ...]: one element shorter than V.
+    diff(A) of a matrix is the differences between its rows (down the
+    columns): one row less.
+    diff(X, n) applies diff n times (the n-th difference); diff(X, n, dim)
+    works along dimension dim (1: columns, 2: rows). Without dim, when a
+    matrix runs out of rows, diff continues along the rows.
+    Example: diff(y) ./ diff(x) approximates the derivative dy/dx.
+
+    See also cumsum, sum.
+    """
+    order = 1 if n is None or n.shape == (0, 0) else _whole_number(n, 'diff', 'The order')
+    if dim is not None:
+        axis = _work_axis(x, dim, 'diff')
+        if axis is None:  # a dimension of length 1: nothing to subtract
+            return to_matrix(np.zeros((0, 0))) if order else x
+        for _ in range(order):
+            if x.shape[axis] == 0:
+                break
+            x = np.diff(x, axis=axis)
+        return to_matrix(x)
+    if x.size == 0 and order:
+        return to_matrix(np.zeros((0, 0)))
+    last = None  # the direction of the last difference
+    for _ in range(order):
+        if x.shape[0] > 1:
+            x, last = np.diff(x, axis=0), 0
+        elif x.shape[1] > 1:
+            x, last = np.diff(x, axis=1), 1
+        else:  # one element left: empty, in the direction of the vector
+            return to_matrix(np.zeros((1, 0) if last == 1 else (0, 1) if last == 0 else (0, 0)))
+    return to_matrix(x)
+
+
+def _sort_order(values, descending):
+    """Positions that sort a 1-D array as MATLAB does: stable, NaN last (first when descending),
+    complex numbers by magnitude and then by angle."""
+    if np.iscomplexobj(values):
+        first, second = np.abs(values), np.angle(values)
+    else:
+        first, second = values.astype(float), np.zeros(values.shape)
+    nan = np.isnan(first) | np.isnan(second)
+    first, second = np.where(nan, 0.0, first), np.where(nan, 0.0, second)
+    if descending:
+        first, second, nan = -first, -second, ~nan
+    return np.lexsort((np.arange(values.size), second, first, nan))
+
+
+@builtin('sort', category=CAT_STATS, outputs=2, keep_types=True)
+def fn_sort(a, dim=None, mode=None, *, nargout=1):
+    """sort - Sort in ascending or descending order.
+
+    sort(V) is the elements of the vector V from the smallest to the
+    largest; sort(A) of a matrix sorts each column.
+    sort(A, dim) works along dimension dim (1: columns, 2: rows), and
+    sort(A, 'descend') or sort(A, dim, 'descend') sorts from the largest
+    to the smallest ('ascend' is the default).
+    [B, I] = sort(A) also gives the positions I of the sorted elements in
+    A, so B is A(I) for a vector. Equal elements keep their order; NaN
+    comes last (first with 'descend'); complex numbers are sorted by
+    their magnitude. Text is sorted by character: sort('hello') is 'ehllo'.
+
+    See also max, min, find.
+    """
+    if mode is None and dim is not None and is_text(dim):  # sort(A, 'descend')
+        dim, mode = None, dim
+    descending = False
+    if mode is not None:
+        word = text_argument(mode, 'sort', 'The sort direction').lower()
+        if word not in ('ascend', 'descend'):
+            raise MatlabError("Error using sort\nThe sort direction must be 'ascend' or 'descend'.")
+        descending = word == 'descend'
+    axis = _work_axis(a, dim, 'sort')
+    if axis is None or a.size == 0:
+        positions = np.ones(a.shape) if axis is None else np.zeros(a.shape)
+        return (a, to_matrix(positions)) if nargout > 1 else a
+    key = to_double(a)
+    work = key if axis == 0 else key.T
+    order = np.column_stack([_sort_order(work[:, c], descending) for c in range(work.shape[1])])
+    if axis == 1:
+        order = order.T
+    result = to_matrix(np.take_along_axis(a, order, axis=axis))
+    return (result, to_matrix(order + 1.0)) if nargout > 1 else result
+
+
 # ---- random numbers ------------------------------------------------------------
 _RANDOM = np.random.default_rng()
 
@@ -1359,6 +1670,23 @@ def fn_reshape(a, m, n=None):
         raise MatlabError("Error using reshape\nNumber of elements must not change. Use [] as one of the size "
                           "inputs to automatically calculate the appropriate size for that dimension.")
     return to_matrix(a.ravel(order='F').reshape(sizes, order='F'))
+
+
+@builtin('repmat', category=CAT_MATRIX, keep_types=True)
+def fn_repmat(a, m, n=None):
+    """repmat - Repeat copies of an array.
+
+    repmat(A, n) is an n-by-n tiling of copies of A.
+    repmat(A, m, n) or repmat(A, [m n]) puts m copies of A below each
+    other and n copies next to each other: repmat([1 2], 2, 3) is a 2-by-6
+    matrix. Text and logical values stay text and logical: repmat('-', 1, 20).
+
+    See also reshape, resize, ones.
+    """
+    rows, cols = _size_args('repmat', [to_double(s) for s in _given(m, n)])
+    if a.size * rows * cols > MAX_ELEMENTS:
+        raise MatlabError("Error using repmat\nRequested array exceeds the maximum allowed size.")
+    return to_matrix(np.tile(a, (rows, cols)))
 
 
 # ---- text and files ------------------------------------------------------------
@@ -6457,7 +6785,8 @@ def app_help_text(mac):
     return f"""## {APP_NAME} {APP_VERSION}
 {APP_NAME} is a calculator that works like the Command Window of MATLAB. Type a command
 after the >> prompt and press Enter: the result appears below it, and the variables you
-create are kept for the next commands.
+create are kept for the next commands. Unlike MATLAB, {APP_NAME} starts immediately, so
+it is ready at once when you need just a few calculations.
 
     >> r = 2;
     >> area = pi * r^2
@@ -6486,8 +6815,10 @@ The help command describes everything {APP_NAME} can do, the same way as in MATL
   changes an element, A(A > 2) selects the elements that meet a condition, and find
   gives their positions.
 - Functions: elementary math, trigonometric and hyperbolic functions, rounding and
-  remainders, statistics (max, min, mean, median, std), random numbers, and functions
-  that create and reshape matrices. Some give several results: [m, i] = max(v).
+  remainders, statistics (max, min, mean, median, std), sums and products (sum, prod,
+  cumsum, cumprod, diff), sorting (sort), random numbers, linear algebra (inv, det,
+  norm, eig), and functions that create and reshape matrices (diag, repmat, reshape).
+  Some give several results: [m, i] = max(v), [V, D] = eig(A).
 - Text and files: 'text' in quotes, disp and fprintf to show results, and fopen,
   fprintf, fscanf and fclose to write and read text files.
 - Files and folders: pwd and cd show and change the current folder; ls lists it,
