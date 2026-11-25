@@ -37,7 +37,7 @@ import numpy as np
 #  Application parameters - edit these to customise the app
 # =============================================================================
 APP_NAME = 'Matlab_Calc'        # Window title, Tk class name and (macOS) menu-bar name
-APP_VERSION = '0.12.0'          # Shown in the welcome banner; see the version history in README.md
+APP_VERSION = '0.13.0'          # Shown in the welcome banner; see the version history in README.md
 APP_CREDITS = "Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, Claude)"
 
 WINDOW_WIDTH = 750              # Initial window width in pixels
@@ -54,6 +54,8 @@ BACKGROUND_COLOR = '#1e1e1e'
 TEXT_COLOR = '#d4d4d4'
 PROMPT_COLOR = '#569cd6'
 CURSOR_COLOR = 'white'
+COMPLETION_COLOR = '#2d2d30'     # Background of the list of names shown by Tab
+COMPLETION_SELECTED_COLOR = '#094771'  # The chosen name in that list
 WINDOW_PADDING = 10             # Space around the console, in pixels
 PROMPT = '>> '
 
@@ -71,6 +73,7 @@ CONFIG_FILE = '~/.matlab_calc.json'  # Settings file in the home folder: first s
 UPDATE_REPOSITORY = 'varallyay/matlab_calc'  # GitHub project (owner/name) that publishes new versions
 APP_WEBSITE = 'https://github.com/' + UPDATE_REPOSITORY  # Shown in the About window
 UPDATE_CHECK_DAYS = 7           # Look for a new version this often (days); 0 = only with the update command
+COMPLETION_ROWS = 10            # Tab completion: names shown at once in the list (more: it scrolls)
 SCRIPT_EXTENSION = '.m'         # File type of scripts: File > Open, File > Save, run and typing a name
 MAX_SCRIPT_DEPTH = 32           # How deeply scripts may run other scripts (stops a script that runs itself)
 # =============================================================================
@@ -4901,6 +4904,42 @@ def help_overview():
     return "\n".join(lines)
 
 
+# Tab completion: the name being typed is the run of letters, digits and _ before the cursor; it
+# must start with a letter (so 1e<Tab> or 2.5<Tab> complete nothing).
+_COMPLETION_WORD_RE = re.compile(r"(?<![\w.])[A-Za-z]\w*$")
+_SCRIPT_NAME_RE = re.compile(r"[A-Za-z]\w*")
+
+
+def completion_prefix(text):
+    """The beginning of the name that ends text (the text before the cursor), or None."""
+    match = _COMPLETION_WORD_RE.search(text)
+    return match.group() if match else None
+
+
+def scripts_in_folder(folder='.'):
+    """The names of the scripts (.m files) in folder that can be run by typing their name."""
+    try:
+        files = os.listdir(folder)
+    except OSError:
+        return []
+    names = []
+    for file in files:
+        name, extension = os.path.splitext(file)
+        if extension == SCRIPT_EXTENSION and _SCRIPT_NAME_RE.fullmatch(name):
+            if os.path.isfile(os.path.join(folder, file)):
+                names.append(name)
+    return names
+
+
+def completions(prefix, variables=()):
+    """The names that start with prefix, sorted as MATLAB lists them: variables, commands,
+    built-in functions, keywords and the scripts of the current folder. Case matters, as in MATLAB."""
+    if not prefix:
+        return []
+    names = set(variables) | set(COMMANDS) | set(FUNCTIONS) | set(KEYWORDS) | set(scripts_in_folder())
+    return sorted((name for name in names if name.startswith(prefix)), key=lambda name: (name.lower(), name))
+
+
 def _indent(text):
     return "\n".join(("  " + line).rstrip() for line in text.splitlines()) + "\n"
 
@@ -6410,6 +6449,7 @@ def app_help_text(mac):
     settings = f"{APP_NAME} > Settings" if mac else "File > Settings"
     key = "Cmd" if mac else "Ctrl"
     keys = (("Enter", "run the command"), ("Up, Down", "earlier commands"), ("Home", "start of the command"),
+            ("Tab", "complete a name; if several fit, choose one with Up, Down and Enter"),
             (f"{key} +, {key} -", f"larger or smaller font ({key} 0: the default size)"),
             (f"{key} O, {key} S", "open a script, save the session"),
             ("Ctrl C", "stop a running loop; drop an unfinished for / if block"))
@@ -6794,6 +6834,13 @@ class MatlabConsoleApp:
         self.output_area.bind("<Home>", self.on_home)
         self.output_area.bind("<Key>", self.on_key)
         self.output_area.bind("<<Paste>>", self.on_paste)
+        self.output_area.bind("<Tab>", self.on_tab)
+        self.output_area.bind("<Escape>", self.on_escape)
+        self.output_area.bind("<Right>", lambda event: self.close_completions())
+        self.output_area.bind("<End>", lambda event: self.close_completions())
+        self.output_area.bind("<ButtonPress>", lambda event: self.close_completions(), add='+')
+        self.output_area.bind("<Configure>", lambda event: self.close_completions(), add='+')
+        self.completion_list = None  # the list of names shown by Tab when several names fit
         for widget in (self.output_area, self.root):
             widget.bind("<Control-c>", self.on_interrupt)
             widget.bind("<Control-C>", self.on_interrupt)
@@ -6828,10 +6875,12 @@ class MatlabConsoleApp:
 
     # ---- key handling (edits of the read-only part are blocked by ConsoleText) ----
     def on_left(self, event):
+        self.close_completions()
         if self.output_area.compare(tk.INSERT, "<=", "input_start"):
             return "break"
 
     def on_home(self, event):
+        self.close_completions()
         self.output_area.mark_set(tk.INSERT, "input_start")
         return "break"
 
@@ -6858,6 +6907,114 @@ class MatlabConsoleApp:
             self.output_area.tag_remove(tk.SEL, "1.0", tk.END)
         if self.output_area.compare(tk.INSERT, "<", "input_start"):
             self.output_area.mark_set(tk.INSERT, tk.END)
+        if self.completion_list is not None:  # the list follows the name being typed
+            self.output_area.after_idle(self._refresh_completions)
+
+    # ---- Tab completion ------------------------------------------------------------
+    def _typed_prefix(self):
+        """The beginning of the name before the cursor at the prompt, or None."""
+        if self.output_area.compare(tk.INSERT, "<", "input_start"):
+            return None
+        return completion_prefix(self.output_area.get("input_start", tk.INSERT))
+
+    def on_tab(self, event=None):
+        """Tab: complete the name before the cursor, as in MATLAB. One fitting name is completed;
+        if several fit, the part they share is added and a list of them appears (Up, Down to
+        choose, Tab or Enter to take one, Esc to close it). With the list open Tab takes the
+        chosen name."""
+        if self.running:
+            return "break"
+        if self.completion_list is not None:
+            self.accept_completion()
+            return "break"
+        prefix = self._typed_prefix()
+        if prefix is None:
+            return None  # nothing to complete: Tab inserts a tab, as before
+        names = completions(prefix, self.engine.variables)
+        if not names:
+            self.output_area.bell()
+            return "break"
+        common = os.path.commonprefix(names)
+        if len(common) > len(prefix):
+            self.output_area.insert(tk.INSERT, common[len(prefix):])
+            self.output_area.see(tk.INSERT)
+        if len(names) > 1:
+            self._show_completions(names)
+        return "break"
+
+    def _show_completions(self, names):
+        """Show names in a list below the cursor (above it near the bottom of the window)."""
+        text = self.output_area
+        if self.completion_list is None:
+            self.completion_list = tk.Listbox(
+                text, font=self.console_font, activestyle='none', exportselection=False,
+                takefocus=0, relief=tk.SOLID, borderwidth=1, highlightthickness=0,
+                bg=COMPLETION_COLOR, fg=TEXT_COLOR, selectbackground=COMPLETION_SELECTED_COLOR,
+                selectforeground=CURSOR_COLOR)
+            self.completion_list.bind("<ButtonRelease-1>", lambda event: self.accept_completion())
+        listbox = self.completion_list
+        listbox.delete(0, tk.END)
+        listbox.insert(tk.END, *names)
+        listbox.configure(height=min(len(names), COMPLETION_ROWS), width=max(len(n) for n in names) + 2)
+        listbox.selection_clear(0, tk.END)
+        listbox.selection_set(0)
+        listbox.see(0)
+        text.see(tk.INSERT)
+        text.update_idletasks()
+        box = text.bbox(tk.INSERT)
+        if box is None:
+            self.close_completions()
+            return
+        x, y, _, line_height = box
+        height, width = listbox.winfo_reqheight(), listbox.winfo_reqwidth()
+        below = y + line_height
+        top = below if below + height <= text.winfo_height() or y < height else y - height
+        left = max(0, min(x, text.winfo_width() - width))
+        listbox.place(x=left, y=top)
+        listbox.lift()
+
+    def _refresh_completions(self):
+        """After a key press with the list open: show the names that fit what is typed now."""
+        if self.completion_list is None:
+            return
+        prefix = self._typed_prefix()
+        names = completions(prefix, self.engine.variables) if prefix else []
+        if not names:
+            self.close_completions()
+        else:
+            self._show_completions(names)
+
+    def move_completion(self, step):
+        listbox = self.completion_list
+        chosen = listbox.curselection()
+        index = max(0, min(listbox.size() - 1, (chosen[0] if chosen else 0) + step))
+        listbox.selection_clear(0, tk.END)
+        listbox.selection_set(index)
+        listbox.see(index)
+
+    def accept_completion(self):
+        """Put the name chosen in the list in place of the beginning typed before the cursor."""
+        listbox = self.completion_list
+        chosen = listbox.curselection() if listbox is not None else ()
+        name = listbox.get(chosen[0]) if chosen else None
+        prefix = self._typed_prefix()
+        self.close_completions()
+        if name is not None and prefix is not None:
+            self.output_area.delete(f"{tk.INSERT} - {len(prefix)} chars", tk.INSERT)
+            self.output_area.insert(tk.INSERT, name)
+            self.output_area.see(tk.INSERT)
+        self.output_area.focus_set()
+
+    def close_completions(self):
+        if self.completion_list is not None:
+            self.completion_list.destroy()
+            self.completion_list = None
+
+    def on_escape(self, event=None):
+        if self.completion_list is not None:
+            self.close_completions()
+            return "break"
+        return None
 
 
     def on_interrupt(self, event=None):
@@ -7123,6 +7280,9 @@ class MatlabConsoleApp:
     def history_up(self, event):
         if self.running:
             return "break"
+        if self.completion_list is not None:
+            self.move_completion(-1)
+            return "break"
         if self.history and self.history_idx > 0:
             self.history_idx -= 1
             self._replace_current_input(self.history[self.history_idx])
@@ -7130,6 +7290,9 @@ class MatlabConsoleApp:
 
     def history_down(self, event):
         if self.running:
+            return "break"
+        if self.completion_list is not None:
+            self.move_completion(1)
             return "break"
         if self.history_idx < len(self.history) - 1:
             self.history_idx += 1
@@ -7141,7 +7304,10 @@ class MatlabConsoleApp:
 
     # ---- execution -------------------------------------------------------------
     def process_command(self, event=None):
-        """Enter: run the command after the prompt."""
+        """Enter: run the command after the prompt (with the Tab list open: take the chosen name)."""
+        if self.completion_list is not None:
+            self.accept_completion()
+            return "break"
         self._submit()
         return "break"
 

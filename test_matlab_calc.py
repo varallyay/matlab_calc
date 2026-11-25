@@ -1751,6 +1751,71 @@ class TestGui(unittest.TestCase):
     def test_keypad_enter_is_bound(self):
         self.assertTrue(self.text.bind('<KP_Enter>'))
 
+    def typed(self):
+        return self.text.get('input_start', 'end-1c')
+
+    def start_typing(self, text):
+        self.app.close_completions()
+        self.text.delete('input_start', 'end-1c')
+        self.text.insert('input_start', text)
+        self.text.mark_set('insert', 'end-1c')
+
+    def test_tab_completes_a_single_name(self):
+        self.assertTrue(self.text.bind('<Tab>'))
+        self.start_typing('x = linsp')
+        self.assertEqual(self.app.on_tab(), 'break')
+        self.assertEqual(self.typed(), 'x = linspace')
+        self.assertIsNone(self.app.completion_list)
+        self.type_and_run('clc')
+        self.type_and_run('my_long_name = 3;')
+        self.start_typing('2 * my_lo')
+        self.app.on_tab()
+        self.assertEqual(self.typed(), '2 * my_long_name')
+        self.start_typing('x = 1e')                       # a number: Tab inserts a tab, as before
+        self.assertIsNone(self.app.on_tab())
+        self.start_typing('nosuchname')                    # nothing fits: the text stays
+        self.assertEqual(self.app.on_tab(), 'break')
+        self.assertEqual(self.typed(), 'nosuchname')
+        self.start_typing('')
+
+    def test_tab_lists_several_names(self):
+        self.start_typing('y = acos')
+        self.app.on_tab()                                  # acos, acosh: the list appears
+        self.assertEqual(self.typed(), 'y = acos')
+        listbox = self.app.completion_list
+        self.assertEqual(listbox.get(0, 'end'), ('acos', 'acosh'))
+        self.assertEqual(listbox.curselection(), (0,))
+        self.app.history_down(None)                        # Down chooses, it does not recall history
+        self.assertEqual(listbox.curselection(), (1,))
+        self.assertEqual(self.app.process_command(), 'break')   # Enter takes it, does not run
+        self.assertEqual(self.typed(), 'y = acosh')
+        self.assertIsNone(self.app.completion_list)
+
+        self.start_typing('clea')
+        self.app.on_tab()
+        self.assertEqual(self.typed(), 'clear')           # only one name fits
+        self.start_typing('cl')
+        self.app.on_tab()
+        self.assertEqual(self.app.completion_list.get(0, 'end'), ('cla', 'clc', 'clear', 'clf', 'close'))
+        self.text.insert('insert', 'e')                    # typing narrows the list
+        self.app._refresh_completions()
+        self.assertEqual(self.app.completion_list.get(0, 'end'), ('clear',))
+        self.app.on_tab()                                  # Tab takes the chosen name
+        self.assertEqual(self.typed(), 'clear')
+
+        self.start_typing('as')
+        self.app.on_tab()
+        self.assertEqual(self.typed(), 'asin')             # the part asin, asinh share is added
+        self.assertEqual(self.app.on_escape(), 'break')    # Esc closes the list
+        self.assertIsNone(self.app.completion_list)
+        self.assertIsNone(self.app.on_escape())
+        self.assertEqual(self.typed(), 'asin')
+        self.app.on_tab()
+        self.text.insert('insert', '(')                    # no name before the cursor: the list closes
+        self.app._refresh_completions()
+        self.assertIsNone(self.app.completion_list)
+        self.start_typing('')
+
 
 class TestEventLoop(unittest.TestCase):
     """Runs the real mainloop(), where tkinter re-raises errors from Tcl-called Python code.
@@ -1954,6 +2019,37 @@ class TestInstallation(InstallationCase):
             self.assertTrue(self.config()['first_start_done'])
         finally:
             root.destroy()
+
+
+class TestCompletion(FolderCase):
+    """The names Tab completes, without a window."""
+
+    def test_completion_prefix(self):
+        self.assertEqual(mc.completion_prefix('x = pl'), 'pl')
+        self.assertEqual(mc.completion_prefix('sqrt(ab'), 'ab')
+        self.assertEqual(mc.completion_prefix('my_var2'), 'my_var2')
+        self.assertEqual(mc.completion_prefix('2*si'), 'si')
+        for text in ('', 'x = ', '1e', '2.5', 'x.y', 'f(', '_a'):
+            self.assertIsNone(mc.completion_prefix(text), text)
+
+    def test_commands_functions_keywords(self):
+        self.assertEqual(mc.completions('cl'), ['cla', 'clc', 'clear', 'clf', 'close'])
+        self.assertEqual(mc.completions('whi'), ['while'])
+        self.assertEqual(mc.completions('linsp'), ['linspace'])
+        self.assertIn('fprintf', mc.completions('f'))
+        self.assertEqual(mc.completions('Pl'), [])          # case matters, as in MATLAB
+        self.assertEqual(mc.completions('nosuchname'), [])
+        self.assertEqual(mc.completions(''), [])
+
+    def test_variables_and_scripts(self):
+        self.eng.execute('total = 1; tally = 2;')
+        self.make('tables.m', 'tab_2.m', 'tab notes.m', 'tabs.txt', 'other/tabular.m')
+        os.mkdir(self.here('tabfolder.m'))
+        self.assertEqual(mc.completions('ta', self.eng.variables),
+                         ['tab_2', 'tables', 'tally', 'tan', 'tanh'])
+        self.assertEqual(mc.completions('to', self.eng.variables), ['total'])
+        self.assertEqual(mc.scripts_in_folder(self.here('other')), ['tabular'])
+        self.assertEqual(mc.scripts_in_folder(self.here('missing')), [])
 
 
 class TestScripts(unittest.TestCase):

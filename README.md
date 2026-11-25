@@ -1,6 +1,8 @@
+<img src="icon.png" width="96" alt="Matlab_calc icon: a grayscale MATLAB peak on an orange background.">
+
 # Matlab_Calc — MATLAB Command Window Emulator (`matlab_calc.py`)
 
-**Version 0.12.0** — see [Version History](#version-history).
+**Version 0.13.0** — see [Version History](#version-history).
 
 A lightweight, interactive desktop calculator built with Python, Tkinter, and NumPy that emulates the look, feel, and matrix-first syntax of the **MATLAB Command Window**.
 
@@ -29,6 +31,7 @@ A lightweight, interactive desktop calculator built with Python, Tkinter, and Nu
 - **Workspace Management**: Persistent variables across calculations, automatic `ans` assignment, output suppression with trailing `;`, and built-in workspace commands (`whos`, `clear`, `clc`, `format short`, `format long`).
 - **Installable**: on macOS and Linux it installs itself as a normal application (asked at the first start), so it starts from Launchpad or the application menu.
 - **Automatic Updates**: once a week the installed program looks for a new version on [GitHub](https://github.com/varallyay/matlab_calc) and, if you agree, downloads and installs it.
+- **Tab Completion**: press **Tab** to complete the name of a command, function, keyword, variable or script (`linsp` → `linspace`). When several names fit, the part they share is added and a list of them appears below the cursor, as in MATLAB: **↑**/**↓** choose, **Tab** or **Enter** takes the name, **Esc** closes the list, and typing narrows it.
 - **Built-in Help**: `help` lists every command, operator and function; `help <name>` shows the full help of one of them, as in MATLAB. *Help > Matlab_Calc Help* describes the program.
 - **Scripts**: typing the name of a script (`demo` for `demo.m` in the current folder) or `run demo`, `run ../other/demo.m` runs its commands in the workspace, as in MATLAB; an error stops it and names the line
 - **Menus**: *File > Open* runs a script (`.m` file) line by line, *File > Save* saves the commands of the session as a script, *Settings* chooses the font, the number format and the update checks, and *About* shows the version and the credits.
@@ -661,6 +664,7 @@ More than two subscripts and N-dimensional arrays, cell arrays, structures, the 
 - **`Enter`** (or keypad **`Enter`**): Execute the command at the current `>> ` prompt.
 - **`Up` / `Down` Arrows**: Cycle through previous commands in history.
 - **`Home`**: Move the cursor to the start of the current input (right after `>> `).
+- **`Tab`**: Complete the name before the cursor (commands, functions, keywords, variables, scripts of the current folder). If several names fit, a list appears: **`Up` / `Down`** choose, **`Tab`** or **`Enter`** takes the name, **`Esc`** closes the list.
 - **`Ctrl+C` / `Cmd+C`**: Copy selected text from anywhere in the console history.
 - **`Ctrl+V` / `Cmd+V`**: Paste into the active command line.
 - **`Ctrl+A` / `Cmd+A`**: Select all text.
@@ -678,7 +682,7 @@ More than two subscripts and N-dimensional arrays, cell arrays, structures, the 
 python3 test_matlab_calc.py
 ```
 
-Runs 177 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files, the file and folder functions (in temporary folders), the statistics and random-number functions, the help texts, the menus, the About, Help and Settings windows, running and saving scripts, the update check of the Help menu, plotting (off-screen) and figure windows, precedence, parsing, number display, workspace commands, the read-only console (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available, and the plot tests when matplotlib is not installed.
+Runs 182 tests covering installation (in temporary folders, so your system is not touched), updates (against a local stand-in for GitHub, without internet access), operators, functions, indexing, assignment, conditions and `find`, several outputs, text, formatted output and files, the file and folder functions (in temporary folders), the statistics and random-number functions, the help texts, the menus, the About, Help and Settings windows, running and saving scripts, the update check of the Help menu, plotting (off-screen) and figure windows, precedence, parsing, number display, workspace commands, the read-only console and Tab completion (including a session inside the real Tk event loop) and the rounded icon. The GUI and icon tests are skipped when no display is available, and the plot tests when matplotlib is not installed.
 
 ---
 
@@ -689,6 +693,11 @@ Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, 
 ---
 
 ## Version History
+
+### 0.13.0 — 2026-11-25
+- **Tab completion:** Tab completes the name before the cursor: console commands, built-in functions, keywords, the variables of the workspace and the scripts (`.m` files) of the current folder. Case matters, as in MATLAB.
+- When several names fit, the part they share is added and a list of them appears below the cursor: ↑/↓ choose, Tab or Enter takes the chosen name (Enter does not run the command then), Esc closes the list, and typing narrows it. A click on a name takes it too.
+- Tab where no name is being typed (e.g. after a space or a number) inserts a tab, as before. The Help window lists the Tab key.
 
 ### 0.12.0 — 2026-11-12
 - **Running scripts from the command line:** typing the name of a script in the current folder (`demo` for `demo.m`) runs it, and so does `run demo`, `run demo.m`, `run folder/demo` or `run('My Script')`. `run` makes the folder of the script the current folder while it runs.
@@ -796,7 +805,7 @@ Developed by Zoltan Varallyay, PhD with the help of AI technology (Antigravity, 
 
 ## Missing Compared to MATLAB around 2000
 
-What MATLAB 6.0 (R12, released in November 2000) — the base product, without toolboxes — had and Matlab_Calc 0.12.0 does not have yet. Items already available in Matlab_Calc are not listed; where only part of a feature exists, the missing part is named.
+What MATLAB 6.0 (R12, released in November 2000) — the base product, without toolboxes — had and Matlab_Calc 0.13.0 does not have yet. Items already available in Matlab_Calc are not listed; where only part of a feature exists, the missing part is named.
 
 ### The most noticeable gaps
 1. **User functions**: function M-files (`function y = f(x)`) with their own workspace, subfunctions, `nargin` / `nargout`, `varargin` / `varargout`, `return`, `global` and `persistent` variables. (Scripts run by typing their name or with `run`, from the current folder.)
